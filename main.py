@@ -424,6 +424,8 @@ class AIProcessor:
                 pill_res = model_pill(frame_yolo, verbose=False, conf=CONF_PILL, 
                                      imgsz=AI_IMG_SIZE, max_det=10, agnostic_nms=True)
                 
+                detected_pills = []  # Store all pill detections first
+                
                 for box in pill_res[0].boxes.xyxy.detach().cpu().numpy().astype(int):
                     x1_s, y1_s, x2_s, y2_s = box
                     
@@ -449,16 +451,46 @@ class AIProcessor:
                                               session_packs=self.sess_mat_packs,
                                               session_packs_lbl=self.sess_lbl_packs)
                     
-                    # Track high-confidence pills
+                    cx, cy = (x1+x2)//2, (y1+y2)//2
+                    detected_pills.append({
+                        'name': nm,
+                        'score': sc,
+                        'center': (cx, cy),
+                        'box': (x1, y1, x2, y2)
+                    })
+                
+                # 🔥 SMART ASSUMPTION: Find highest confidence pill (exclude ? and Unknown)
+                best_pill = None
+                best_score = -1
+                
+                for pill in detected_pills:
+                    if "?" not in pill['name'] and "Unknown" not in pill['name']:
+                        if pill['score'] > best_score:
+                            best_score = pill['score']
+                            best_pill = pill
+                
+                # If we found a confident pill, use it as the assumed class
+                assumed_pill_name = best_pill['name'] if best_pill else None
+                
+                # Now create final pill detections with assumption
+                for pill in detected_pills:
+                    nm = pill['name']
+                    sc = pill['score']
+                    
+                    # 🎯 Apply assumption: if current pill is uncertain but we have a best pill
+                    if assumed_pill_name and ("?" in nm or "Unknown" in nm or sc < SCORE_PASS_PILL):
+                        nm = assumed_pill_name  # Override with assumed name
+                        sc = best_score  # Use best score for display
+                    
+                    # Track valid pills for pack matching
                     if "?" not in nm and "Unknown" not in nm:
-                        cx, cy = (x1+x2)//2, (y1+y2)//2
-                        valid_pills.append({'name': nm, 'center': (cx, cy)})
-
+                        valid_pills.append({'name': nm, 'center': pill['center']})
+                    
                     final_detections.append({
                         'label': nm, 
                         'score': sc, 
                         'type': 'pill', 
-                        'box': (x1, y1, x2, y2)
+                        'box': pill['box']
                     })
 
                 # 2. DETECT PACKS
@@ -497,14 +529,18 @@ class AIProcessor:
                             found_inner_pill_name = pill['name']
                             break
                     
-                    # If found pill inside, use pill name but keep pack score
+                    # If found pill inside, use pill name (already assumed if needed)
+                    # Otherwise, use pack detection name
                     if found_inner_pill_name:
                         nm = found_inner_pill_name
-                        print(f"[DEBUG] Pack Override: {nm} | Score: {sc:.2%} | Threshold: {SCORE_PASS_PACK}")
+                        # If we have assumed pill name, pack also uses it
+                        if assumed_pill_name:
+                            nm = assumed_pill_name
+                            sc = best_score  # Use best pill score for pack too
                     
                     final_detections.append({
                         'label': nm, 
-                        'score': sc,  # Real pack score from trinity_inference
+                        'score': sc,  # Real pack score (or best pill score if assumed)
                         'type': 'pack', 
                         'box': (x1, y1, x2, y2)
                     })
