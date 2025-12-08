@@ -13,7 +13,7 @@ from PIL import Image
 # ================= FIX RASPBERRY PI ENVIRONMENT =================
 os.environ["QT_QPA_PLATFORM"] = "xcb"
 os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
-os.environ["OMP_NUM_THREADS"] = "3"
+os.environ["OMP_NUM_THREADS"] = "3"    
 
 try:
     from picamera2 import Picamera2
@@ -42,7 +42,7 @@ SCORE_PASS_PILL = 0.2
 SCORE_PASS_PACK = 0.6
 
 # --- SENIOR UPGRADES ---
-CONSISTENCY_THRESHOLD = 3   # ลดลงเหลือ 3 เพื่อให้ตัดเร็วขึ้น (Responsiveness)
+CONSISTENCY_THRESHOLD = 2   # ลดลงเหลือ 3 เพื่อให้ตัดเร็วขึ้น (Responsiveness)
 MAX_OBJ_AREA_RATIO = 0.40   
 
 device = torch.device("cpu")
