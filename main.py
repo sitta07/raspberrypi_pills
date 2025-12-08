@@ -37,7 +37,7 @@ DISPLAY_W, DISPLAY_H = 1280, 720
 AI_IMG_SIZE = 416 
 
 # Thresholds
-CONF_PILL = 0.15    
+CONF_PILL = 0.5    
 CONF_PACK = 0.75    
 SCORE_PASS_PILL = 0.2
 SCORE_PASS_PACK = 0.75  # Pack threshold: 75%
@@ -154,6 +154,41 @@ class PrescriptionManager:
             filtered_lbls = [source_lbls[i] for i in indices]
             return torch.tensor(np.array(filtered_vecs), device=device), filtered_lbls
         return None, None
+
+# ================= PRESCRIPTION CHECKBOX STATE =================
+class PrescriptionState:
+    """Manages verified/remaining drugs with checkbox state"""
+    def __init__(self):
+        self.all_drugs = []  # Original full list
+        self.verified_drugs = set()  # Checked drugs
+        self.lock = threading.Lock()
+    
+    def load_drugs(self, drug_list):
+        with self.lock:
+            self.all_drugs = drug_list.copy()
+            self.verified_drugs.clear()
+    
+    def get_remaining_drugs(self):
+        with self.lock:
+            return [d for d in self.all_drugs if d not in self.verified_drugs]
+    
+    def toggle_drug(self, drug_name):
+        with self.lock:
+            if drug_name in self.verified_drugs:
+                self.verified_drugs.remove(drug_name)
+            else:
+                self.verified_drugs.add(drug_name)
+    
+    def is_verified(self, drug_name):
+        with self.lock:
+            return drug_name in self.verified_drugs
+    
+    def get_all_drugs(self):
+        with self.lock:
+            return self.all_drugs.copy()
+
+# Global prescription state
+prescription_state = PrescriptionState()
 
 # --- LOAD DATABASES (OPTIMIZED) ---
 def load_pkl_to_list(filepath):
@@ -393,15 +428,38 @@ class AIProcessor:
                 self.sess_lbl_pills = None
                 self.sess_mat_packs = None
                 self.sess_lbl_packs = None
+                prescription_state.load_drugs([])
             else:
                 self.is_rx_mode = True
                 self.current_patient_info = patient_data
                 drugs = patient_data['drugs']
+                
+                # Load into prescription state
+                prescription_state.load_drugs(drugs)
+                
+                # Initially filter with ALL drugs
                 self.sess_mat_pills, self.sess_lbl_pills = PrescriptionManager.filter_db(
                     drugs, pills_vecs, pills_lbls)
                 self.sess_mat_packs, self.sess_lbl_packs = PrescriptionManager.filter_db(
                     drugs, packs_vecs, packs_lbls)
                 print(f"🏥 Loaded: {patient_data['name']}")
+    
+    def update_remaining_drugs(self):
+        """Update session database to only include remaining (unchecked) drugs"""
+        with self.lock:
+            if self.current_patient_info:
+                remaining = prescription_state.get_remaining_drugs()
+                if remaining:
+                    self.sess_mat_pills, self.sess_lbl_pills = PrescriptionManager.filter_db(
+                        remaining, pills_vecs, pills_lbls)
+                    self.sess_mat_packs, self.sess_lbl_packs = PrescriptionManager.filter_db(
+                        remaining, packs_vecs, packs_lbls)
+                else:
+                    # All verified - use full database
+                    self.sess_mat_pills = matrix_pills
+                    self.sess_lbl_pills = pills_lbls
+                    self.sess_mat_packs = matrix_packs
+                    self.sess_lbl_packs = packs_lbls
 
     def start(self): 
         threading.Thread(target=self.run, daemon=True).start()
@@ -494,14 +552,21 @@ class AIProcessor:
                     if assumed_pill_name and ("?" in nm or "Unknown" in nm or sc < SCORE_PASS_PILL):
                         nm, sc = assumed_pill_name, best_score
                     
-                    # Track valid pills
+                    # Track valid pills with verified status
+                    is_verified = prescription_state.is_verified(nm.lower())
+                    
                     if "?" not in nm and "Unknown" not in nm:
-                        valid_pills.append({'name': nm, 'center': pill['center']})
+                        valid_pills.append({
+                            'name': nm, 
+                            'center': pill['center'],
+                            'verified': is_verified
+                        })
                     
                     final_detections.append({
                         'label': nm, 
                         'score': sc, 
-                        'type': 'pill', 
+                        'type': 'pill',
+                        'verified': is_verified,
                         'box': pill['box']
                     })
 
@@ -534,9 +599,12 @@ class AIProcessor:
                     
                     # Check for inner pill (optimized search)
                     found_inner = False
+                    pack_verified = False
+                    
                     for pill in valid_pills:
                         if is_point_in_box(pill['center'], (x1, y1, x2, y2)):
                             found_inner = True
+                            pack_verified = pill['verified']  # Pack inherits pill verification
                             if assumed_pill_name:
                                 nm, sc = assumed_pill_name, best_score
                             break
@@ -544,7 +612,8 @@ class AIProcessor:
                     final_detections.append({
                         'label': nm, 
                         'score': sc,
-                        'type': 'pack', 
+                        'type': 'pack',
+                        'verified': pack_verified,  # Pack is verified if inner pill is verified
                         'box': (x1, y1, x2, y2)
                     })
 
@@ -558,7 +627,7 @@ class AIProcessor:
     def stop(self): 
         self.stopped = True
 
-# ================= 5. UI DRAWING (OPTIMIZED) =================
+# ================= 5. UI DRAWING (OPTIMIZED WITH CHECKBOX) =================
 # Pre-allocate drawing parameters
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 FONT_SCALE = 0.8
@@ -566,45 +635,102 @@ FONT_SCALE_SMALL = 0.6
 THICKNESS = 2
 THICKNESS_BOX = 3
 
+# Checkbox parameters
+CHECKBOX_SIZE = 25
+CHECKBOX_PADDING = 5
+
 def draw_patient_info(frame, patient_data):
-    """Optimized: Minimal drawing operations"""
+    """Optimized: Interactive prescription list with checkboxes"""
     if not patient_data: 
-        return
+        return []
     
     H, W = frame.shape[:2]
-    box_w = 400
+    box_w = 450
     start_x = W - box_w
     
-    # Build lines
-    lines = [
+    # Header lines
+    header_lines = [
         f"HN: {patient_data.get('hn', 'N/A')}",
         f"Name: {patient_data.get('name', 'N/A')}", 
-        "--- Rx List ---"
+        "--- Prescription List ---"
     ]
-    lines.extend(f"- {d}" for d in patient_data.get('drugs', [])[:5])
+    
+    # Get all drugs with verification status
+    all_drugs = prescription_state.get_all_drugs()
     
     line_h = 40
-    box_h = len(lines) * line_h + 20
+    header_h = len(header_lines) * line_h
+    total_lines = len(header_lines) + len(all_drugs)
+    box_h = total_lines * line_h + 20
     
-    # Single background rect
+    # Draw background
     cv2.rectangle(frame, (start_x, 0), (W, box_h), (50, 50, 50), -1)
     cv2.rectangle(frame, (start_x, 0), (W, box_h), (0, 255, 255), 2)
     
-    # Batch text rendering
-    for i, line in enumerate(lines):
+    # Draw header
+    for i, line in enumerate(header_lines):
         y = 35 + i * line_h
         cv2.putText(frame, line, (start_x+15, y), FONT, FONT_SCALE, (255, 255, 255), THICKNESS)
+    
+    # Draw drug list with checkboxes
+    clickable_areas = []
+    
+    for i, drug in enumerate(all_drugs):
+        y = 35 + (len(header_lines) + i) * line_h
+        checkbox_x = start_x + 15
+        checkbox_y = y - CHECKBOX_SIZE + 5
+        
+        # Checkbox background
+        is_checked = prescription_state.is_verified(drug.lower())
+        checkbox_color = (0, 200, 0) if is_checked else (100, 100, 100)
+        cv2.rectangle(frame, (checkbox_x, checkbox_y), 
+                     (checkbox_x + CHECKBOX_SIZE, checkbox_y + CHECKBOX_SIZE), 
+                     checkbox_color, -1)
+        cv2.rectangle(frame, (checkbox_x, checkbox_y), 
+                     (checkbox_x + CHECKBOX_SIZE, checkbox_y + CHECKBOX_SIZE), 
+                     (255, 255, 255), 2)
+        
+        # Checkmark if verified
+        if is_checked:
+            cv2.line(frame, (checkbox_x + 5, checkbox_y + 12), 
+                    (checkbox_x + 10, checkbox_y + 20), (255, 255, 255), 3)
+            cv2.line(frame, (checkbox_x + 10, checkbox_y + 20), 
+                    (checkbox_x + 20, checkbox_y + 5), (255, 255, 255), 3)
+        
+        # Drug name (strikethrough if checked)
+        text_x = checkbox_x + CHECKBOX_SIZE + 10
+        drug_text = drug
+        text_color = (150, 150, 150) if is_checked else (255, 255, 255)
+        cv2.putText(frame, drug_text, (text_x, y), FONT, 0.7, text_color, THICKNESS)
+        
+        # Strikethrough if checked
+        if is_checked:
+            text_size = cv2.getTextSize(drug_text, FONT, 0.7, THICKNESS)[0]
+            cv2.line(frame, (text_x, y - 8), (text_x + text_size[0], y - 8), (150, 150, 150), 2)
+        
+        # Store clickable area
+        clickable_areas.append({
+            'drug': drug,
+            'box': (checkbox_x, checkbox_y, checkbox_x + CHECKBOX_SIZE + 200, checkbox_y + CHECKBOX_SIZE)
+        })
+    
+    return clickable_areas
 
 def draw_boxes_on_items(frame, results):
-    """Optimized: Vectorized color selection"""
+    """Optimized: Color based on verification status"""
     for r in results:
         x1, y1, x2, y2 = r['box']
         label = r['label']
         score = r['score']
         obj_type = r.get('type', 'pill')
+        is_verified = r.get('verified', False)
         
-        # Optimized color selection (avoid multiple ifs)
-        if obj_type == 'pack':
+        # Color logic with verification
+        if is_verified:
+            # Verified items are always GREEN with ✓
+            color = (0, 255, 0)
+            label = f"✓ {label}"
+        elif obj_type == 'pack':
             color = (0, 255, 0) if score >= SCORE_PASS_PACK else (0, 255, 255)
         elif "?" in label or score < SCORE_PASS_PILL:
             color = (0, 0, 255)
@@ -613,12 +739,27 @@ def draw_boxes_on_items(frame, results):
         else:
             color = (0, 255, 0)
 
-        # Draw (minimized calls)
+        # Draw
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, THICKNESS_BOX)
         cv2.putText(frame, f"{label} {score:.0%}", (x1, y1-10), 
                    FONT, FONT_SCALE_SMALL, color, THICKNESS)
 
-# ================= 6. MAIN (ULTRA-OPTIMIZED) =================
+# ================= 6. MAIN (ULTRA-OPTIMIZED WITH INTERACTION) =================
+# Mouse callback for checkbox interaction
+def mouse_callback(event, x, y, flags, param):
+    if event == cv2.EVENT_LBUTTONDOWN:
+        clickable_areas, ai_processor = param
+        for area in clickable_areas:
+            x1, y1, x2, y2 = area['box']
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                # Toggle drug verification
+                drug = area['drug']
+                prescription_state.toggle_drug(drug.lower())
+                # Update AI processor to use remaining drugs only
+                ai_processor.update_remaining_drugs()
+                print(f"{'✓' if prescription_state.is_verified(drug.lower()) else '☐'} {drug}")
+                break
+
 def main():
     TARGET_HN = "HN-101" 
     
@@ -644,7 +785,8 @@ def main():
     cv2.resizeWindow(window_name, DISPLAY_W, DISPLAY_H) 
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    print(f"🎥 RUNNING... (Ultra-Optimized Mode)")
+    print(f"🎥 RUNNING... (Interactive Mode)")
+    print("📋 Click checkboxes to mark drugs as verified")
     
     # FPS tracking
     fps = 0
@@ -655,6 +797,9 @@ def main():
     # Pre-allocate FPS text position
     fps_pos = (30, 50)
     fps_color = (0, 255, 0)
+    
+    # Store clickable areas for mouse callback
+    clickable_areas = []
 
     try:
         while True:
@@ -672,11 +817,15 @@ def main():
             # Get results
             results, cur_patient = ai.get_results()
             
-            # Draw on original frame (avoid unnecessary copy if possible)
+            # Draw on original frame
             draw_boxes_on_items(frame_rgb, results)
             
+            # Draw patient info and get clickable areas
             if cur_patient: 
-                draw_patient_info(frame_rgb, cur_patient)
+                clickable_areas = draw_patient_info(frame_rgb, cur_patient)
+            
+            # Setup mouse callback with current clickable areas
+            cv2.setMouseCallback(window_name, mouse_callback, (clickable_areas, ai))
             
             # Calculate FPS
             curr_time = time.perf_counter()
@@ -686,7 +835,7 @@ def main():
             # Get temperature
             temp = get_cpu_temperature()
             
-            # Draw FPS (single text call)
+            # Draw FPS
             cv2.putText(frame_rgb, f"FPS: {fps:.1f} | {temp}", fps_pos, 
                        FONT, 1.2, fps_color, THICKNESS_BOX)
             
