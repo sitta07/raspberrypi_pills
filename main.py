@@ -690,45 +690,50 @@ def draw_patient_info(frame, patient_data):
         
         is_checked = prescription_state.is_verified(drug.lower())
         
-        # Checkbox border (white outline)
+        # DEBUG: Show checked status
+        if i == 0:  # Only for first drug to avoid spam
+            print(f"[DRAW] Drug '{drug}' checked={is_checked}, verified_set={prescription_state.verified_drugs}")
+        
+        # Checkbox border (white outline) - THICKER for visibility
         cv2.rectangle(frame, (checkbox_x, checkbox_y), 
                      (checkbox_x + CHECKBOX_SIZE, checkbox_y + CHECKBOX_SIZE), 
-                     (255, 255, 255), 2)
+                     (255, 255, 255), 3)
         
         # Checkbox fill (green if checked, dark gray if not)
         if is_checked:
             # Fill green background
-            cv2.rectangle(frame, (checkbox_x + 2, checkbox_y + 2), 
-                         (checkbox_x + CHECKBOX_SIZE - 2, checkbox_y + CHECKBOX_SIZE - 2), 
-                         (0, 200, 0), -1)
+            cv2.rectangle(frame, (checkbox_x + 3, checkbox_y + 3), 
+                         (checkbox_x + CHECKBOX_SIZE - 3, checkbox_y + CHECKBOX_SIZE - 3), 
+                         (0, 255, 0), -1)  # BRIGHT GREEN
             
-            # Draw checkmark (✓)
-            cv2.line(frame, (checkbox_x + 6, checkbox_y + 13), 
-                    (checkbox_x + 10, checkbox_y + 18), (255, 255, 255), 3)
-            cv2.line(frame, (checkbox_x + 10, checkbox_y + 18), 
-                    (checkbox_x + 19, checkbox_y + 7), (255, 255, 255), 3)
+            # Draw checkmark (✓) - LARGER and THICKER
+            cv2.line(frame, (checkbox_x + 6, checkbox_y + 14), 
+                    (checkbox_x + 11, checkbox_y + 20), (255, 255, 255), 4)
+            cv2.line(frame, (checkbox_x + 11, checkbox_y + 20), 
+                    (checkbox_x + 20, checkbox_y + 8), (255, 255, 255), 4)
         else:
             # Empty checkbox (dark fill)
-            cv2.rectangle(frame, (checkbox_x + 2, checkbox_y + 2), 
-                         (checkbox_x + CHECKBOX_SIZE - 2, checkbox_y + CHECKBOX_SIZE - 2), 
-                         (80, 80, 80), -1)
+            cv2.rectangle(frame, (checkbox_x + 3, checkbox_y + 3), 
+                         (checkbox_x + CHECKBOX_SIZE - 3, checkbox_y + CHECKBOX_SIZE - 3), 
+                         (60, 60, 60), -1)
         
         # Drug name (strikethrough if checked)
         text_x = checkbox_x + CHECKBOX_SIZE + 10
         text_y = y_base
         drug_text = drug
-        text_color = (150, 150, 150) if is_checked else (255, 255, 255)
+        text_color = (100, 100, 100) if is_checked else (255, 255, 255)  # Darker gray when checked
         cv2.putText(frame, drug_text, (text_x, text_y), FONT, 0.75, text_color, THICKNESS)
         
-        # Strikethrough if checked
+        # Strikethrough if checked - THICKER LINE
         if is_checked:
             text_size = cv2.getTextSize(drug_text, FONT, 0.75, THICKNESS)[0]
-            cv2.line(frame, (text_x, text_y - 10), (text_x + text_size[0], text_y - 10), (150, 150, 150), 2)
+            cv2.line(frame, (text_x, text_y - 10), (text_x + text_size[0], text_y - 10), (255, 0, 0), 3)  # RED LINE
         
         # Store clickable area (larger area for easier clicking)
+        click_box = (checkbox_x - 5, checkbox_y - 5, checkbox_x + 300, checkbox_y + CHECKBOX_SIZE + 10)
         clickable_areas.append({
             'drug': drug,
-            'box': (checkbox_x - 5, checkbox_y - 5, checkbox_x + 250, checkbox_y + CHECKBOX_SIZE + 5)
+            'box': click_box
         })
     
     return clickable_areas
@@ -771,14 +776,26 @@ def draw_boxes_on_items(frame, results):
 
 # ================= 6. MAIN (ULTRA-OPTIMIZED WITH INTERACTION) =================
 # Mouse callback for checkbox interaction
+mouse_click_debug = {"last_click": None}
+
 def mouse_callback(event, x, y, flags, param):
     if event == cv2.EVENT_LBUTTONDOWN:
+        print(f"[MOUSE] Click at ({x}, {y})")
         clickable_areas, ai_processor = param
+        
+        if not clickable_areas:
+            print("[MOUSE] No clickable areas!")
+            return
+            
         for area in clickable_areas:
             x1, y1, x2, y2 = area['box']
+            print(f"[MOUSE] Checking area: {area['drug']} at ({x1},{y1},{x2},{y2})")
+            
             if x1 <= x <= x2 and y1 <= y <= y2:
                 # Toggle drug verification
                 drug = area['drug']
+                print(f"[MOUSE] HIT! Toggling: {drug}")
+                
                 prescription_state.toggle_drug(drug.lower())
                 is_now_verified = prescription_state.is_verified(drug.lower())
                 
@@ -787,8 +804,13 @@ def mouse_callback(event, x, y, flags, param):
                 
                 # Print status
                 status = '✓ VERIFIED' if is_now_verified else '☐ UNVERIFIED'
-                print(f"{status}: {drug}")
-                break
+                print(f"[STATUS] {status}: {drug}")
+                print(f"[STATE] Verified drugs: {prescription_state.verified_drugs}")
+                
+                mouse_click_debug["last_click"] = drug
+                return
+        
+        print("[MOUSE] No area matched!")
 
 def main():
     TARGET_HN = "HN-101" 
@@ -853,9 +875,10 @@ def main():
             # Draw patient info and get clickable areas
             if cur_patient: 
                 clickable_areas = draw_patient_info(frame_rgb, cur_patient)
-            
-            # Setup mouse callback with current clickable areas
-            cv2.setMouseCallback(window_name, mouse_callback, (clickable_areas, ai))
+                # Setup mouse callback with current clickable areas (UPDATE EVERY FRAME)
+                cv2.setMouseCallback(window_name, mouse_callback, (clickable_areas, ai))
+            else:
+                clickable_areas = []
             
             # Calculate FPS
             curr_time = time.perf_counter()
