@@ -758,7 +758,7 @@ def main():
             results, cur_patient = ai.get_results()
             
             # กรอบวัตถุ
-            # draw_boxes_on_items(frame_rgb, results)
+            draw_boxes_on_items(frame_rgb, results)
             
             if cur_patient: 
                 clickable_areas = draw_patient_info(frame_rgb, cur_patient)
