@@ -26,8 +26,8 @@ except ImportError:
 # 🔥 TIPS: เปลี่ยนชื่อไฟล์ตรงนี้ ระบบจะปรับโหมด Box ให้เอง
 # ถ้าลงท้าย .pt  -> แสดงกรอบ
 # ถ้าลงท้าย .onnx -> ไม่แสดงกรอบ
-MODEL_PILL_PATH = 'models/pills.onnx'   
-MODEL_PACK_PATH = 'models/best_process_2.onnx' 
+MODEL_PILL_PATH = 'models/pills.pt'   
+MODEL_PACK_PATH = 'models/best_process_2.pt' 
 
 # 🧠 Logic: Auto-Detect Box Visibility
 SHOW_BOXES = MODEL_PILL_PATH.endswith('.pt')
