@@ -767,9 +767,9 @@ def main():
             # 4. วาดเส้นลงบนภาพ "ตัวจริง" (In-place modification)
             draw_boxes_on_items(frame_rgb, results)
             
-            if cur_patient: 
-                clickable_areas = draw_patient_info(frame_rgb, cur_patient)
-                cv2.setMouseCallback(window_name, mouse_callback, (clickable_areas, ai))
+            # if cur_patient: 
+            #     clickable_areas = draw_patient_info(frame_rgb, cur_patient)
+            #     cv2.setMouseCallback(window_name, mouse_callback, (clickable_areas, ai))
             
             # 5. คำนวณ FPS
             curr_time = time.perf_counter()
