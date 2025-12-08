@@ -37,13 +37,13 @@ AI_IMG_SIZE = 416
 
 # Thresholds
 CONF_PILL = 0.25    
-CONF_PACK = 0.5     # ปรับ Pack ให้ detect ง่ายขึ้นนิดนึง เพราะเราเชื่อมันมาก
+CONF_PACK = 0.5     
 SCORE_PASS_PILL = 0.2
 SCORE_PASS_PACK = 0.6
 
 # --- SENIOR UPGRADES ---
-CONSISTENCY_THRESHOLD = 4   # Stability Check
-MAX_OBJ_AREA_RATIO = 0.40   # Ghost Filter
+CONSISTENCY_THRESHOLD = 3   # ลดลงเหลือ 3 เพื่อให้ตัดเร็วขึ้น (Responsiveness)
+MAX_OBJ_AREA_RATIO = 0.40   
 
 device = torch.device("cpu")
 print(f"🚀 SYSTEM STARTING ON: {device} (RGB888 STRICT MODE)")
@@ -77,7 +77,6 @@ class WebcamStream:
         print("[DEBUG] Initializing Camera (RGB888)...")
         try:
             self.picam2 = Picamera2()
-            # FORCE RGB888 HERE
             config = self.picam2.create_preview_configuration(
                 main={"size": (DISPLAY_W, DISPLAY_H), "format": "RGB888"},
                 controls={"FrameDurationLimits": (100000, 100000)} 
@@ -99,17 +98,16 @@ class WebcamStream:
         while not self.stopped:
             try:
                 if self.picam2:
-                    frame = self.picam2.capture_array() # Returns RGB888
+                    frame = self.picam2.capture_array() 
                     if frame is not None:
                         with self.lock:
                             self.frame = frame
                             self.grabbed = True
                     else: self.stopped = True
                 else:
-                    ret, frame = self.cam.read() # OpenCV gives BGR
+                    ret, frame = self.cam.read() 
                     if ret:
                         with self.lock:
-                            # FORCE CONVERT TO RGB888 for internal consistency
                             self.frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                             self.grabbed = True
             except: 
@@ -142,7 +140,8 @@ class HISLoader:
                     parts = line.split('|')
                     if len(parts) < 3: continue
                     hn, name = parts[0].strip(), parts[1].strip()
-                    drugs = [d.strip().lower() for d in parts[2].split(',') if d.strip()]
+                    # Clean hidden characters
+                    drugs = [d.strip().lower().replace('\ufeff', '') for d in parts[2].split(',') if d.strip()]
                     db[hn] = {'name': name, 'drugs': drugs}
             return db
         except: return {}
@@ -171,9 +170,23 @@ class PrescriptionState:
 
     def verify_drug(self, drug_name):
         with self.lock:
+            # ตรวจสอบแบบ Loose Match อีกครั้งตอน verify
+            for verified in list(self.verified_drugs):
+                if verified == drug_name: return
+
             if drug_name not in self.verified_drugs:
-                print(f"✨ AUTO-VERIFIED: {drug_name}")
-                self.verified_drugs.add(drug_name)
+                # ลองหาว่าชื่อนี้ไป match กับตัวไหนใน list จริงๆ หรือไม่
+                found = False
+                for target in self.all_drugs:
+                    if target == drug_name:
+                        self.verified_drugs.add(target)
+                        print(f"✨ VERIFIED (Direct): {target}")
+                        found = True
+                        break
+                
+                if not found:
+                    self.verified_drugs.add(drug_name)
+                    print(f"✨ VERIFIED (New): {drug_name}")
     
     def is_verified(self, drug_name):
         with self.lock:
@@ -238,7 +251,6 @@ if os.path.exists(IMG_DB_FOLDER):
 try:
     model_pill = YOLO(MODEL_PILL_PATH, task='detect')
     model_pack = YOLO(MODEL_PACK_PATH, task='detect')
-    # Use ResNet for Embeddings
     weights = models.ResNet50_Weights.DEFAULT
     base_model = models.resnet50(weights=weights)
     embedder = torch.nn.Sequential(*list(base_model.children())[:-1])
@@ -248,7 +260,6 @@ try:
     preprocess = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
-        # Normalize expect RGB
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
     torch.set_grad_enabled(False)
@@ -273,7 +284,6 @@ def trinity_inference(img_crop, is_pill=True,
     if target_matrix is None: return "DB Error", 0.0
 
     try:
-        # img_crop is already RGB888
         if is_pill: 
             pil_img = Image.fromarray(img_crop) 
         else:
@@ -417,12 +427,12 @@ class AIProcessor:
                                    interpolation=self.resize_interpolation)
             
             final_detections = []
-            active_packs = [] # Store packs found in this frame to override pills
+            active_packs = [] 
             found_in_this_frame = set()
 
             try:
                 # ==========================================
-                # PHASE 1: DETECT PACKS FIRST (Priority)
+                # PHASE 1: DETECT PACKS
                 # ==========================================
                 pack_res = model_pack(frame_yolo, verbose=False, conf=CONF_PACK, 
                                      imgsz=AI_IMG_SIZE, max_det=5, agnostic_nms=True)
@@ -439,7 +449,6 @@ class AIProcessor:
                     crop = frame_HD[y1:y2, x1:x2]
                     if crop.size == 0: continue
                     
-                    # 1. Identify Pack
                     real_name, real_score = trinity_inference(crop, is_pill=False,
                                               session_pills=matrix_pills, 
                                               session_pills_lbl=pills_lbls,
@@ -450,15 +459,17 @@ class AIProcessor:
                     final_score = real_score
                     is_wrong_drug = False
                     
-                    # 2. RX Check for Pack
+                    # 2. RX Check for Pack (BIDIRECTIONAL CHECK)
                     if self.is_rx_mode:
                         clean_real = real_name.replace("_pack", "").lower().strip()
                         allowed_drugs = [d.lower() for d in prescription_state.get_all_drugs()]
                         match_found = False
+                        
                         for allowed in allowed_drugs:
-                            if allowed in clean_real:
+                            # แก้ไขตรงนี้: เช็ค 2 ทาง (AI อยู่ใน List หรือ List อยู่ใน AI)
+                            if allowed in clean_real or clean_real in allowed:
                                 match_found = True
-                                final_name = allowed 
+                                final_name = allowed # ใช้ชื่อจาก List ทันที
                                 break
                         
                         if not match_found and "?" not in real_name and "Unknown" not in real_name:
@@ -478,7 +489,6 @@ class AIProcessor:
                     
                     pack_verified = prescription_state.is_verified(clean_name)
                     
-                    # Store for Pill Phase
                     pack_data = {
                         'label': final_name, 'score': final_score, 'type': 'pack',
                         'verified': pack_verified, 'box': (x1, y1, x2, y2), 'is_wrong': is_wrong_drug,
@@ -488,7 +498,7 @@ class AIProcessor:
                     final_detections.append(pack_data)
 
                 # ==========================================
-                # PHASE 2: DETECT PILLS (Subordinate)
+                # PHASE 2: DETECT PILLS
                 # ==========================================
                 pill_res = model_pill(frame_yolo, verbose=False, conf=CONF_PILL, 
                                      imgsz=AI_IMG_SIZE, max_det=20, agnostic_nms=True)
@@ -504,7 +514,6 @@ class AIProcessor:
                     
                     cx, cy = (x1+x2)>>1, (y1+y2)>>1
                     
-                    # --- CRITICAL: PACK PRIORITY LOGIC ---
                     parent_pack = None
                     for pack in active_packs:
                         if is_point_in_box((cx, cy), pack['box']):
@@ -517,20 +526,19 @@ class AIProcessor:
                     is_verified = False
 
                     if parent_pack:
-                        # CASE A: FOUND INSIDE PACK -> TRUST PACK
-                        final_name = parent_pack['label'] # Inherit name
-                        final_score = parent_pack['score'] # Inherit/Trust Pack confidence
+                        # TRUST PACK
+                        final_name = parent_pack['label'] 
+                        final_score = parent_pack['score'] 
                         is_wrong_drug = parent_pack['is_wrong']
                         is_verified = parent_pack['verified']
                         
-                        # Add to consistency if pack is valid
                         clean_name = parent_pack['clean_name']
                         if not is_wrong_drug:
                              self.consistency_counter[clean_name] = self.consistency_counter.get(clean_name, 0) + 1
                              found_in_this_frame.add(clean_name)
 
                     else:
-                        # CASE B: NO PACK -> RUN TRINITY (Original Logic)
+                        # TRINITY FALLBACK
                         crop = frame_HD[y1:y2, x1:x2]
                         if crop.size > 0:
                             real_name, real_score = trinity_inference(crop, is_pill=True,
@@ -541,13 +549,14 @@ class AIProcessor:
                             final_name = real_name
                             final_score = real_score
 
-                            # Check RX for loose pill
+                            # RX CHECK FOR LOOSE PILL (BIDIRECTIONAL)
                             if self.is_rx_mode:
                                 clean_real = real_name.lower().strip()
                                 allowed_drugs = [d.lower() for d in prescription_state.get_all_drugs()]
                                 match_found = False
                                 for allowed in allowed_drugs:
-                                    if allowed in clean_real: 
+                                    # แก้ไขตรงนี้: เช็ค 2 ทาง
+                                    if allowed in clean_real or clean_real in allowed: 
                                         match_found = True
                                         final_name = allowed 
                                         break
@@ -557,7 +566,6 @@ class AIProcessor:
                                     final_score = 0.0 
                                     is_wrong_drug = True
 
-                            # Auto-Tick for loose pill
                             clean_name = final_name.lower()
                             if not is_wrong_drug and "?" not in final_name and "Unknown" not in final_name and final_score > SCORE_PASS_PILL:
                                 self.consistency_counter[clean_name] = self.consistency_counter.get(clean_name, 0) + 1
@@ -567,13 +575,11 @@ class AIProcessor:
                             
                             is_verified = prescription_state.is_verified(clean_name)
 
-                    # Add to result
                     final_detections.append({
                         'label': final_name, 'score': final_score, 'type': 'pill',
                         'verified': is_verified, 'box': (x1, y1, x2, y2), 'is_wrong': is_wrong_drug
                     })
 
-                # Clear old consistency counters
                 all_tracked = list(self.consistency_counter.keys())
                 for k in all_tracked:
                     if k not in found_in_this_frame:
@@ -596,7 +602,6 @@ THICKNESS = 2
 THICKNESS_BOX = 3
 CHECKBOX_SIZE = 25
 
-# *** DEFINE RGB COLORS ***
 RGB_GREEN = (0, 255, 0)
 RGB_RED   = (255, 0, 0)
 RGB_BLUE  = (0, 0, 255)
@@ -678,7 +683,6 @@ def draw_boxes_on_items(frame, results):
         is_verified = r.get('verified', False)
         is_wrong = r.get('is_wrong', False)
         
-        # Color Logic (USING RGB TUPLES)
         if is_wrong:
             color = RGB_RED 
             label_display = f"!! {label} !!"
@@ -716,7 +720,6 @@ def mouse_callback(event, x, y, flags, param):
 def main():
     TARGET_HN = "HN-101" 
     
-    # 1. Start Camera in RGB Mode
     cam = WebcamStream().start()
     ai = AIProcessor().start()
     
@@ -745,27 +748,19 @@ def main():
     try:
         while True:
             start_loop = time.perf_counter()
-            
-            # 1. ได้ภาพสด (Clean)
             frame_rgb = cam.read()
             if frame_rgb is None: 
                 time.sleep(0.01)
                 continue
             
-            # 2. ส่ง "สำเนา" ให้ AI (เพื่อให้ AI ได้ภาพคลีนๆ ไม่มีเส้น)
             ai.update_frame(frame_rgb.copy()) 
-            
-            # 3. รับผล
             results, cur_patient = ai.get_results()
-            
-            # 4. วาดเส้นลงบนภาพ "ตัวจริง" (In-place modification)
             draw_boxes_on_items(frame_rgb, results)
             
             if cur_patient: 
                 clickable_areas = draw_patient_info(frame_rgb, cur_patient)
                 cv2.setMouseCallback(window_name, mouse_callback, (clickable_areas, ai))
             
-            # 5. คำนวณ FPS
             curr_time = time.perf_counter()
             fps = 1 / (curr_time - prev_time) if (curr_time - prev_time) > 0 else 0
             prev_time = curr_time
@@ -774,7 +769,6 @@ def main():
             cv2.putText(frame_rgb, f"FPS: {fps:.1f} | {temp}", (30, 50), 
                        FONT, 1.2, RGB_GREEN, THICKNESS_BOX)
             
-            # 6. แสดงผลภาพที่วาดแล้ว
             cv2.imshow(window_name, frame_rgb)
             
             key = cv2.waitKey(1) & 0xFF
