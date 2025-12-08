@@ -12,7 +12,7 @@ from ultralytics import YOLO
 from torchvision import models, transforms
 from PIL import Image
 
-#  FIX Display on Raspberry Pi OS
+# 🛠️ FIX Display on Raspberry Pi OS
 os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 # Import Picamera2
@@ -46,7 +46,7 @@ W_COLOR_DEF  = 0.6
 device = torch.device("cpu") # Pi runs on CPU
 print(f"🚀 SYSTEM STARTING ON: {device}")
 
-# ================= 0. UTILS: CPU TEMPERATURE =================
+# ================= 0. UTILS =================
 def get_cpu_temperature():
     try:
         with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
@@ -62,13 +62,14 @@ class WebcamStream:
         self.frame = None
         self.grabbed = False
         self.picam2 = None
+        self.lock = threading.Lock() # เพิ่ม Lock ให้ชัดเจน
 
     def start(self):
         print(" Initializing Picamera2 (HD Mode)...")
         try:
             self.picam2 = Picamera2()
             
-            # Config for HD 720p
+            # 🔥 Config RGB888 ตามรีเควส
             config = self.picam2.create_preview_configuration(
                 main={"size": (1280, 720), "format": "RGB888"},
                 controls={"FrameDurationLimits": (16666, 16666)} 
@@ -77,7 +78,7 @@ class WebcamStream:
             self.picam2.start()
             
             time.sleep(2.0)
-            print(" Camera Ready (1280x720)!")
+            print(" Camera Ready (1280x720 RGB888)!")
         except Exception as e:
             print(f" Camera Init Failed: {e}")
             self.stopped = True
@@ -88,18 +89,23 @@ class WebcamStream:
     def update(self):
         while not self.stopped:
             try:
-                # Picamera2 returns RGB, we might need BGR for OpenCV later
                 frame = self.picam2.capture_array()
                 if frame is not None:
-                    self.frame = frame
-                    self.grabbed = True
+                    with self.lock:
+                        self.frame = frame
+                        self.grabbed = True
                 else:
                     self.stopped = True
             except:
                 self.stopped = True
 
+    # ✅ Fix Formatting: ขยายเป็นหลายบรรทัด
     def read(self):
-        return self.frame
+        with self.lock:
+            if self.grabbed:
+                return self.frame.copy()
+            else:
+                return None
 
     def stop(self):
         self.stopped = True
@@ -186,7 +192,6 @@ try:
     model_pack = YOLO(MODEL_PACK_PATH)
     
     print("   - Loading Embedder...")
-    # NOTE: On Pi, ResNet50 is heavy. If slow, switch to MobileNetV3.
     weights = models.ResNet50_Weights.DEFAULT
     embedder = torch.nn.Sequential(*list(models.resnet50(weights=weights).children())[:-1])
     embedder.eval().to(device)
@@ -208,7 +213,7 @@ def trinity_inference(img_crop, is_pill=True, custom_matrix=None, custom_labels=
     target_labels = custom_labels if custom_labels is not None else global_labels
     if target_matrix is None: return "DB Error", 0.0
 
-    # Image is already BGR from AIProcessor loop
+    # Image is already BGR from AIProcessor loop logic
     if is_pill:
         w_vec, w_sift, w_col = 0.3, 0.1, 0.6 
         pil_img = Image.fromarray(cv2.cvtColor(img_crop, cv2.COLOR_BGR2RGB))
@@ -282,8 +287,11 @@ def trinity_inference(img_crop, is_pill=True, custom_matrix=None, custom_labels=
 # ================= 4. AI WORKER (ASYNC) =================
 class AIProcessor:
     def __init__(self):
-        self.frame_in = None; self.results = [] 
-        self.stopped = False; self.lock = threading.Lock()
+        self.frame_in = None
+        self.results = [] 
+        self.stopped = False
+        self.lock = threading.Lock()
+        
         self.current_patient_info = None 
         self.session_matrix = None
         self.session_labels = None
@@ -292,10 +300,13 @@ class AIProcessor:
     def load_patient(self, patient_data):
         with self.lock:
             if not patient_data:
-                self.is_rx_mode = False; self.current_patient_info = None
-                self.session_matrix = None; self.session_labels = None
+                self.is_rx_mode = False
+                self.current_patient_info = None
+                self.session_matrix = None
+                self.session_labels = None
             else:
-                self.is_rx_mode = True; self.current_patient_info = patient_data
+                self.is_rx_mode = True
+                self.current_patient_info = patient_data
                 drugs = patient_data['drugs']
                 self.session_matrix, self.session_labels = rx_manager.create_session_db(drugs)
                 print(f"🏥 Loaded: {patient_data['name']}")
@@ -304,20 +315,27 @@ class AIProcessor:
         threading.Thread(target=self.loop, args=(), daemon=True).start()
         return self
     
+    # ✅ Fix Formatting: ขยายเป็นหลายบรรทัด
     def set_frame(self, frame): 
-        with self.lock: self.frame_in = frame
+        with self.lock: 
+            self.frame_in = frame
         
+    # ✅ Fix Formatting: ขยายเป็นหลายบรรทัด
     def get_results(self): 
-        with self.lock: return self.results, self.current_patient_info
+        with self.lock: 
+            return self.results, self.current_patient_info
 
     def loop(self):
         while not self.stopped:
             frame = None
             with self.lock:
-                if self.frame_in is not None: frame = self.frame_in; self.frame_in = None
+                if self.frame_in is not None: 
+                    frame = self.frame_in
+                    self.frame_in = None
             
             if frame is None: 
-                time.sleep(0.005); continue
+                time.sleep(0.005)
+                continue
 
             # ⚠️ Convert RGB (from Picamera2) to BGR (for OpenCV/AI Logic)
             frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
@@ -392,9 +410,11 @@ class AIProcessor:
                     })
 
             with self.lock: self.results = detections
+            
     def stop(self): self.stopped = True
 
-# ================= 5. MAIN UI LOOP =================
+# ================= 5. UI DRAWING FUNCTIONS =================
+
 def draw_patient_info(frame, patient_data):
     if not patient_data: return
     H, W = frame.shape[:2]
@@ -411,6 +431,45 @@ def draw_patient_info(frame, patient_data):
     for i, line in enumerate(lines):
         cv2.putText(frame, line, (start_x+10, 25+(i*25)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
 
+def draw_summary_box(frame, results):
+    H, W = frame.shape[:2]
+    
+    # Filter & Count: Only count valid Pills and Packs (exclude Group Box & Errors)
+    items = [r['label'] for r in results 
+             if r['type'] in ['pill', 'pack'] 
+             and "Unknown" not in r['label'] 
+             and "WRONG" not in r['label']]
+    
+    if not items: return
+
+    counts = Counter(items)
+    
+    box_w = 300
+    line_h = 30
+    padding = 10
+    total_lines = len(counts) + 1 # +1 for Header
+    total_h = (total_lines * line_h) + (padding * 2)
+
+    start_x = W - box_w - 20
+    start_y = H - total_h - 20
+
+    # Draw Background
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (start_x, start_y), (W - 20, H - 20), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+    cv2.rectangle(frame, (start_x, start_y), (W - 20, H - 20), (255, 255, 255), 2)
+
+    # Draw Text
+    cv2.putText(frame, "--- DETECTED ---", (start_x + 10, start_y + 25), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    
+    for i, (name, count) in enumerate(counts.items()):
+        y_pos = start_y + 25 + ((i + 1) * line_h)
+        text = f"{name}: {count}"
+        cv2.putText(frame, text, (start_x + 10, y_pos), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+# ================= 6. MAIN LOOP =================
 def main():
     TARGET_HN = "HN-101" 
     
@@ -425,11 +484,9 @@ def main():
     if TARGET_HN in his_db: 
         d = his_db[TARGET_HN]; d['hn'] = TARGET_HN; ai.load_patient(d)
     
-    # Wait for camera
     print(" Waiting for camera feed...")
     while cam.read() is None: time.sleep(0.1)
     
-    # Setup Window (Fullscreen for Pi)
     window_name = "PillTrack - Raspberry Pi"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
@@ -439,7 +496,7 @@ def main():
 
     try:
         while True:
-            # Read Frame (RGB)
+            # Read Frame (RGB from Picamera2)
             frame_rgb = cam.read()
             if frame_rgb is None: 
                 time.sleep(0.01); continue
@@ -460,7 +517,6 @@ def main():
                 
                 if det.get('type') == 'group_box':
                     cv2.rectangle(display, (x1,y1), (x2,y2), color, 4) 
-                    cv2.rectangle(display, (x1, y1-35), (x1+400, y1), color, -1)
                     cv2.putText(display, det['full'], (x1+5, y1-10), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
                 else:
@@ -469,6 +525,9 @@ def main():
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
             if cur_patient: draw_patient_info(display, cur_patient)
+            
+            # Draw Bottom-Right Summary
+            draw_summary_box(display, results)
             
             # Draw Stats
             temp = get_cpu_temperature()
