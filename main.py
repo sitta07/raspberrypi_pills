@@ -45,7 +45,7 @@ CONF_PACK = 0.75
 
 # Accuracy Thresholds
 SCORE_PASS_PILL = 0.2
-SCORE_PASS_PACK = 0.85 
+SCORE_PASS_PACK = 0.75  # Pack threshold: 75% 
 
 device = torch.device("cpu")
 print(f"🚀 SYSTEM STARTING ON: {device} (Optimized Mode)")
