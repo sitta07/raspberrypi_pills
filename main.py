@@ -25,7 +25,7 @@ except ImportError:
 
 # ================= CONFIGURATION =================
 MODEL_PILL_PATH = 'models/pills.pt'          
-MODEL_PACK_PATH = 'models/best_process_2.pt'
+MODEL_PACK_PATH = 'models/best_process_2.onnx'
 
 DB_FILES = {
     'pills': {'vec': 'database/db_pills.pkl', 'col': 'database/colors_pills.pkl'},
@@ -41,8 +41,8 @@ AI_IMG_SIZE = 640
 CONF_PILL = 0.25    
 CONF_PACK = 0.40    
 
-SCORE_PASS_PILL = 0.50  
-SCORE_PASS_PACK = 0.50  
+SCORE_PASS_PILL = 0.2  
+SCORE_PASS_PACK = 0.7  
 
 device = torch.device("cpu")
 print(f"🚀 SYSTEM STARTING ON: {device}")
