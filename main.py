@@ -11,16 +11,18 @@ from ultralytics import YOLO
 from torchvision import models, transforms
 from PIL import Image
 
-# ================= FIX RASPBERRY PI ENVIRONMENT =================
+# ================= 1. FIX CRASH & ENV (สำคัญมาก) =================
 os.environ["QT_QPA_PLATFORM"] = "xcb"
 os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
+# 🔥 จำกัด Thread ของ AI ไม่ให้แย่งกล้องจนน็อค
+os.environ["OMP_NUM_THREADS"] = "1" 
+os.environ["MKL_NUM_THREADS"] = "1"
 
 # Import Picamera2
 try:
     from picamera2 import Picamera2
-    print("[DEBUG] Picamera2 module imported successfully.")
 except ImportError:
-    print("⚠️ Warning: Picamera2 not found. Is this a Raspberry Pi?")
+    print("⚠️ Warning: Picamera2 not found.")
     sys.exit(1)
 
 # ================= CONFIGURATION =================
@@ -33,11 +35,11 @@ DB_FILES = {
 IMG_DB_FOLDER = 'database_images'
 HIS_FILE_PATH = 'prescription.txt' 
 
-# 🔥 ลด Threshold ต่ำสุดๆ เพื่อดูว่าโมเดลทำงานมั้ย
-CONF_PILL = 0.10    
-CONF_PACK = 0.15    
-SCORE_PASS_PILL = 0.50  
-SCORE_PASS_PACK = 0.50  
+# 🔥 ปรับค่ากลับมาให้สมเหตุสมผล (ต่ำไปจะเจอ Noise จนเครื่องค้าง)
+CONF_PILL = 0.40    
+CONF_PACK = 0.50    
+SCORE_PASS_PILL = 0.65  
+SCORE_PASS_PACK = 0.60  
 
 device = torch.device("cpu")
 print(f"🚀 SYSTEM STARTING ON: {device}")
@@ -49,7 +51,7 @@ def get_cpu_temperature():
             return f"{float(f.read()) / 1000.0:.1f}C"
     except: return "N/A"
 
-# ================= 1. WEBCAM STREAM =================
+# ================= WEBCAM STREAM =================
 class WebcamStream:
     def __init__(self):
         self.stopped = False
@@ -63,13 +65,13 @@ class WebcamStream:
         try:
             self.picam2 = Picamera2()
             config = self.picam2.create_preview_configuration(
-                main={"size": (1280, 720), "format": "RGB888"},
-                controls={"FrameDurationLimits": (16666, 16666)} 
+                main={"size": (640, 480), "format": "RGB888"}, # ⚠️ ลดลดเหลือ 640x480 เพื่อความลื่น (Model รับ 640 อยู่แล้ว)
+                controls={"FrameDurationLimits": (33333, 33333)} # Lock at 30 FPS
             )
             self.picam2.configure(config)
             self.picam2.start()
             time.sleep(2.0)
-            print("[DEBUG] Camera Started Successfully (RGB888)")
+            print("[DEBUG] Camera Started (640x480 RGB888)")
         except Exception as e:
             print(f"[ERROR] Camera Init Failed: {e}")
             self.stopped = True
@@ -77,7 +79,6 @@ class WebcamStream:
         return self
 
     def update(self):
-        frame_count = 0
         while not self.stopped:
             try:
                 frame = self.picam2.capture_array()
@@ -85,55 +86,60 @@ class WebcamStream:
                     with self.lock:
                         self.frame = frame
                         self.grabbed = True
-                    # Print every 100 frames just to know it's alive
-                    frame_count += 1
-                    if frame_count % 100 == 0:
-                        print(f"[DEBUG] Camera is sending frames... (Count: {frame_count})")
                 else:
-                    print("[ERROR] Camera returned None frame")
                     self.stopped = True
-            except Exception as e:
-                print(f"[ERROR] Camera Update Error: {e}")
+            except:
                 self.stopped = True
 
     def read(self):
         with self.lock:
-            if self.grabbed and self.frame is not None:
-                return self.frame.copy()
+            if self.grabbed: return self.frame.copy()
             return None
     
     def stop(self):
         self.stopped = True
         if self.picam2: self.picam2.stop(); self.picam2.close()
 
-# ================= 2. RESOURCES =================
+# ================= RESOURCES =================
+class HISLoader:
+    @staticmethod
+    def load_database(filename):
+        if not os.path.exists(filename): return {}
+        db = {}
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"): continue
+                    parts = line.split('|')
+                    if len(parts) < 3: continue
+                    hn, name = parts[0].strip(), parts[1].strip()
+                    drugs = [d.strip().lower() for d in parts[2].split(',') if d.strip()]
+                    db[hn] = {'name': name, 'drugs': drugs}
+            return db
+        except: return {}
+
 class PrescriptionManager:
     def __init__(self, global_vecs, global_lbls):
         self.g_vec = global_vecs; self.g_lbl = global_lbls
-        print(f"[DEBUG] RxManager Init with {len(global_lbls)} labels")
     def create_session_db(self, drug_names_list):
         if not drug_names_list: return None, None
-        print(f"[DEBUG] Creating Session DB for: {drug_names_list}")
         s_vec, s_lbl = [], []
         for idx, label in enumerate(self.g_lbl):
             for target in drug_names_list:
                 if target in label.lower():
                     s_vec.append(self.g_vec[idx]); s_lbl.append(label)
-        if s_vec:
-            print(f"[DEBUG] Found {len(s_vec)} matching vectors for session.")
-            return torch.tensor(np.array(s_vec)).to(device), s_lbl
-        print("[DEBUG] No matching vectors found!")
+        if s_vec: return torch.tensor(np.array(s_vec)).to(device), s_lbl
         return None, None
 
-# Load Resources
-print("[DEBUG] Loading Vectors...")
+print("[DEBUG] Loading Resources...")
 vec_db, color_db = {}, {}
 try:
     with open(DB_FILES['pills']['vec'], 'rb') as f: vec_db.update(pickle.load(f))
     with open(DB_FILES['pills']['col'], 'rb') as f: color_db.update(pickle.load(f))
     with open(DB_FILES['packs']['vec'], 'rb') as f: vec_db.update(pickle.load(f))
     with open(DB_FILES['packs']['col'], 'rb') as f: color_db.update(pickle.load(f))
-except Exception as e: print(f"[ERROR] DB Load Failed: {e}")
+except: pass
 
 global_vectors, global_labels = [], []
 for name, vec_list in vec_db.items():
@@ -145,26 +151,35 @@ rx_manager = PrescriptionManager(global_vectors, global_labels)
 sift = cv2.SIFT_create()
 bf = cv2.BFMatcher()
 sift_db = {}
-# (Skipping SIFT DB Loading debug print to save space, assuming it works)
+if os.path.exists(IMG_DB_FOLDER):
+    for folder in os.listdir(IMG_DB_FOLDER):
+        path = os.path.join(IMG_DB_FOLDER, folder)
+        if not os.path.isdir(path): continue
+        des_list = []
+        for f in [x for x in os.listdir(path) if x.endswith(('jpg','png'))][:3]:
+            img = cv2.imread(os.path.join(path, f), 0)
+            if img is not None:
+                _, des = sift.detectAndCompute(img, None)
+                if des is not None: des_list.append(des)
+        sift_db[folder] = des_list
 
 try:
-    print(f"[DEBUG] Loading YOLO from: {MODEL_PILL_PATH}")
+    # โหลดโมเดล
     model_pill = YOLO(MODEL_PILL_PATH, task='detect')
-    
-    print(f"[DEBUG] Loading YOLO from: {MODEL_PACK_PATH}")
     model_pack = YOLO(MODEL_PACK_PATH, task='detect')
     
+    # ถ้า Pi ช้ามากลองเปลี่ยน ResNet เป็น MobileNet (แต่ตอนนี้ลอง ResNet ไปก่อน)
     weights = models.ResNet50_Weights.DEFAULT
     embedder = torch.nn.Sequential(*list(models.resnet50(weights=weights).children())[:-1])
     embedder.eval().to(device)
+    
     preprocess = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 except Exception as e:
-    print(f"[CRITICAL ERROR] Model Load Failed: {e}")
-    sys.exit(1)
+    print(f"[CRITICAL] Model Error: {e}"); sys.exit(1)
 
 # ================= 3. TRINITY ENGINE =================
 def trinity_inference(img_crop, is_pill=True, custom_matrix=None, custom_labels=None):
@@ -173,11 +188,7 @@ def trinity_inference(img_crop, is_pill=True, custom_matrix=None, custom_labels=
     if target_matrix is None: return "DB Error", 0.0
 
     try:
-        # Debug Input
-        # print(f"[DEBUG-TRINITY] Input shape: {img_crop.shape}")
-        
-        if is_pill:
-            pil_img = Image.fromarray(img_crop) 
+        if is_pill: pil_img = Image.fromarray(img_crop) 
         else:
             gray_crop = cv2.cvtColor(img_crop, cv2.COLOR_RGB2GRAY)
             crop_3ch_gray = cv2.merge([gray_crop, gray_crop, gray_crop])
@@ -189,11 +200,6 @@ def trinity_inference(img_crop, is_pill=True, custom_matrix=None, custom_labels=
             live_vec = live_vec / live_vec.norm()
             
         scores = torch.matmul(live_vec, target_matrix.T).squeeze(0)
-        
-        # Check scores
-        # max_score = torch.max(scores).item()
-        # print(f"[DEBUG-TRINITY] Max Vector Score: {max_score:.2f}")
-
         k_val = min(10, len(target_labels))
         if k_val == 0: return "Unknown", 0.0
         
@@ -221,7 +227,15 @@ def trinity_inference(img_crop, is_pill=True, custom_matrix=None, custom_labels=
         for name, vec_score in candidates:
             clean_name = name.replace("_pill", "").replace("_pack", "")
             sift_score = 0.0
-            # (SIFT Logic omitted for brevity, assuming standard)
+            if des_live is not None and clean_name in sift_db:
+                max_good = 0
+                for ref_des in sift_db[clean_name]:
+                    try:
+                        matches = bf.knnMatch(des_live, ref_des, k=2)
+                        good = [m for m,n in matches if m.distance < 0.75 * n.distance]
+                        if len(good) > max_good: max_good = len(good)
+                    except: pass
+                sift_score = min(max_good / 15.0, 1.0)
                 
             color_score = 0.0
             if is_pill and name in color_db:
@@ -236,9 +250,7 @@ def trinity_inference(img_crop, is_pill=True, custom_matrix=None, custom_labels=
             if total > best_score: best_score = total; final_name = clean_name
 
         return final_name, best_score
-    except Exception as e:
-        print(f"[ERROR-TRINITY] {e}")
-        return "Error", 0.0
+    except: return "Error", 0.0
 
 # ================= 4. AI WORKER =================
 class AIProcessor:
@@ -248,7 +260,19 @@ class AIProcessor:
         self.stopped = False
         self.lock = threading.Lock()
         self.is_rx_mode = False
+        self.current_patient_info = None
         self.session_matrix = None; self.session_labels = None
+
+    def load_patient(self, patient_data):
+        with self.lock:
+            if not patient_data:
+                self.is_rx_mode = False; self.current_patient_info = None
+                self.session_matrix = None; self.session_labels = None
+            else:
+                self.is_rx_mode = True; self.current_patient_info = patient_data
+                drugs = patient_data['drugs']
+                self.session_matrix, self.session_labels = rx_manager.create_session_db(drugs)
+                print(f"🏥 Loaded: {patient_data['name']}")
 
     def start(self): 
         threading.Thread(target=self.run, daemon=True).start()
@@ -258,7 +282,7 @@ class AIProcessor:
         with self.lock: self.latest_frame = frame.copy() 
         
     def get_results(self): 
-        with self.lock: return self.results
+        with self.lock: return self.results, self.current_patient_info
 
     def run(self):
         print("[DEBUG] AI Worker Loop Started.")
@@ -272,168 +296,173 @@ class AIProcessor:
             if frame_to_process is None: 
                 time.sleep(0.01); continue
 
-            # 🔥 Force Contiguous Array (Memory Fix for Pi)
+            # Force Contiguous (แก้ปัญหา Memory Picamera)
             frame_clean = np.ascontiguousarray(frame_to_process)
             
-            # Uncomment to debug image shape entering YOLO
-            # print(f"[DEBUG-AI] Processing frame shape: {frame_clean.shape}")
-
             detections = []
-            pill_names_batch = []
-            pill_coords = []
+            pill_names_batch = [] 
+            pill_coords = []      
 
-            # 1. Detect Pills
+            def process_crop(crop, is_pill_mode):
+                name, score = trinity_inference(crop, is_pill=is_pill_mode,
+                                                custom_matrix=self.session_matrix,
+                                                custom_labels=self.session_labels)
+                threshold = SCORE_PASS_PILL if is_pill_mode else SCORE_PASS_PACK
+                label_prefix, color = "", (0,0,255)
+                if score > threshold:
+                    color = (0,255,0) if is_pill_mode else (255,0,255)
+                    if self.is_rx_mode: label_prefix = "OK "; color = (0,255,0)
+                else:
+                    if self.is_rx_mode: name = "WRONG"; label_prefix = "!!! "
+                return name, score, label_prefix, color
+
             try:
-                # Use verbose=False to keep terminal clean, but check len below
-                pill_res = model_pill(frame_clean, verbose=False, conf=CONF_PILL)
-                
-                # 🔥 DEBUG: Check if YOLO saw anything
+                # 1. Pills 
+                # 🔥 Limit max_det=10 เพื่อป้องกัน CPU ระเบิดถ้าเจอ Noise เยอะ
+                pill_res = model_pill(frame_clean, verbose=False, conf=CONF_PILL, max_det=10)
                 if len(pill_res[0].boxes) > 0:
-                    print(f"[DEBUG] YOLO found {len(pill_res[0].boxes)} pills")
-                
-                for box in pill_res[0].boxes.xyxy.cpu().numpy().astype(int):
-                    x1,y1,x2,y2 = box
-                    crop = frame_clean[y1:y2, x1:x2]
-                    if crop.size == 0: continue
+                    for box in pill_res[0].boxes.xyxy.cpu().numpy().astype(int):
+                        x1,y1,x2,y2 = box
+                        if x2<=x1 or y2<=y1: continue
+                        crop = frame_clean[y1:y2, x1:x2]
+                        if crop.size == 0: continue
 
-                    nm, sc = trinity_inference(crop, is_pill=True,
-                                             custom_matrix=self.session_matrix,
-                                             custom_labels=self.session_labels)
-                    
-                    print(f"   -> Pill: {nm} (Score: {sc:.2f})") # 🔥 Print identified pill
+                        nm, sc, pf, clr = process_crop(crop, True)
+                        if "WRONG" not in nm and "Unknown" not in nm:
+                            pill_names_batch.append(nm); pill_coords.append((x1,y1,x2,y2))
+                        detections.append({'box':box, 'label':nm, 'full':f"{pf}{nm} {sc:.0%}", 'color':clr, 'type':'pill'})
 
-                    # Color Logic
-                    color = (0,0,255)
-                    if sc > SCORE_PASS_PILL:
-                        color = (0,255,0)
-                        if "Unknown" not in nm: 
-                            pill_names_batch.append(nm); pill_coords.append(box)
-                    
-                    detections.append({'box':box, 'label':nm, 'full':f"{nm} {sc:.0%}", 'color':color, 'type':'pill'})
+                # 2. Packs
+                pack_res = model_pack(frame_clean, verbose=False, conf=CONF_PACK, retina_masks=True, max_det=5)
+                if pack_res[0].masks is not None:
+                    masks = pack_res[0].masks.data.cpu().numpy()
+                    boxes = pack_res[0].boxes.xyxy.cpu().numpy().astype(int)
+                    for i, box in enumerate(boxes):
+                        x1,y1,x2,y2 = box
+                        if x2<=x1 or y2<=y1: continue
+                        
+                        raw_mask = masks[i]
+                        mask_resized = cv2.resize(raw_mask, (frame_clean.shape[1], frame_clean.shape[0]))
+                        mask_binary = (mask_resized > 0.5).astype(np.uint8)
+                        masked = frame_clean.copy(); masked[mask_binary == 0] = [128,128,128]
+                        crop = masked[y1:y2, x1:x2]
+                        if crop.size == 0: continue
 
+                        nm, sc, pf, clr = process_crop(crop, False)
+                        detections.append({'box':box, 'label':nm, 'full':f"{pf}{nm} {sc:.0%}", 'color':clr, 'type':'pack'})
+
+                # 3. Group Box
+                if pill_coords:
+                    counts = Counter(pill_names_batch)
+                    if counts:
+                        maj_name = counts.most_common(1)[0][0]
+                        all_x1 = [c[0] for c in pill_coords]; all_y1 = [c[1] for c in pill_coords]
+                        all_x2 = [c[2] for c in pill_coords]; all_y2 = [c[3] for c in pill_coords]
+                        gx1 = max(0, min(all_x1)-20); gy1 = max(0, min(all_y1)-40)
+                        gx2 = max(all_x2)+20; gy2 = max(all_y2)+20
+                        detections.append({'box': (gx1, gy1, gx2, gy2), 'label': maj_name,
+                                           'full': f"BATCH: {maj_name} ({len(pill_coords)})",
+                                           'color': (0,255,255), 'type':'group_box'})
+
+                with self.lock: self.results = detections
             except Exception as e:
-                print(f"[ERROR-YOLO-PILL] {e}")
-
-            # 2. Detect Packs (Similar logic...)
-            try:
-                pack_res = model_pack(frame_clean, verbose=False, conf=CONF_PACK)
-                if len(pack_res[0].boxes) > 0:
-                    print(f"[DEBUG] YOLO found {len(pack_res[0].boxes)} packs")
-
-                for box in pack_res[0].boxes.xyxy.cpu().numpy().astype(int):
-                    x1,y1,x2,y2 = box
-                    crop = frame_clean[y1:y2, x1:x2]
-                    if crop.size == 0: continue
-                    nm, sc = trinity_inference(crop, is_pill=False,
-                                             custom_matrix=self.session_matrix,
-                                             custom_labels=self.session_labels)
-                    
-                    color = (0,255,0) if sc > SCORE_PASS_PACK else (0,0,255)
-                    detections.append({'box':box, 'label':nm, 'full':f"{nm} {sc:.0%}", 'color':color, 'type':'pack'})
-            except Exception as e:
-                print(f"[ERROR-YOLO-PACK] {e}")
-
-            # 3. Group Box
-            if pill_coords:
-                counts = Counter(pill_names_batch)
-                if counts:
-                    maj_name = counts.most_common(1)[0][0]
-                    # Calculate bounds safely
-                    all_x1 = [c[0] for c in pill_coords]; all_y1 = [c[1] for c in pill_coords]
-                    all_x2 = [c[2] for c in pill_coords]; all_y2 = [c[3] for c in pill_coords]
-                    gx1 = max(0, min(all_x1)-20); gy1 = max(0, min(all_y1)-40)
-                    gx2 = max(all_x2)+20; gy2 = max(all_y2)+20
-                    
-                    detections.append({
-                        'box': (gx1, gy1, gx2, gy2),
-                        'label': maj_name,
-                        'full': f"BATCH: {maj_name} ({len(pill_coords)})",
-                        'color': (0,255,255), 'type':'group_box'
-                    })
-
-            with self.lock: self.results = detections
+                print(f"[ERROR-AI-LOOP] {e}")
             
     def stop(self): self.stopped = True
 
 # ================= 5. DRAWING =================
+def draw_patient_info(frame, patient_data):
+    if not patient_data: return
+    H, W = frame.shape[:2]
+    box_w = 300; start_x = W - box_w
+    lines = [f"HN: {patient_data.get('hn', 'N/A')}",
+             f"Name: {patient_data.get('name', 'N/A')}", "--- Rx List ---"]
+    for d in patient_data.get('drugs', [])[:5]: lines.append(f"- {d}")
+    box_h = (len(lines) * 25) + 15
+    cv2.rectangle(frame, (start_x, 0), (W, box_h), (50,50,50), -1)
+    cv2.rectangle(frame, (start_x, 0), (W, box_h), (0,255,255), 2)
+    for i, line in enumerate(lines):
+        cv2.putText(frame, line, (start_x+10, 25+(i*25)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
+
 def draw_summary_box(frame, results):
     if not results: return
     items = [r['label'] for r in results 
-             if r['type'] in ['pill', 'pack'] and "Unknown" not in r['label']]
+             if r['type'] in ['pill', 'pack'] and "Unknown" not in r['label'] and "WRONG" not in r['label']]
     if not items: return
-
     counts = Counter(items)
     H, W = frame.shape[:2]
-    
-    # Debug: Print summary to console
-    # print(f"[DEBUG-UI] Summary: {dict(counts)}")
-
-    start_x = W - 300
-    start_y = H - (len(counts)*30) - 60
-    
-    cv2.rectangle(frame, (start_x, start_y), (W, H), (0,0,0), -1)
-    cv2.rectangle(frame, (start_x, start_y), (W, H), (255,255,255), 2)
-    
+    box_w = 300; line_h = 30; padding = 10
+    total_lines = len(counts) + 1
+    total_h = (total_lines * line_h) + (padding * 2)
+    start_x = W - box_w - 20; start_y = H - total_h - 20
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (start_x, start_y), (W - 20, H - 20), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+    cv2.rectangle(frame, (start_x, start_y), (W - 20, H - 20), (255, 255, 255), 2)
+    cv2.putText(frame, "--- DETECTED ---", (start_x + 10, start_y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
     for i, (name, count) in enumerate(counts.items()):
-        y = start_y + 40 + (i*30)
-        cv2.putText(frame, f"{name}: {count}", (start_x+10, y), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+        y_pos = start_y + 25 + ((i + 1) * line_h)
+        cv2.putText(frame, f"{name}: {count}", (start_x + 10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
 # ================= 6. MAIN =================
 def main():
-    print("[DEBUG] Main Started")
+    TARGET_HN = "HN-101" 
     cam = WebcamStream().start()
     ai = AIProcessor().start()
     
-    print("[DEBUG] Waiting for camera...")
+    his_db = HISLoader.load_database(HIS_FILE_PATH)
+    if TARGET_HN in his_db: 
+        d = his_db[TARGET_HN]; d['hn'] = TARGET_HN; ai.load_patient(d)
+    
+    print(" Waiting for camera feed...")
     while cam.read() is None: time.sleep(0.1)
-    print("[DEBUG] Camera is Live.")
+    print(" Camera Live!")
 
     window_name = "PillTrack"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
+    print("🎥 RUNNING... Press 'R' to Reload")
     fps = 0; prev_time = 0
+
     try:
         while True:
-            frame = cam.read() # RGB
-            if frame is None: time.sleep(0.01); continue
+            frame_rgb = cam.read()
+            if frame_rgb is None: time.sleep(0.01); continue
             
-            ai.update_frame(frame)
-            results = ai.get_results() # Get whatever results are available
+            ai.update_frame(frame_rgb)
+            display = frame_rgb.copy()
+            results, cur_patient = ai.get_results()
             
-            # 🔥 Draw directly on RGB frame
-            display = frame.copy()
+            for det in results:
+                x1,y1,x2,y2 = det['box']
+                color = det['color']
+                if det.get('type') == 'group_box':
+                    cv2.rectangle(display, (x1,y1), (x2,y2), color, 4) 
+                    cv2.putText(display, det['full'], (x1+5, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
+                else:
+                    cv2.rectangle(display, (x1,y1), (x2,y2), color, 2)
+                    cv2.putText(display, det['label'], (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+            if cur_patient: draw_patient_info(display, cur_patient)
+            draw_summary_box(display, results)
             
-            # วาดผลลัพธ์
-            if results:
-                for det in results:
-                    x1,y1,x2,y2 = det['box']
-                    color = det['color'] # RGB Color (0,255,0) is Green
-                    
-                    if det['type'] == 'group_box':
-                        cv2.rectangle(display, (x1,y1), (x2,y2), color, 4)
-                        cv2.putText(display, det['full'], (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
-                    else:
-                        cv2.rectangle(display, (x1,y1), (x2,y2), color, 2)
-                        cv2.putText(display, det['full'], (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-                
-                draw_summary_box(display, results)
-            
-            # Calculate FPS
             curr_time = time.time()
-            if (curr_time - prev_time) > 0: fps = 1/(curr_time - prev_time)
+            if (curr_time - prev_time) > 0: fps = 1 / (curr_time - prev_time)
             prev_time = curr_time
+            temp = get_cpu_temperature()
             
-            cv2.putText(display, f"FPS: {fps:.1f}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+            cv2.putText(display, f"FPS: {fps:.1f} | Temp: {temp}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
             cv2.imshow(window_name, display)
             
-            if cv2.waitKey(1) & 0xFF == ord('q'): break
-
-    except KeyboardInterrupt:
-        print("\n[DEBUG] Stopping...")
-    finally:
-        cam.stop(); ai.stop(); cv2.destroyAllWindows()
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'): break
+            elif key == ord('r'):
+                his_db = HISLoader.load_database(HIS_FILE_PATH)
+                if TARGET_HN in his_db: d = his_db[TARGET_HN]; d['hn'] = TARGET_HN; ai.load_patient(d)
+                
+    except KeyboardInterrupt: print("\n Stopping...")
+    finally: cam.stop(); ai.stop(); cv2.destroyAllWindows(); print(" Bye Bye!")
 
 if __name__ == "__main__":
     main()
