@@ -23,7 +23,7 @@ except ImportError:
     sys.exit(1)
 
 # ================= CONFIGURATION =================
-MODEL_PILL_PATH = 'models/pills.pt'   
+MODEL_PILL_PATH = 'models/pills.onnx'   
 MODEL_PACK_PATH = 'models/best_process_2.onnx' 
 
 # 🧠 Logic: Auto-Detect Box Visibility & Model Name
