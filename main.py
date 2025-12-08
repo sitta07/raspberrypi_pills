@@ -34,10 +34,10 @@ HIS_FILE_PATH = 'prescription.txt'
 
 # Display & AI Resolution
 DISPLAY_W, DISPLAY_H = 1280, 720
-AI_IMG_SIZE = 416 
+AI_IMG_SIZE = 832 
 
 # Thresholds
-CONF_PILL = 0.4    
+CONF_PILL = 0.45    
 CONF_PACK = 0.7     # ลดลงนิดหน่อยเพื่อให้ Detect เจอกล่องง่ายขึ้น แล้วไปคัดที่ Logic แทน
 SCORE_PASS_PILL = 0.2
 SCORE_PASS_PACK = 0.5
