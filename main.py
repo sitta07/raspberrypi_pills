@@ -283,7 +283,7 @@ def trinity_inference(img_crop, is_pill=True,
         candidates = []
         seen = set()
         
-        for idx, sc in zip(top_k_idx.cpu().numpy(), top_k_val.cpu().numpy()):
+        for idx, sc in zip(top_k_idx.detach().cpu().numpy(), top_k_val.detach().cpu().numpy()):
             name = target_labels[idx]
             if name not in seen:
                 candidates.append((name, float(sc)))
@@ -424,7 +424,7 @@ class AIProcessor:
                 pill_res = model_pill(frame_yolo, verbose=False, conf=CONF_PILL, 
                                      imgsz=AI_IMG_SIZE, max_det=10, agnostic_nms=True)
                 
-                for box in pill_res[0].boxes.xyxy.cpu().numpy().astype(int):
+                for box in pill_res[0].boxes.xyxy.detach().cpu().numpy().astype(int):
                     x1_s, y1_s, x2_s, y2_s = box
                     
                     # Scale to display resolution
@@ -465,7 +465,7 @@ class AIProcessor:
                 pack_res = model_pack(frame_yolo, verbose=False, conf=CONF_PACK, 
                                      imgsz=AI_IMG_SIZE, max_det=5, agnostic_nms=True)
                 
-                for box in pack_res[0].boxes.xyxy.cpu().numpy().astype(int):
+                for box in pack_res[0].boxes.xyxy.detach().cpu().numpy().astype(int):
                     x1_s, y1_s, x2_s, y2_s = box
                     
                     # Scale to display resolution
