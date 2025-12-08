@@ -253,15 +253,18 @@ def trinity_inference(img_crop, is_pill=True, custom_matrix=None, custom_labels=
     except: return "Error", 0.0
 
 # ================= 4. AI WORKER =================
+# ================= 4. AI WORKER (DEBUG MODE) =================
 class AIProcessor:
     def __init__(self):
         self.latest_frame = None 
         self.results = [] 
         self.stopped = False
         self.lock = threading.Lock()
-        self.is_rx_mode = False
-        self.current_patient_info = None
+        
+        self.current_patient_info = None 
         self.session_matrix = None; self.session_labels = None
+        self.is_rx_mode = False
+        self.frame_count_debug = 0 # ตัวนับเฟรมสำหรับ debug
 
     def load_patient(self, patient_data):
         with self.lock:
@@ -296,9 +299,23 @@ class AIProcessor:
             if frame_to_process is None: 
                 time.sleep(0.01); continue
 
-            # Force Contiguous (แก้ปัญหา Memory Picamera)
-            frame_clean = np.ascontiguousarray(frame_to_process)
+            # 🛠️ DEBUG 1: บันทึกภาพที่ AI เห็นลงเครื่องเพื่อเช็คว่าภาพดำมั้ย
+            self.frame_count_debug += 1
+            if self.frame_count_debug % 100 == 0:
+                # Save as BGR for verification (OpenCV saves BGR)
+                debug_save = cv2.cvtColor(frame_to_process, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(f"debug_ai_input.jpg", debug_save)
+                print(f"[DEBUG] Saved 'debug_ai_input.jpg' to check image quality")
+
+            # 🔥 FIX 2: Resize เป็น 640x640 (Square) เพื่อให้ชัวร์ว่า YOLO ชอบ
+            # และใช้ np.ascontiguousarray
+            img_input = cv2.resize(frame_to_process, (640, 640))
+            frame_clean = np.ascontiguousarray(img_input)
             
+            # เก็บสเกลไว้คูณพิกัดกลับ (เพราะเราย่อภาพไป process)
+            scale_x = frame_to_process.shape[1] / 640.0
+            scale_y = frame_to_process.shape[0] / 640.0
+
             detections = []
             pill_names_batch = [] 
             pill_coords = []      
@@ -317,39 +334,50 @@ class AIProcessor:
                 return name, score, label_prefix, color
 
             try:
-                # 1. Pills 
-                # 🔥 Limit max_det=10 เพื่อป้องกัน CPU ระเบิดถ้าเจอ Noise เยอะ
-                pill_res = model_pill(frame_clean, verbose=False, conf=CONF_PILL, max_det=10)
+                # 1. Pills (Detection)
+                # 🔥 FIX 3: ลด conf ต่ำมาก (0.15) และ imgsz=640
+                pill_res = model_pill(frame_clean, verbose=False, conf=0.15, imgsz=640, max_det=10)
+                
+                # Debug Print Raw
                 if len(pill_res[0].boxes) > 0:
-                    for box in pill_res[0].boxes.xyxy.cpu().numpy().astype(int):
-                        x1,y1,x2,y2 = box
-                        if x2<=x1 or y2<=y1: continue
-                        crop = frame_clean[y1:y2, x1:x2]
-                        if crop.size == 0: continue
+                    print(f"[DEBUG] YOLO detected {len(pill_res[0].boxes)} items (Raw)")
 
-                        nm, sc, pf, clr = process_crop(crop, True)
-                        if "WRONG" not in nm and "Unknown" not in nm:
-                            pill_names_batch.append(nm); pill_coords.append((x1,y1,x2,y2))
-                        detections.append({'box':box, 'label':nm, 'full':f"{pf}{nm} {sc:.0%}", 'color':clr, 'type':'pill'})
+                for box in pill_res[0].boxes.xyxy.cpu().numpy().astype(int):
+                    # Coordinates บนภาพ 640x640
+                    x1_s, y1_s, x2_s, y2_s = box
+                    
+                    # แปลงกลับเป็นพิกัดภาพจริง
+                    x1 = int(x1_s * scale_x); y1 = int(y1_s * scale_y)
+                    x2 = int(x2_s * scale_x); y2 = int(y2_s * scale_y)
 
-                # 2. Packs
-                pack_res = model_pack(frame_clean, verbose=False, conf=CONF_PACK, retina_masks=True, max_det=5)
-                if pack_res[0].masks is not None:
-                    masks = pack_res[0].masks.data.cpu().numpy()
-                    boxes = pack_res[0].boxes.xyxy.cpu().numpy().astype(int)
-                    for i, box in enumerate(boxes):
-                        x1,y1,x2,y2 = box
-                        if x2<=x1 or y2<=y1: continue
-                        
-                        raw_mask = masks[i]
-                        mask_resized = cv2.resize(raw_mask, (frame_clean.shape[1], frame_clean.shape[0]))
-                        mask_binary = (mask_resized > 0.5).astype(np.uint8)
-                        masked = frame_clean.copy(); masked[mask_binary == 0] = [128,128,128]
-                        crop = masked[y1:y2, x1:x2]
-                        if crop.size == 0: continue
+                    # Crop จากภาพจริง (Original Resolution) เพื่อความชัด
+                    crop = frame_to_process[y1:y2, x1:x2]
+                    if crop.size == 0: continue
 
-                        nm, sc, pf, clr = process_crop(crop, False)
-                        detections.append({'box':box, 'label':nm, 'full':f"{pf}{nm} {sc:.0%}", 'color':clr, 'type':'pack'})
+                    nm, sc, pf, clr = process_crop(crop, True)
+                    
+                    # Log การเจอ
+                    print(f"   -> Pill Logic: {nm} ({sc:.2f})")
+
+                    if "WRONG" not in nm and "Unknown" not in nm:
+                        pill_names_batch.append(nm); pill_coords.append((x1,y1,x2,y2))
+                    
+                    detections.append({'box':(x1,y1,x2,y2), 'label':nm, 'full':f"{pf}{nm} {sc:.0%}", 'color':clr, 'type':'pill'})
+
+                # 2. Packs (Detection)
+                pack_res = model_pack(frame_clean, verbose=False, conf=0.20, imgsz=640, max_det=5)
+                for box in pack_res[0].boxes.xyxy.cpu().numpy().astype(int):
+                    x1_s, y1_s, x2_s, y2_s = box
+                    x1 = int(x1_s * scale_x); y1 = int(y1_s * scale_y)
+                    x2 = int(x2_s * scale_x); y2 = int(y2_s * scale_y)
+
+                    crop = frame_to_process[y1:y2, x1:x2]
+                    if crop.size == 0: continue
+
+                    nm, sc, pf, clr = process_crop(crop, False)
+                    print(f"   -> Pack Logic: {nm} ({sc:.2f})")
+                    
+                    detections.append({'box':(x1,y1,x2,y2), 'label':nm, 'full':f"{pf}{nm} {sc:.0%}", 'color':clr, 'type':'pack'})
 
                 # 3. Group Box
                 if pill_coords:
@@ -365,6 +393,7 @@ class AIProcessor:
                                            'color': (0,255,255), 'type':'group_box'})
 
                 with self.lock: self.results = detections
+            
             except Exception as e:
                 print(f"[ERROR-AI-LOOP] {e}")
             
