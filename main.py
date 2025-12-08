@@ -37,7 +37,7 @@ AI_IMG_SIZE = 416
 
 # Thresholds
 CONF_PILL = 0.25    
-CONF_PACK = 0.6     
+CONF_PACK = 0.5     # ปรับ Pack ให้ detect ง่ายขึ้นนิดนึง เพราะเราเชื่อมันมาก
 SCORE_PASS_PILL = 0.2
 SCORE_PASS_PACK = 0.6
 
@@ -402,7 +402,7 @@ class AIProcessor:
         return True
 
     def run(self):
-        print("[DEBUG] AI Worker Loop Started (RGB Mode).")
+        print("[DEBUG] AI Worker Loop Started (RGB Mode) - Priority Pack > Pill")
         
         while not self.stopped:
             with self.lock:
@@ -417,98 +417,13 @@ class AIProcessor:
                                    interpolation=self.resize_interpolation)
             
             final_detections = []
-            detected_pills_raw = [] 
-            valid_pills = []
+            active_packs = [] # Store packs found in this frame to override pills
             found_in_this_frame = set()
 
             try:
-                # --- 1. DETECT PILLS ---
-                pill_res = model_pill(frame_yolo, verbose=False, conf=CONF_PILL, 
-                                     imgsz=AI_IMG_SIZE, max_det=10, agnostic_nms=True)
-                
-                best_pill_score = -1
-                best_pill_name = None
-
-                for box in pill_res[0].boxes.xyxy.detach().cpu().numpy().astype(int):
-                    x1_s, y1_s, x2_s, y2_s = box
-                    x1, y1 = int(x1_s * self.scale_x), int(y1_s * self.scale_y)
-                    x2, y2 = int(x2_s * self.scale_x), int(y2_s * self.scale_y)
-                    
-                    if not self.is_valid_detection((x1, y1, x2, y2), DISPLAY_W, DISPLAY_H):
-                        continue
-                    
-                    if (x2-x1) < 30 or (y2-y1) < 30: continue
-                    crop = frame_HD[y1:y2, x1:x2] # Cropping from RGB
-                    if crop.size == 0: continue
-
-                    real_name, real_score = trinity_inference(crop, is_pill=True,
-                                              session_pills=matrix_pills,       
-                                              session_pills_lbl=pills_lbls,
-                                              session_packs=matrix_packs,
-                                              session_packs_lbl=packs_lbls)
-                    
-                    cx, cy = (x1+x2)>>1, (y1+y2)>>1
-                    
-                    final_name = real_name
-                    final_score = real_score
-                    is_wrong_drug = False
-
-                    if self.is_rx_mode:
-                        clean_real = real_name.lower().strip()
-                        allowed_drugs = [d.lower() for d in prescription_state.get_all_drugs()]
-                        
-                        match_found = False
-                        for allowed in allowed_drugs:
-                            if allowed in clean_real: 
-                                match_found = True
-                                final_name = allowed 
-                                break
-                        
-                        if not match_found and "?" not in real_name and "Unknown" not in real_name:
-                            final_name = f"WRONG: {real_name}"
-                            final_score = 0.0 
-                            is_wrong_drug = True
-
-                    if not is_wrong_drug and "?" not in final_name and "Unknown" not in final_name and final_score > best_pill_score:
-                        best_pill_score = final_score
-                        best_pill_name = final_name
-                        
-                    detected_pills_raw.append({
-                        'name': final_name, 'score': final_score, 'center': (cx, cy), 
-                        'box': (x1, y1, x2, y2), 'is_wrong': is_wrong_drug
-                    })
-
-                # Process Pills
-                for pill in detected_pills_raw:
-                    nm, sc = pill['name'], pill['score']
-                    is_wrong = pill['is_wrong']
-                    
-                    if not is_wrong and best_pill_name and ("?" in nm or "Unknown" in nm or sc < SCORE_PASS_PILL):
-                        nm, sc = best_pill_name, best_pill_score
-                    
-                    clean_name = nm.lower()
-                    
-                    # Logic: Auto-Tick
-                    if not is_wrong and "?" not in nm and "Unknown" not in nm and sc >= SCORE_PASS_PILL:
-                        self.consistency_counter[clean_name] = self.consistency_counter.get(clean_name, 0) + 1
-                        found_in_this_frame.add(clean_name)
-                        
-                        if self.consistency_counter[clean_name] >= CONSISTENCY_THRESHOLD:
-                            prescription_state.verify_drug(clean_name)
-                    
-                    is_verified = prescription_state.is_verified(clean_name)
-                    
-                    if not is_wrong and "?" not in nm and "Unknown" not in nm:
-                        valid_pills.append({
-                            'name': nm, 'center': pill['center'], 'verified': is_verified, 'score': sc
-                        })
-
-                    final_detections.append({
-                        'label': nm, 'score': sc, 'type': 'pill',
-                        'verified': is_verified, 'box': pill['box'], 'is_wrong': is_wrong
-                    })
-
-                # --- 2. DETECT PACKS ---
+                # ==========================================
+                # PHASE 1: DETECT PACKS FIRST (Priority)
+                # ==========================================
                 pack_res = model_pack(frame_yolo, verbose=False, conf=CONF_PACK, 
                                      imgsz=AI_IMG_SIZE, max_det=5, agnostic_nms=True)
                 
@@ -524,6 +439,7 @@ class AIProcessor:
                     crop = frame_HD[y1:y2, x1:x2]
                     if crop.size == 0: continue
                     
+                    # 1. Identify Pack
                     real_name, real_score = trinity_inference(crop, is_pill=False,
                                               session_pills=matrix_pills, 
                                               session_pills_lbl=pills_lbls,
@@ -534,6 +450,7 @@ class AIProcessor:
                     final_score = real_score
                     is_wrong_drug = False
                     
+                    # 2. RX Check for Pack
                     if self.is_rx_mode:
                         clean_real = real_name.replace("_pack", "").lower().strip()
                         allowed_drugs = [d.lower() for d in prescription_state.get_all_drugs()]
@@ -551,6 +468,7 @@ class AIProcessor:
 
                     clean_name = final_name.replace("_pack", "").lower()
 
+                    # 3. Register Valid Pack
                     if not is_wrong_drug and "?" not in final_name and "Unknown" not in final_name and final_score >= SCORE_PASS_PACK:
                         self.consistency_counter[clean_name] = self.consistency_counter.get(clean_name, 0) + 1
                         found_in_this_frame.add(clean_name)
@@ -560,26 +478,102 @@ class AIProcessor:
                     
                     pack_verified = prescription_state.is_verified(clean_name)
                     
-                    if not is_wrong_drug:
-                        for pill in valid_pills:
-                            if is_point_in_box(pill['center'], (x1, y1, x2, y2)):
-                                if pill['score'] >= SCORE_PASS_PILL or pill['verified']:
-                                    pack_verified = True
-                                    final_name = pill['name']
-                                    final_score = max(final_score, pill['score'])
-                                    clean_pill = final_name.lower()
-                                    
-                                    self.consistency_counter[clean_pill] = CONSISTENCY_THRESHOLD + 1
-                                    found_in_this_frame.add(clean_pill)
-                                    
-                                    prescription_state.verify_drug(clean_pill)
-                                    break
-                    
-                    final_detections.append({
+                    # Store for Pill Phase
+                    pack_data = {
                         'label': final_name, 'score': final_score, 'type': 'pack',
-                        'verified': pack_verified, 'box': (x1, y1, x2, y2), 'is_wrong': is_wrong_drug
+                        'verified': pack_verified, 'box': (x1, y1, x2, y2), 'is_wrong': is_wrong_drug,
+                        'clean_name': clean_name
+                    }
+                    active_packs.append(pack_data)
+                    final_detections.append(pack_data)
+
+                # ==========================================
+                # PHASE 2: DETECT PILLS (Subordinate)
+                # ==========================================
+                pill_res = model_pill(frame_yolo, verbose=False, conf=CONF_PILL, 
+                                     imgsz=AI_IMG_SIZE, max_det=20, agnostic_nms=True)
+                
+                for box in pill_res[0].boxes.xyxy.detach().cpu().numpy().astype(int):
+                    x1_s, y1_s, x2_s, y2_s = box
+                    x1, y1 = int(x1_s * self.scale_x), int(y1_s * self.scale_y)
+                    x2, y2 = int(x2_s * self.scale_x), int(y2_s * self.scale_y)
+                    
+                    if not self.is_valid_detection((x1, y1, x2, y2), DISPLAY_W, DISPLAY_H):
+                        continue
+                    if (x2-x1) < 30 or (y2-y1) < 30: continue
+                    
+                    cx, cy = (x1+x2)>>1, (y1+y2)>>1
+                    
+                    # --- CRITICAL: PACK PRIORITY LOGIC ---
+                    parent_pack = None
+                    for pack in active_packs:
+                        if is_point_in_box((cx, cy), pack['box']):
+                            parent_pack = pack
+                            break
+                    
+                    final_name = "Unknown"
+                    final_score = 0.0
+                    is_wrong_drug = False
+                    is_verified = False
+
+                    if parent_pack:
+                        # CASE A: FOUND INSIDE PACK -> TRUST PACK
+                        final_name = parent_pack['label'] # Inherit name
+                        final_score = parent_pack['score'] # Inherit/Trust Pack confidence
+                        is_wrong_drug = parent_pack['is_wrong']
+                        is_verified = parent_pack['verified']
+                        
+                        # Add to consistency if pack is valid
+                        clean_name = parent_pack['clean_name']
+                        if not is_wrong_drug:
+                             self.consistency_counter[clean_name] = self.consistency_counter.get(clean_name, 0) + 1
+                             found_in_this_frame.add(clean_name)
+
+                    else:
+                        # CASE B: NO PACK -> RUN TRINITY (Original Logic)
+                        crop = frame_HD[y1:y2, x1:x2]
+                        if crop.size > 0:
+                            real_name, real_score = trinity_inference(crop, is_pill=True,
+                                                      session_pills=matrix_pills,       
+                                                      session_pills_lbl=pills_lbls,
+                                                      session_packs=matrix_packs,
+                                                      session_packs_lbl=packs_lbls)
+                            final_name = real_name
+                            final_score = real_score
+
+                            # Check RX for loose pill
+                            if self.is_rx_mode:
+                                clean_real = real_name.lower().strip()
+                                allowed_drugs = [d.lower() for d in prescription_state.get_all_drugs()]
+                                match_found = False
+                                for allowed in allowed_drugs:
+                                    if allowed in clean_real: 
+                                        match_found = True
+                                        final_name = allowed 
+                                        break
+                                
+                                if not match_found and "?" not in real_name and "Unknown" not in real_name:
+                                    final_name = f"WRONG: {real_name}"
+                                    final_score = 0.0 
+                                    is_wrong_drug = True
+
+                            # Auto-Tick for loose pill
+                            clean_name = final_name.lower()
+                            if not is_wrong_drug and "?" not in final_name and "Unknown" not in final_name and final_score > SCORE_PASS_PILL:
+                                self.consistency_counter[clean_name] = self.consistency_counter.get(clean_name, 0) + 1
+                                found_in_this_frame.add(clean_name)
+                                if self.consistency_counter[clean_name] >= CONSISTENCY_THRESHOLD:
+                                    prescription_state.verify_drug(clean_name)
+                            
+                            is_verified = prescription_state.is_verified(clean_name)
+
+                    # Add to result
+                    final_detections.append({
+                        'label': final_name, 'score': final_score, 'type': 'pill',
+                        'verified': is_verified, 'box': (x1, y1, x2, y2), 'is_wrong': is_wrong_drug
                     })
 
+                # Clear old consistency counters
                 all_tracked = list(self.consistency_counter.keys())
                 for k in all_tracked:
                     if k not in found_in_this_frame:
