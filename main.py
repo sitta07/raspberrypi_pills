@@ -42,11 +42,13 @@ AI_IMG_SIZE = 416
 # Thresholds
 CONF_PILL = 0.15    
 CONF_PACK = 0.20    
-SCORE_PASS_PILL = 0.10  
-SCORE_PASS_PACK = 0.85  
+
+# Accuracy Thresholds (แยกกัน)
+SCORE_PASS_PILL = 0.10  # ยาเม็ด: 10% เอาหมด
+SCORE_PASS_PACK = 0.85  # กล่อง: ต้อง 85% (แต่ถ้ามีเม็ดอยู่ข้างใน จะถูก override)
 
 device = torch.device("cpu")
-print(f"🚀 SYSTEM STARTING ON: {device} (HD Box Mode)")
+print(f"🚀 SYSTEM STARTING ON: {device} (10 FPS + Smart Box Logic)")
 
 # ================= UTILS =================
 def get_cpu_temperature():
@@ -55,7 +57,13 @@ def get_cpu_temperature():
             return f"{float(f.read()) / 1000.0:.1f}C"
     except: return "N/A"
 
-# ================= 1. WEBCAM STREAM (1280x720) =================
+def is_point_in_box(point, box):
+    """เช็คว่าจุดกึ่งกลาง (px, py) อยู่ในกล่อง (x1, y1, x2, y2) หรือไม่"""
+    px, py = point
+    x1, y1, x2, y2 = box
+    return x1 < px < x2 and y1 < py < y2
+
+# ================= 1. WEBCAM STREAM (LOCKED @ 10 FPS) =================
 class WebcamStream:
     def __init__(self):
         self.stopped = False
@@ -65,18 +73,18 @@ class WebcamStream:
         self.lock = threading.Lock()
 
     def start(self):
-        print("[DEBUG] Initializing Picamera2 (720p HD)...")
+        print("[DEBUG] Initializing Picamera2 (10 FPS Mode)...")
         try:
             self.picam2 = Picamera2()
-            # 🔥 Config HD 1280x720, Limit 15 FPS
+            # 🔥 Config 10 FPS (1,000,000 / 10 = 100,000 us)
             config = self.picam2.create_preview_configuration(
                 main={"size": (DISPLAY_W, DISPLAY_H), "format": "RGB888"},
-                controls={"FrameDurationLimits": (66666, 66666)} 
+                controls={"FrameDurationLimits": (100000, 100000)} 
             )
             self.picam2.configure(config)
             self.picam2.start()
             time.sleep(2.0)
-            print("[DEBUG] Camera Started (1280x720 RGB888)")
+            print("[DEBUG] Camera Started")
         except Exception as e:
             print(f"[ERROR] Camera Init Failed: {e}")
             self.stopped = True
@@ -250,7 +258,7 @@ def trinity_inference(img_crop, is_pill=True, custom_matrix=None, custom_labels=
         return final_name, best_score
     except: return "Error", 0.0
 
-# ================= 4. AI WORKER (WITH BOXES) =================
+# ================= 4. AI WORKER (SMART BOX LOGIC) =================
 class AIProcessor:
     def __init__(self):
         self.latest_frame = None 
@@ -292,7 +300,7 @@ class AIProcessor:
                     self.latest_frame = None 
             
             if frame_HD is None: 
-                time.sleep(0.001); continue
+                time.sleep(0.005); continue
 
             # Resize for YOLO
             frame_yolo = cv2.resize(frame_HD, (AI_IMG_SIZE, AI_IMG_SIZE))
@@ -302,18 +310,22 @@ class AIProcessor:
             scale_x = DISPLAY_W / AI_IMG_SIZE
             scale_y = DISPLAY_H / AI_IMG_SIZE
 
-            detections = []
+            final_detections = []
+            
+            # Temporary storage for smart logic
+            valid_pills = [] 
 
             def process_crop(crop, is_pill_mode):
                 name, score = trinity_inference(crop, is_pill=is_pill_mode,
                                                 custom_matrix=self.session_matrix,
                                                 custom_labels=self.session_labels)
                 threshold = SCORE_PASS_PILL if is_pill_mode else SCORE_PASS_PACK
+                # ถ้าเป็น Pills คะแนนต่ำก็ส่งชื่อไปเลย แต่ถ้า Pack เดี๋ยวไปเช็คข้างในอีกที
                 if score <= threshold: name = f"{name}?"
                 return name, score
 
             try:
-                # 1. Pills 
+                # 1. DETECT PILLS FIRST
                 pill_res = model_pill(frame_yolo_clean, verbose=False, conf=CONF_PILL, imgsz=AI_IMG_SIZE, max_det=10, agnostic_nms=True)
                 for box in pill_res[0].boxes.xyxy.cpu().numpy().astype(int):
                     x1_s, y1_s, x2_s, y2_s = box
@@ -326,10 +338,16 @@ class AIProcessor:
                     if crop.size == 0: continue
 
                     nm, sc = process_crop(crop, True)
-                    # 🔥 เก็บพิกัดกรอบด้วย (HD Box)
-                    detections.append({'label':nm, 'score':sc, 'type':'pill', 'box':(x1,y1,x2,y2)})
+                    
+                    # Store Valid Pills for Box Checking
+                    # ถ้าชื่อไม่ Unknown และไม่ ? ให้ถือว่าเป็น Verified Pill
+                    if "?" not in nm and "Unknown" not in nm:
+                        cx, cy = (x1+x2)//2, (y1+y2)//2
+                        valid_pills.append({'name': nm, 'center': (cx, cy)})
 
-                # 2. Packs
+                    final_detections.append({'label':nm, 'score':sc, 'type':'pill', 'box':(x1,y1,x2,y2)})
+
+                # 2. DETECT PACKS & CHECK INSIDE
                 pack_res = model_pack(frame_yolo_clean, verbose=False, conf=CONF_PACK, imgsz=AI_IMG_SIZE, max_det=5, agnostic_nms=True)
                 for box in pack_res[0].boxes.xyxy.cpu().numpy().astype(int):
                     x1_s, y1_s, x2_s, y2_s = box
@@ -337,14 +355,27 @@ class AIProcessor:
                     x2 = int(x2_s * scale_x); y2 = int(y2_s * scale_y)
                     
                     if (x2-x1) < 50 or (y2-y1) < 50: continue
-                    crop = frame_HD[y1:y2, x1:x2]
-                    if crop.size == 0: continue
+                    
+                    # 🔥 SMART LOGIC: Check if any valid pill is inside this pack
+                    found_inner_pill_name = None
+                    for pill in valid_pills:
+                        if is_point_in_box(pill['center'], (x1, y1, x2, y2)):
+                            found_inner_pill_name = pill['name']
+                            break # Found one! assume the pack is this drug
+                    
+                    if found_inner_pill_name:
+                        # ✅ Override Pack Name with Pill Name!
+                        nm = f"Box: {found_inner_pill_name}"
+                        sc = 1.0 # Force High Score
+                        final_detections.append({'label':nm, 'score':sc, 'type':'pack', 'box':(x1,y1,x2,y2)})
+                    else:
+                        # ❌ No pill inside, use Trinity
+                        crop = frame_HD[y1:y2, x1:x2]
+                        if crop.size == 0: continue
+                        nm, sc = process_crop(crop, False)
+                        final_detections.append({'label':nm, 'score':sc, 'type':'pack', 'box':(x1,y1,x2,y2)})
 
-                    nm, sc = process_crop(crop, False)
-                    # 🔥 เก็บพิกัดกรอบด้วย (HD Box)
-                    detections.append({'label':nm, 'score':sc, 'type':'pack', 'box':(x1,y1,x2,y2)})
-
-                with self.lock: self.results = detections
+                with self.lock: self.results = final_detections
             
             except Exception as e:
                 print(f"[ERROR-AI-LOOP] {e}")
@@ -399,35 +430,35 @@ def draw_summary_box(frame, results):
     for i, (name, scores) in enumerate(summary.items()):
         count = len(scores)
         avg = sum(scores)/count
-        color = (0, 255, 0); display_name = name
-        if avg < SCORE_PASS_PILL: color = (255, 255, 0); display_name = f"{name} (?)"
-        if "Unknown" in name: color = (100, 100, 255); display_name = "Unknown"
+        color = (0, 255, 0)
+        display_name = name
+        
+        # Logic การแสดงผลสรุป
+        if avg < SCORE_PASS_PILL: # ใช้เกณฑ์ต่ำสุดเป็นตัวเตือน
+             color = (255, 255, 0); display_name = f"{name} (?)"
+        if "Unknown" in name: 
+             color = (100, 100, 255); display_name = "Unknown"
+
         y = start_y + 110 + (i * line_h)
         text = f"{display_name} : {count} ({avg:.0%})"
         cv2.putText(frame, text, (start_x+25, y), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
 
-# 🔥 New Function: Draw Bounding Boxes
 def draw_boxes_on_items(frame, results):
     for r in results:
         x1, y1, x2, y2 = r['box']
         label = r['label']
         score = r['score']
-        is_pill = r['type'] == 'pill'
         
-        # Determine Color based on confidence
-        threshold = SCORE_PASS_PILL if is_pill else SCORE_PASS_PACK
-        color = (0, 255, 0) # Green (Confident)
-        if score < threshold or "?" in label:
-             color = (0, 0, 255) # Red (Unsure)
-             
-        # Draw Box
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-        
-        # Draw Mini Label above box
-        label_text = f"{label.replace('?','')} {score:.0%}"
-        cv2.putText(frame, label_text, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        # Color Logic
+        color = (0, 255, 0) # Green
+        if "?" in label or score < SCORE_PASS_PILL: color = (0, 0, 255) # Red
+        if "Unknown" in label: color = (255, 0, 0) # Blue
+        if "Box:" in label: color = (0, 255, 255) # Yellow for Verified Box
 
-# ================= 6. MAIN =================
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+        cv2.putText(frame, f"{label} {score:.0%}", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+# ================= 6. MAIN (10 FPS) =================
 def main():
     TARGET_HN = "HN-101" 
     cam = WebcamStream().start()
@@ -443,9 +474,9 @@ def main():
     cv2.resizeWindow(window_name, DISPLAY_W, DISPLAY_H) 
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    print(f"🎥 RUNNING... (HD Mode {DISPLAY_W}x{DISPLAY_H} with Boxes)")
+    print(f"🎥 RUNNING... (10 FPS Optimized)")
     fps = 0; prev_time = 0
-    TARGET_FPS = 15
+    TARGET_FPS = 10 
     FRAME_TIME = 1.0 / TARGET_FPS
 
     try:
@@ -458,9 +489,7 @@ def main():
             display = frame_rgb.copy()
             results, cur_patient = ai.get_results()
             
-            # 🔥 Draw Boxes First
             draw_boxes_on_items(display, results)
-            # Then Draw Summaries
             draw_summary_box(display, results)
             if cur_patient: draw_patient_info(display, cur_patient)
             
