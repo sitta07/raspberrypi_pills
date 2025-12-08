@@ -14,7 +14,7 @@ from PIL import Image
 # ================= FIX RASPBERRY PI ENVIRONMENT =================
 os.environ["QT_QPA_PLATFORM"] = "xcb"
 os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
-os.environ["OMP_NUM_THREADS"] = "2" # ให้ AI ใช้ 2 Core, อีก 2 เก็บไว้ให้ OS/Camera
+os.environ["OMP_NUM_THREADS"] = "1"
 
 # Import Picamera2
 try:
@@ -24,10 +24,8 @@ except ImportError:
     sys.exit(1)
 
 # ================= CONFIGURATION =================
-# ✅ กลับมาใช้ .pt
-MODEL_PILL_PATH = 'models/pills.pt'          
-MODEL_PACK_PATH = 'models/best_process_2.pt'
-
+MODEL_PILL_PATH = 'models/pills.onnx'          
+MODEL_PACK_PATH = 'models/best_process_2.onnx'
 DB_FILES = {
     'pills': {'vec': 'database/db_pills.pkl', 'col': 'database/colors_pills.pkl'},
     'packs': {'vec': 'database/db_packs.pkl', 'col': 'database/colors_packs.pkl'}
@@ -35,15 +33,17 @@ DB_FILES = {
 IMG_DB_FOLDER = 'database_images'
 HIS_FILE_PATH = 'prescription.txt' 
 
-# 🔥 ลดความละเอียด AI เพื่อความเร็ว (320 เร็วกว่า 640 มาก)
-AI_IMG_SIZE = 320 
+# 🔥 ลดความละเอียด AI ลงเพื่อให้เร็วปรู๊ดปร๊าด (320px)
+AI_IMG_SIZE = 320
 
-CONF_PILL = 0.40    
-CONF_PACK = 0.50    
-SCORE_PASS_PILL = 0.60  
-SCORE_PASS_PACK = 0.60  
+# 🔥 ตั้งค่าความมั่นใจให้ต่ำมากกกก (ตามรีเควส) เพื่อดูว่าโมเดลเห็นอะไรบ้าง
+CONF_PILL = 0.15    
+CONF_PACK = 0.15    
 
-# ใช้ CPU
+# เกณฑ์การยอมรับชื่อยา (ถ้าต่ำกว่านี้จะขึ้น Unknown แต่ยังโชว์ใน Debug)
+SCORE_PASS_PILL = 0.50  
+SCORE_PASS_PACK = 0.50  
+
 device = torch.device("cpu")
 print(f"🚀 SYSTEM STARTING ON: {device}")
 
@@ -54,7 +54,7 @@ def get_cpu_temperature():
             return f"{float(f.read()) / 1000.0:.1f}C"
     except: return "N/A"
 
-# ================= 1. WEBCAM STREAM =================
+# ================= 1. WEBCAM STREAM (RGB888) =================
 class WebcamStream:
     def __init__(self):
         self.stopped = False
@@ -67,15 +67,15 @@ class WebcamStream:
         print("[DEBUG] Initializing Picamera2...")
         try:
             self.picam2 = Picamera2()
-            # Config กล้อง
+            # RGB888 Configuration
             config = self.picam2.create_preview_configuration(
                 main={"size": (640, 640), "format": "RGB888"},
-                controls={"FrameDurationLimits": (33333, 33333)} # Lock sensor at 30fps
+                controls={"FrameDurationLimits": (33333, 33333)} 
             )
             self.picam2.configure(config)
             self.picam2.start()
             time.sleep(2.0)
-            print("[DEBUG] Camera Started")
+            print("[DEBUG] Camera Started (640x640 RGB888)")
         except Exception as e:
             print(f"[ERROR] Camera Init Failed: {e}")
             self.stopped = True
@@ -89,8 +89,7 @@ class WebcamStream:
                 frame = self.picam2.capture_array()
                 if frame is not None:
                     with self.lock:
-                        # Copy ทันทีเพื่อความเร็วและแก้ Memory Layout
-                        self.frame = frame.copy() 
+                        self.frame = frame.copy() # Copy to fix memory layout
                         self.grabbed = True
                 else:
                     self.stopped = True
@@ -171,9 +170,9 @@ if os.path.exists(IMG_DB_FOLDER):
         sift_db[folder] = des_list
 
 try:
-    print(f"[DEBUG] Loading PyTorch Models...")
-    model_pill = YOLO(MODEL_PILL_PATH)
-    model_pack = YOLO(MODEL_PACK_PATH)
+    print(f"[DEBUG] Loading Models...")
+    model_pill = YOLO(MODEL_PILL_PATH, task='detect')
+    model_pack = YOLO(MODEL_PACK_PATH, task='detect')
     
     weights = models.ResNet50_Weights.DEFAULT
     embedder = torch.nn.Sequential(*list(models.resnet50(weights=weights).children())[:-1])
@@ -187,14 +186,14 @@ try:
 except Exception as e:
     print(f"[CRITICAL] Model Error: {e}"); sys.exit(1)
 
-# ================= 3. TRINITY ENGINE =================
+# ================= 4. TRINITY ENGINE (RGB) =================
 def trinity_inference(img_crop, is_pill=True, custom_matrix=None, custom_labels=None):
     target_matrix = custom_matrix if custom_matrix is not None else global_matrix
     target_labels = custom_labels if custom_labels is not None else global_labels
     if target_matrix is None: return "DB Error", 0.0
 
     try:
-        # Input is RGB
+        # 🔥 Input is RGB (No Conversion needed for PIL)
         if is_pill:
             pil_img = Image.fromarray(img_crop) 
         else:
@@ -225,7 +224,7 @@ def trinity_inference(img_crop, is_pill=True, custom_matrix=None, custom_labels=
         if is_pill: 
             h, w = img_crop.shape[:2]
             center = img_crop[int(h*0.25):int(h*0.75), int(w*0.25):int(w*0.75)]
-            hsv = cv2.cvtColor(center, cv2.COLOR_RGB2HSV)
+            hsv = cv2.cvtColor(center, cv2.COLOR_RGB2HSV) # Correct for RGB input
             live_color = np.mean(hsv, axis=(0,1))
         
         gray = cv2.cvtColor(img_crop, cv2.COLOR_RGB2GRAY)
@@ -260,7 +259,7 @@ def trinity_inference(img_crop, is_pill=True, custom_matrix=None, custom_labels=
         return final_name, best_score
     except: return "Error", 0.0
 
-# ================= 4. AI WORKER (Decoupled & Fast) =================
+# ================= 5. AI WORKER (OPTIMIZED) =================
 class AIProcessor:
     def __init__(self):
         self.latest_frame = None 
@@ -288,13 +287,10 @@ class AIProcessor:
     
     def update_frame(self, frame): 
         with self.lock: 
-            # เก็บเฟรมล่าสุดไว้รอ process
             self.latest_frame = frame.copy() 
         
     def get_results(self): 
-        with self.lock: 
-            # คืนค่าผลลัพธ์ล่าสุดที่มี (ไม่บล็อค)
-            return self.results, self.current_patient_info
+        with self.lock: return self.results, self.current_patient_info
 
     def run(self):
         print("[DEBUG] AI Worker Loop Started.")
@@ -303,52 +299,46 @@ class AIProcessor:
             with self.lock:
                 if self.latest_frame is not None:
                     frame_to_process = self.latest_frame
-                    self.latest_frame = None # Clear buffer
+                    self.latest_frame = None 
             
-            # ถ้าไม่มีงาน ให้หลับยาวหน่อย เพื่อคืน CPU ให้ Main Thread วาดรูป
             if frame_to_process is None: 
-                time.sleep(0.05) 
-                continue
+                time.sleep(0.01); continue
 
-            # 🔥 COLOR FIX: Convert RGB -> BGR for YOLO (YOLO trains on BGR)
-            # Picamera gives RGB, YOLO wants BGR.
-            frame_bgr = cv2.cvtColor(frame_to_process, cv2.COLOR_RGB2BGR)
-
+            # 🔥 NO COLOR CONVERSION (Input is RGB)
+            frame_clean = np.ascontiguousarray(frame_to_process)
+            
             detections = []
 
             def process_crop(crop, is_pill_mode):
-                # Crop is RGB (because we pass frame_to_process to Trinity, not frame_bgr)
-                # Trinity expects RGB now.
                 name, score = trinity_inference(crop, is_pill=is_pill_mode,
                                                 custom_matrix=self.session_matrix,
                                                 custom_labels=self.session_labels)
                 threshold = SCORE_PASS_PILL if is_pill_mode else SCORE_PASS_PACK
-                # ถ้าไม่มั่นใจ ก็บอกตรงๆ ว่า Unknown
-                if score <= threshold: name = "Unknown"
+                # ส่งชื่อและคะแนนออกไปเลย ไม่กรองทิ้ง (เพื่อให้โชว์ใน Summary ได้)
+                if score <= threshold: 
+                    # ต่อให้คะแนนน้อย ก็ให้บอกชื่อที่เดาได้ (แต่ mark ว่า low conf)
+                    name = f"{name}?" 
                 return name, score
 
             try:
-                # 🚀 Optimization: imgsz=320 is MUCH faster on Pi than 640
-                pill_res = model_pill(frame_bgr, verbose=False, conf=CONF_PILL, imgsz=AI_IMG_SIZE, max_det=10)
-                
+                # 1. Pills (ใช้ RGB) & imgsz=320 เพื่อความเร็ว
+                pill_res = model_pill(frame_clean, verbose=False, conf=CONF_PILL, imgsz=AI_IMG_SIZE, max_det=10)
                 for box in pill_res[0].boxes.xyxy.cpu().numpy().astype(int):
                     x1,y1,x2,y2 = box
-                    # Validate
                     if x2<=x1 or y2<=y1: continue
-                    
-                    # Crop from ORIGINAL RGB FRAME for high detail feature extraction
-                    crop = frame_to_process[y1:y2, x1:x2]
+                    crop = frame_clean[y1:y2, x1:x2]
                     if crop.size == 0: continue
 
                     nm, sc = process_crop(crop, True)
-                    # เก็บผลลัพธ์พร้อม Score
+                    # เก็บทุกเม็ด เพื่อเอาไปโชว์
                     detections.append({'label':nm, 'score':sc, 'type':'pill'})
 
-                pack_res = model_pack(frame_bgr, verbose=False, conf=CONF_PACK, imgsz=AI_IMG_SIZE, max_det=5)
+                # 2. Packs (ใช้ RGB)
+                pack_res = model_pack(frame_clean, verbose=False, conf=CONF_PACK, imgsz=AI_IMG_SIZE, max_det=5)
                 for box in pack_res[0].boxes.xyxy.cpu().numpy().astype(int):
                     x1,y1,x2,y2 = box
                     if x2<=x1 or y2<=y1: continue
-                    crop = frame_to_process[y1:y2, x1:x2]
+                    crop = frame_clean[y1:y2, x1:x2]
                     if crop.size == 0: continue
 
                     nm, sc = process_crop(crop, False)
@@ -361,7 +351,7 @@ class AIProcessor:
             
     def stop(self): self.stopped = True
 
-# ================= 5. UI DRAWING (DISPLAY ONLY) =================
+# ================= 6. UI DRAWING (UPDATED) =================
 def draw_patient_info(frame, patient_data):
     if not patient_data: return
     H, W = frame.shape[:2]
@@ -378,9 +368,9 @@ def draw_patient_info(frame, patient_data):
 def draw_summary_box(frame, results):
     H, W = frame.shape[:2]
     
-    # ถ้าผลลัพธ์ว่าง
     if not results:
-        cv2.putText(frame, "Waiting for objects...", (W-300, H-30), 
+        # Show "Scanning..." but with more details if possible
+        cv2.putText(frame, "Analyzing...", (W-200, H-30), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200,200,200), 2)
         return
 
@@ -388,45 +378,55 @@ def draw_summary_box(frame, results):
     summary = {}
     for r in results:
         name = r['label']
-        if name == "Unknown": continue # ข้าม Unknown ไปเลย จะได้ไม่รก
+        score = r['score']
         
-        if name not in summary: summary[name] = []
-        summary[name].append(r['score'])
+        # Clean name name (remove ?)
+        clean_name = name.replace("?", "")
+        
+        if clean_name not in summary: summary[clean_name] = []
+        summary[clean_name].append(score)
 
-    if not summary:
-        cv2.putText(frame, "Unknown Objects...", (W-300, H-30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100,100,255), 2)
-        return
-
-    box_w = 400; line_h = 40; padding = 15
+    box_w = 400
+    line_h = 40
+    padding = 15
     total_lines = len(summary) + 1
     total_h = (total_lines * line_h) + (padding * 2)
-    start_x = W - box_w - 10; start_y = H - total_h - 10
+    start_x = W - box_w - 10
+    start_y = H - total_h - 10
     
+    # Draw Background
     overlay = frame.copy()
     cv2.rectangle(overlay, (start_x, start_y), (W-10, H-10), (0,0,0), -1)
     cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
     cv2.rectangle(frame, (start_x, start_y), (W-10, H-10), (255,255,255), 2)
     
-    cv2.putText(frame, "DETECTED ITEMS", (start_x+15, start_y+30), 
+    # Header
+    cv2.putText(frame, "--- DETECTED ---", (start_x+15, start_y+30), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
     cv2.line(frame, (start_x+15, start_y+40), (W-25, start_y+40), (200,200,200), 1)
 
+    # Items List
     for i, (name, scores) in enumerate(summary.items()):
         count = len(scores)
         avg_conf = sum(scores) / count
         
         # สีตามความมั่นใจ
-        color = (0, 255, 0) # เขียว
-        if avg_conf < 0.6: color = (255, 255, 0) # เหลือง
-        if avg_conf < 0.4: color = (255, 0, 0)   # แดง
+        if avg_conf < 0.5:
+            color = (0, 0, 255) # Red (Low Conf)
+            status = "Low Conf"
+        else:
+            color = (0, 255, 0) # Green (High Conf)
+            status = "Confident"
 
         y = start_y + 75 + (i * line_h)
+        
+        # Text: Name (Count) : 85%
         text = f"{name} ({count}) : {avg_conf:.0%}"
+        
         cv2.putText(frame, text, (start_x+15, y), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-# ================= 6. MAIN (30 FPS LOOP) =================
+# ================= 7. MAIN =================
 def main():
     TARGET_HN = "HN-101" 
     cam = WebcamStream().start()
@@ -441,39 +441,29 @@ def main():
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    print("🎥 RUNNING... (Performance Mode)")
-    prev_time = 0; fps = 0
-
-    # ตั้งเวลาสำหรับการแสดงผล 30 FPS (0.033s per frame)
-    TARGET_FPS = 30
-    FRAME_TIME = 1.0 / TARGET_FPS
+    print("🎥 RUNNING... (Detailed Summary Mode)")
+    fps = 0; prev_time = 0
 
     try:
         while True:
-            start_loop = time.time()
-            
-            # 1. รับภาพ (เร็วมาก)
             frame_rgb = cam.read()
             if frame_rgb is None: time.sleep(0.01); continue
             
-            # 2. ส่งงานให้ AI (โยนไปทำงานเบื้องหลัง ไม่รอมันเสร็จ)
             ai.update_frame(frame_rgb)
-            
-            # 3. วาดผลลัพธ์ "ล่าสุดที่มี" (AI อาจจะยังประมวลผลเฟรมนี้ไม่เสร็จ ก็เอาผลเก่ามาโชว์ก่อน)
-            display = frame_rgb.copy()
+            display = frame_rgb.copy() # RGB Display
             results, cur_patient = ai.get_results()
             
-            # วาด UI
+            # 🔥 No Bounding Boxes -> Just Detailed Summary
             draw_summary_box(display, results)
+            
             if cur_patient: draw_patient_info(display, cur_patient)
             
-            # 4. FPS Calculation
             curr_time = time.time()
             if (curr_time - prev_time) > 0: fps = 1 / (curr_time - prev_time)
             prev_time = curr_time
             temp = get_cpu_temperature()
             
-            cv2.putText(display, f"Display FPS: {fps:.1f} | Temp: {temp}", (10, 30), 
+            cv2.putText(display, f"FPS: {fps:.1f} | Temp: {temp}", (10, 30), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
             cv2.imshow(window_name, display)
             
@@ -481,11 +471,6 @@ def main():
             if cv2.waitKey(1) & 0xFF == ord('r'):
                 his_db = HISLoader.load_database(HIS_FILE_PATH)
                 if TARGET_HN in his_db: d = his_db[TARGET_HN]; d['hn'] = TARGET_HN; ai.load_patient(d)
-
-            # 5. Cap Frame Rate (เพื่อให้ CPU เหลือไปทำ AI)
-            elapsed = time.time() - start_loop
-            if elapsed < FRAME_TIME:
-                time.sleep(FRAME_TIME - elapsed)
 
     except KeyboardInterrupt: print("\n Stopping...")
     finally: cam.stop(); ai.stop(); cv2.destroyAllWindows(); print(" Bye Bye!")
