@@ -336,7 +336,7 @@ def trinity_inference(img_crop, is_pill=True,
                 dist = np.linalg.norm(norm_diff)
                 color_score = np.clip(np.exp(-3.0 * dist), 0, 1)
                 
-            w_vec, w_sift, w_col = (0.2, 0.5, 0.3) if is_pill else (0.8, 0.2, 0.0)
+            w_vec, w_sift, w_col = (0.5, 0.4, 0.1) if is_pill else (0.8, 0.2, 0.0)
             total = vec_score * w_vec + sift_score * w_sift + color_score * w_col
             
             if total > best_score: 
