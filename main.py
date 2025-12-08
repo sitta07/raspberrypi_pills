@@ -23,9 +23,14 @@ except ImportError:
     sys.exit(1)
 
 # ================= CONFIGURATION =================
-# 🔥 TIPS: ถ้าจะใช้ ONNX ให้เปลี่ยนนามสกุลไฟล์ตรงนี้เป็น .onnx
-MODEL_PILL_PATH = 'models/pills.pt'   # หรือ .pt
-MODEL_PACK_PATH = 'models/best_process_2.onnx' # หรือ .pt
+# 🔥 TIPS: เปลี่ยนชื่อไฟล์ตรงนี้ ระบบจะปรับโหมด Box ให้เอง
+# ถ้าลงท้าย .pt  -> แสดงกรอบ
+# ถ้าลงท้าย .onnx -> ไม่แสดงกรอบ
+MODEL_PILL_PATH = 'models/pills.onnx'   
+MODEL_PACK_PATH = 'models/best_process_2.onnx' 
+
+# 🧠 Logic: Auto-Detect Box Visibility
+SHOW_BOXES = MODEL_PILL_PATH.endswith('.pt')
 
 DB_FILES = {
     'pills': {'vec': 'database/db_pills.pkl', 'col': 'database/colors_pills.pkl'},
@@ -37,8 +42,7 @@ HIS_FILE_PATH = 'prescription.txt'
 # 📺 Display Resolution
 DISPLAY_W, DISPLAY_H = 1280, 720
 
-# 🚀 AI Resolution (ต้องตรงกับ Model ที่ Export มา เป๊ะๆ สำหรับ ONNX)
-# ถ้า Error: "expect 640" ให้แก้ตรงนี้เป็น 640 ครับ
+# 🚀 AI Resolution (Fix for ONNX)
 AI_IMG_SIZE = 640 
 
 # Thresholds
@@ -48,7 +52,8 @@ SCORE_PASS_PILL = 0.10
 SCORE_PASS_PACK = 0.85  
 
 device = torch.device("cpu")
-print(f"🚀 SYSTEM STARTING ON: {device} (HD Box Mode + ONNX Ready)")
+print(f"🚀 SYSTEM STARTING ON: {device}")
+print(f"📦 Model: {MODEL_PILL_PATH} | 🖼️ Show Boxes: {SHOW_BOXES}")
 
 # ================= UTILS =================
 def get_cpu_temperature():
@@ -57,7 +62,7 @@ def get_cpu_temperature():
             return f"{float(f.read()) / 1000.0:.1f}C"
     except: return "N/A"
 
-# ================= 1. WEBCAM STREAM (1280x720) =================
+# ================= 1. WEBCAM STREAM =================
 class WebcamStream:
     def __init__(self):
         self.stopped = False
@@ -67,7 +72,7 @@ class WebcamStream:
         self.lock = threading.Lock()
 
     def start(self):
-        print("[DEBUG] Initializing Picamera2 (720p HD)...")
+        print("[DEBUG] Initializing Picamera2...")
         try:
             self.picam2 = Picamera2()
             config = self.picam2.create_preview_configuration(
@@ -77,7 +82,7 @@ class WebcamStream:
             self.picam2.configure(config)
             self.picam2.start()
             time.sleep(2.0)
-            print("[DEBUG] Camera Started (1280x720 RGB888)")
+            print("[DEBUG] Camera Started")
         except Exception as e:
             print(f"[ERROR] Camera Init Failed: {e}")
             self.stopped = True
@@ -168,8 +173,6 @@ if os.path.exists(IMG_DB_FOLDER):
         sift_db[folder] = des_list
 
 try:
-    # 🔥 Ultralytics YOLO รองรับ .pt และ .onnx โดยอัตโนมัติ
-    # แต่ถ้าเป็น .onnx ต้องระวังเรื่อง AI_IMG_SIZE ต้องตรงกับตอน export
     model_pill = YOLO(MODEL_PILL_PATH, task='detect')
     model_pack = YOLO(MODEL_PACK_PATH, task='detect')
     
@@ -254,7 +257,7 @@ def trinity_inference(img_crop, is_pill=True, custom_matrix=None, custom_labels=
         return final_name, best_score
     except: return "Error", 0.0
 
-# ================= 4. AI WORKER (WITH BOXES) =================
+# ================= 4. AI WORKER =================
 class AIProcessor:
     def __init__(self):
         self.latest_frame = None 
@@ -298,11 +301,9 @@ class AIProcessor:
             if frame_HD is None: 
                 time.sleep(0.001); continue
 
-            # 🔥 Fix: Resize ให้ตรงกับที่โมเดลต้องการ (640 หรือ 416)
+            # Resize ให้ตรงกับ Model (ONNX = 640)
             frame_yolo = cv2.resize(frame_HD, (AI_IMG_SIZE, AI_IMG_SIZE))
-            # บางที ONNX ต้องการ C,H,W และ Normalize แต่ Ultralytics YOLO จัดการให้เราเองถ้าใช้ class YOLO()
             
-            # Scale Factors สำหรับแปลงกลับเป็น HD
             scale_x = DISPLAY_W / AI_IMG_SIZE
             scale_y = DISPLAY_H / AI_IMG_SIZE
 
@@ -381,6 +382,54 @@ def draw_boxes_on_items(frame, results):
         label_text = f"{label.replace('?','')} {score:.0%}"
         cv2.putText(frame, label_text, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
+# 🔥 SUMMARY BOX (UPDATED)
+def draw_summary_box(frame, results):
+    if not results: return
+    H, W = frame.shape[:2]
+    
+    # 1. Group & Calculate Stats
+    summary = {} # {name: [score1, score2]}
+    for r in results:
+        name = r['label'].replace("?", "")
+        score = r['score']
+        if name not in summary: summary[name] = []
+        summary[name].append(score)
+        
+    # 2. Draw Setup
+    box_w = 400
+    line_h = 40
+    padding = 20
+    total_lines = len(summary) + 1 # Header + Items
+    box_h = (total_lines * line_h) + (padding * 2)
+    
+    start_x = W - box_w - 10
+    start_y = H - box_h - 10
+    
+    # Background
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (start_x, start_y), (W-10, H-10), (0,0,0), -1)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+    cv2.rectangle(frame, (start_x, start_y), (W-10, H-10), (255,255,255), 2)
+    
+    # Header
+    cv2.putText(frame, "DETECTED SUMMARY", (start_x+15, start_y+35), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
+    
+    # Items
+    for i, (name, scores) in enumerate(summary.items()):
+        count = len(scores)
+        avg_conf = sum(scores) / count
+        
+        # Color Logic
+        color = (0, 255, 0) # Green
+        if avg_conf < 0.6: color = (0, 255, 255) # Yellow
+        if "Unknown" in name: color = (0, 0, 255) # Red
+            
+        text = f"{name} : {count} ({avg_conf:.0%})"
+        y_pos = start_y + 35 + ((i+1) * line_h)
+        cv2.putText(frame, text, (start_x+15, y_pos), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
 # ================= 6. MAIN =================
 def main():
     TARGET_HN = "HN-101" 
@@ -397,7 +446,7 @@ def main():
     cv2.resizeWindow(window_name, DISPLAY_W, DISPLAY_H) 
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    print(f"🎥 RUNNING... (HD Mode {DISPLAY_W}x{DISPLAY_H} + Boxes)")
+    print(f"🎥 RUNNING... (Resolution: {DISPLAY_W}x{DISPLAY_H})")
     fps = 0; prev_time = 0
     TARGET_FPS = 15
     FRAME_TIME = 1.0 / TARGET_FPS
@@ -412,11 +461,14 @@ def main():
             display = frame_rgb.copy()
             results, cur_patient = ai.get_results()
             
-            # 🔥 Draw Boxes First
-            draw_boxes_on_items(display, results)
+            # 🔥 1. Conditional Boxes (PT=Show, ONNX=Hide)
+            if SHOW_BOXES:
+                draw_boxes_on_items(display, results)
             
-            # ❌ [REMOVED] draw_summary_box(display, results)
+            # 🔥 2. Summary Box (Always Show, Accurate %)
+            draw_summary_box(display, results)
             
+            # 3. Patient Info
             if cur_patient: draw_patient_info(display, cur_patient)
             
             curr_time = time.time()
@@ -427,8 +479,9 @@ def main():
             cv2.putText(display, f"FPS: {fps:.1f} | {temp}", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,255,0), 3)
             cv2.imshow(window_name, display)
             
-            if cv2.waitKey(1) & 0xFF == ord('q'): break
-            if cv2.waitKey(1) & 0xFF == ord('r'):
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'): break
+            if key == ord('r'):
                 his_db = HISLoader.load_database(HIS_FILE_PATH)
                 if TARGET_HN in his_db: d = his_db[TARGET_HN]; d['hn'] = TARGET_HN; ai.load_patient(d)
 
