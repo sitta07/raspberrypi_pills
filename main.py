@@ -478,7 +478,19 @@ class AIProcessor:
                     if (x2-x1) < 50 or (y2-y1) < 50: 
                         continue
                     
-                    # 🔥 SMART LOGIC: Override with inner pill name
+                    # Extract crop first to get pack score
+                    crop = frame_HD[y1:y2, x1:x2]
+                    if crop.size == 0: 
+                        continue
+                    
+                    # Get pack detection score
+                    nm, sc = trinity_inference(crop, is_pill=False,
+                                              session_pills=self.sess_mat_pills,
+                                              session_pills_lbl=self.sess_lbl_pills,
+                                              session_packs=self.sess_mat_packs,
+                                              session_packs_lbl=self.sess_lbl_packs)
+                    
+                    # 🔥 SMART LOGIC: Override with inner pill name BUT keep pack score
                     found_inner_pill_name = None
                     for pill in valid_pills:
                         if is_point_in_box(pill['center'], (x1, y1, x2, y2)):
@@ -486,33 +498,15 @@ class AIProcessor:
                             break
                     
                     if found_inner_pill_name:
-                        # Override with pill name
+                        # Override name but keep original pack score
                         nm = found_inner_pill_name
-                        sc = 1.0
-                        final_detections.append({
-                            'label': nm, 
-                            'score': sc, 
-                            'type': 'pack', 
-                            'box': (x1, y1, x2, y2)
-                        })
-                    else:
-                        # Detect pack normally
-                        crop = frame_HD[y1:y2, x1:x2]
-                        if crop.size == 0: 
-                            continue
-                        
-                        nm, sc = trinity_inference(crop, is_pill=False,
-                                                  session_pills=self.sess_mat_pills,
-                                                  session_pills_lbl=self.sess_lbl_pills,
-                                                  session_packs=self.sess_mat_packs,
-                                                  session_packs_lbl=self.sess_lbl_packs)
-                        
-                        final_detections.append({
-                            'label': nm, 
-                            'score': sc, 
-                            'type': 'pack', 
-                            'box': (x1, y1, x2, y2)
-                        })
+                    
+                    final_detections.append({
+                        'label': nm, 
+                        'score': sc,  # Use actual pack score
+                        'type': 'pack', 
+                        'box': (x1, y1, x2, y2)
+                    })
 
                 # Update results
                 with self.lock: 
