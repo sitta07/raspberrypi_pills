@@ -478,32 +478,33 @@ class AIProcessor:
                     if (x2-x1) < 50 or (y2-y1) < 50: 
                         continue
                     
-                    # Extract crop first to get pack score
+                    # Extract crop
                     crop = frame_HD[y1:y2, x1:x2]
                     if crop.size == 0: 
                         continue
                     
-                    # Get pack detection score
+                    # ALWAYS run trinity inference to get real pack score
                     nm, sc = trinity_inference(crop, is_pill=False,
                                               session_pills=self.sess_mat_pills,
                                               session_pills_lbl=self.sess_lbl_pills,
                                               session_packs=self.sess_mat_packs,
                                               session_packs_lbl=self.sess_lbl_packs)
                     
-                    # 🔥 SMART LOGIC: Override with inner pill name BUT keep pack score
+                    # 🔥 SMART LOGIC: Override name with inner pill BUT keep pack score
                     found_inner_pill_name = None
                     for pill in valid_pills:
                         if is_point_in_box(pill['center'], (x1, y1, x2, y2)):
                             found_inner_pill_name = pill['name']
                             break
                     
+                    # If found pill inside, use pill name but keep pack score
                     if found_inner_pill_name:
-                        # Override name but keep original pack score
                         nm = found_inner_pill_name
+                        print(f"[DEBUG] Pack Override: {nm} | Score: {sc:.2%} | Threshold: {SCORE_PASS_PACK}")
                     
                     final_detections.append({
                         'label': nm, 
-                        'score': sc,  # Use actual pack score
+                        'score': sc,  # Real pack score from trinity_inference
                         'type': 'pack', 
                         'box': (x1, y1, x2, y2)
                     })
