@@ -365,7 +365,7 @@ def trinity_inference(img_crop, is_pill=True,
 
 # ================= 4. AI WORKER (AUTO-CHECK LOGIC) =================
 # ================= CONFIGURATION FOR STABILITY =================
-CONSISTENCY_THRESHOLD = 4  # ต้องเจอ High Score ติดกัน 4 เฟรม (ประมาณ 0.4 วิ) ถึงจะตัดยอด
+CONSISTENCY_THRESHOLD = 2  # ต้องเจอ High Score ติดกัน 4 เฟรม (ประมาณ 0.4 วิ) ถึงจะตัดยอด
 
 # ================= 4. AI WORKER (AUTO-CHECK LOGIC) =================
 class AIProcessor:
