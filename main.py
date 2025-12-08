@@ -34,9 +34,14 @@ IMG_DB_FOLDER = 'database_images'
 HIS_FILE_PATH = 'prescription.txt' 
 
 AI_IMG_SIZE = 416 
+
+# Thresholds (Detection - หาเจอไหม)
 CONF_PILL = 0.15    
 CONF_PACK = 0.20    
-SCORE_PASS = 0.60  
+
+# 🔥 Thresholds (Accuracy - แยกกันตามสั่ง)
+SCORE_PASS_PILL = 0.10  # ยาเม็ด: 10% ก็เอา (ยอมรับง่าย)
+SCORE_PASS_PACK = 0.85  # กล่อง: 85% ถึงจะยอม (ต้องเป๊ะ)
 
 device = torch.device("cpu")
 print(f"🚀 SYSTEM STARTING ON: {device}")
@@ -243,7 +248,7 @@ def trinity_inference(img_crop, is_pill=True, custom_matrix=None, custom_labels=
         return final_name, best_score
     except: return "Error", 0.0
 
-# ================= 4. AI WORKER (OPTIMIZED) =================
+# ================= 4. AI WORKER (SEPARATE THRESHOLDS) =================
 class AIProcessor:
     def __init__(self):
         self.latest_frame = None 
@@ -287,32 +292,34 @@ class AIProcessor:
             if frame_to_process is None: 
                 time.sleep(0.001); continue
 
-            # RGB Direct + Contiguous Memory
             frame_clean = np.ascontiguousarray(frame_to_process)
-            
             detections = []
 
+            # 🔥 HELPER: Apply Specific Thresholds
             def process_crop(crop, is_pill_mode):
                 name, score = trinity_inference(crop, is_pill=is_pill_mode,
                                                 custom_matrix=self.session_matrix,
                                                 custom_labels=self.session_labels)
-                # ส่งชื่อออกไปเลย พร้อมเครื่องหมาย ? ถ้าคะแนนต่ำ
-                if score <= SCORE_PASS: name = f"{name}?"
+                
+                # 🔥 เลือก Threshold ตามประเภท
+                threshold = SCORE_PASS_PILL if is_pill_mode else SCORE_PASS_PACK
+                
+                if score <= threshold: name = f"{name}?" # Mark as unsure
                 return name, score
 
             try:
-                # 1. Pills 
+                # 1. Pills (Detection Conf 0.15)
                 pill_res = model_pill(frame_clean, verbose=False, conf=CONF_PILL, imgsz=AI_IMG_SIZE, max_det=10, agnostic_nms=True)
                 for box in pill_res[0].boxes.xyxy.cpu().numpy().astype(int):
                     x1,y1,x2,y2 = box
-                    if (x2-x1) < 20 or (y2-y1) < 20: continue # Skip noise
+                    if (x2-x1) < 20 or (y2-y1) < 20: continue
                     crop = frame_to_process[y1:y2, x1:x2]
                     if crop.size == 0: continue
 
-                    nm, sc = process_crop(crop, True)
+                    nm, sc = process_crop(crop, True) # Use Pill Threshold (0.1)
                     detections.append({'label':nm, 'score':sc, 'type':'pill'})
 
-                # 2. Packs
+                # 2. Packs (Detection Conf 0.20)
                 pack_res = model_pack(frame_clean, verbose=False, conf=CONF_PACK, imgsz=AI_IMG_SIZE, max_det=5, agnostic_nms=True)
                 for box in pack_res[0].boxes.xyxy.cpu().numpy().astype(int):
                     x1,y1,x2,y2 = box
@@ -320,7 +327,7 @@ class AIProcessor:
                     crop = frame_to_process[y1:y2, x1:x2]
                     if crop.size == 0: continue
 
-                    nm, sc = process_crop(crop, False)
+                    nm, sc = process_crop(crop, False) # Use Pack Threshold (0.85)
                     detections.append({'label':nm, 'score':sc, 'type':'pack'})
 
                 with self.lock: self.results = detections
@@ -339,7 +346,6 @@ def draw_patient_info(frame, patient_data):
              f"Name: {patient_data.get('name', 'N/A')}", "--- Rx List ---"]
     for d in patient_data.get('drugs', [])[:5]: lines.append(f"- {d}")
     
-    # Scale fonts up for Fullscreen
     font_scale = 0.8
     line_h = 35
     box_h = (len(lines) * line_h) + 20
@@ -355,7 +361,6 @@ def draw_summary_box(frame, results):
     H, W = frame.shape[:2]
     
     if not results:
-        # Show Big Scanning Text
         text = "Analyzing..."
         font = cv2.FONT_HERSHEY_SIMPLEX
         scale = 1.5
@@ -370,7 +375,6 @@ def draw_summary_box(frame, results):
         if name not in summary: summary[name] = []
         summary[name].append(score)
 
-    # Config Big Box for Fullscreen
     box_w = 500
     line_h = 50
     padding = 20
@@ -384,7 +388,6 @@ def draw_summary_box(frame, results):
     cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
     cv2.rectangle(frame, (start_x, start_y), (W-20, H-20), (255,255,255), 2)
     
-    # Header
     cv2.putText(frame, "DETECTED ITEMS", (start_x+20, start_y+40), 
                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,255), 3)
     cv2.line(frame, (start_x+20, start_y+55), (W-40, start_y+55), (200,200,200), 2)
@@ -393,12 +396,15 @@ def draw_summary_box(frame, results):
         count = len(scores)
         avg = sum(scores)/count
         
+        # สีตามความมั่นใจเฉลี่ย
         color = (0, 255, 0)
         display_name = name
-        if avg < SCORE_PASS: 
-            color = (255, 255, 0); display_name = f"{name} (Low Conf)"
+        
+        # 0.40 คือจุดตัดสีเหลือง (Visual Warning)
+        if avg < 0.40: 
+            color = (255, 255, 0); display_name = f"{name} (?)"
         if "Unknown" in name: 
-            color = (100, 100, 255); display_name = "Unknown Object"
+            color = (100, 100, 255); display_name = "Unknown"
 
         y = start_y + 100 + (i * line_h)
         text = f"{display_name} : {count} ({avg:.0%})"
@@ -406,7 +412,7 @@ def draw_summary_box(frame, results):
         cv2.putText(frame, text, (start_x+20, y), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
 
-# ================= 6. MAIN (15 FPS + FULLSCREEN) =================
+# ================= 6. MAIN =================
 def main():
     TARGET_HN = "HN-101" 
     cam = WebcamStream().start()
@@ -418,7 +424,6 @@ def main():
     while cam.read() is None: time.sleep(0.1)
     
     window_name = "PillTrack"
-    # 🔥 FULLSCREEN SETUP
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
