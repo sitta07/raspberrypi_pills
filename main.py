@@ -23,14 +23,12 @@ except ImportError:
     sys.exit(1)
 
 # ================= CONFIGURATION =================
-# 🔥 TIPS: เปลี่ยนชื่อไฟล์ตรงนี้ ระบบจะปรับโหมด Box ให้เอง
-# ถ้าลงท้าย .pt  -> แสดงกรอบ
-# ถ้าลงท้าย .onnx -> ไม่แสดงกรอบ
-MODEL_PILL_PATH = 'models/pills.pt'   
-MODEL_PACK_PATH = 'models/best_process_2.pt' 
+MODEL_PILL_PATH = 'models/pills.onnx'   
+MODEL_PACK_PATH = 'models/best_process_2.onnx' 
 
-# 🧠 Logic: Auto-Detect Box Visibility
+# 🧠 Logic: Auto-Detect Box Visibility & Model Name
 SHOW_BOXES = MODEL_PILL_PATH.endswith('.pt')
+MODEL_TYPE_NAME = "ONNX" if MODEL_PILL_PATH.endswith('.onnx') else "PyTorch"
 
 DB_FILES = {
     'pills': {'vec': 'database/db_pills.pkl', 'col': 'database/colors_pills.pkl'},
@@ -42,7 +40,7 @@ HIS_FILE_PATH = 'prescription.txt'
 # 📺 Display Resolution
 DISPLAY_W, DISPLAY_H = 1280, 720
 
-# 🚀 AI Resolution (Fix for ONNX)
+# 🚀 AI Resolution (Fix for ONNX = 640)
 AI_IMG_SIZE = 640 
 
 # Thresholds
@@ -53,7 +51,7 @@ SCORE_PASS_PACK = 0.85
 
 device = torch.device("cpu")
 print(f"🚀 SYSTEM STARTING ON: {device}")
-print(f"📦 Model: {MODEL_PILL_PATH} | 🖼️ Show Boxes: {SHOW_BOXES}")
+print(f"📦 Model: {MODEL_PILL_PATH} ({MODEL_TYPE_NAME}) | 🖼️ Show Boxes: {SHOW_BOXES}")
 
 # ================= UTILS =================
 def get_cpu_temperature():
@@ -61,6 +59,15 @@ def get_cpu_temperature():
         with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
             return f"{float(f.read()) / 1000.0:.1f}C"
     except: return "N/A"
+
+def check_inside(inner_box, outer_box):
+    # inner_box = (x1, y1, x2, y2)
+    # Check if CENTER of inner is inside outer
+    ix_cen = (inner_box[0] + inner_box[2]) / 2
+    iy_cen = (inner_box[1] + inner_box[3]) / 2
+    
+    ox1, oy1, ox2, oy2 = outer_box
+    return (ox1 < ix_cen < ox2) and (oy1 < iy_cen < oy2)
 
 # ================= 1. WEBCAM STREAM =================
 class WebcamStream:
@@ -257,7 +264,7 @@ def trinity_inference(img_crop, is_pill=True, custom_matrix=None, custom_labels=
         return final_name, best_score
     except: return "Error", 0.0
 
-# ================= 4. AI WORKER =================
+# ================= 4. AI WORKER (SMART LOGIC) =================
 class AIProcessor:
     def __init__(self):
         self.latest_frame = None 
@@ -301,14 +308,15 @@ class AIProcessor:
             if frame_HD is None: 
                 time.sleep(0.001); continue
 
-            # Resize ให้ตรงกับ Model (ONNX = 640)
+            # Resize
             frame_yolo = cv2.resize(frame_HD, (AI_IMG_SIZE, AI_IMG_SIZE))
-            
             scale_x = DISPLAY_W / AI_IMG_SIZE
             scale_y = DISPLAY_H / AI_IMG_SIZE
 
-            detections = []
-
+            temp_pills = [] # Store pill results temporarily
+            temp_packs = [] # Store pack boxes
+            
+            # --- Helper to process crop ---
             def process_crop(crop, is_pill_mode):
                 name, score = trinity_inference(crop, is_pill=is_pill_mode,
                                                 custom_matrix=self.session_matrix,
@@ -318,21 +326,22 @@ class AIProcessor:
                 return name, score
 
             try:
-                # 1. Pills 
-                pill_res = model_pill(frame_yolo, verbose=False, conf=CONF_PILL, imgsz=AI_IMG_SIZE, max_det=10, agnostic_nms=True)
+                # 1. Detect PILLS First (We need them for Pack Logic)
+                pill_res = model_pill(frame_yolo, verbose=False, conf=CONF_PILL, imgsz=AI_IMG_SIZE, max_det=15, agnostic_nms=True)
                 for box in pill_res[0].boxes.xyxy.cpu().numpy().astype(int):
                     x1_s, y1_s, x2_s, y2_s = box
                     x1 = int(x1_s * scale_x); y1 = int(y1_s * scale_y)
                     x2 = int(x2_s * scale_x); y2 = int(y2_s * scale_y)
                     
-                    if (x2-x1) < 30 or (y2-y1) < 30: continue 
+                    if (x2-x1) < 20 or (y2-y1) < 20: continue 
                     crop = frame_HD[y1:y2, x1:x2]
                     if crop.size == 0: continue
 
                     nm, sc = process_crop(crop, True)
-                    detections.append({'label':nm, 'score':sc, 'type':'pill', 'box':(x1,y1,x2,y2)})
+                    # เก็บผล Pills ไว้ก่อน
+                    temp_pills.append({'label':nm, 'score':sc, 'type':'pill', 'box':(x1,y1,x2,y2)})
 
-                # 2. Packs
+                # 2. Detect PACKS
                 pack_res = model_pack(frame_yolo, verbose=False, conf=CONF_PACK, imgsz=AI_IMG_SIZE, max_det=5, agnostic_nms=True)
                 for box in pack_res[0].boxes.xyxy.cpu().numpy().astype(int):
                     x1_s, y1_s, x2_s, y2_s = box
@@ -342,11 +351,34 @@ class AIProcessor:
                     if (x2-x1) < 50 or (y2-y1) < 50: continue
                     crop = frame_HD[y1:y2, x1:x2]
                     if crop.size == 0: continue
+                    
+                    # 🔥 3. SMART CHECK: Pack contains Pills?
+                    contained_labels = []
+                    for p in temp_pills:
+                        # Check if Pill Center is inside Pack Box
+                        if check_inside(p['box'], (x1, y1, x2, y2)):
+                            # เอาชื่อยาที่ detect ได้ (ตัด ? ออก)
+                            clean_name = p['label'].replace("?", "")
+                            if "Unknown" not in clean_name:
+                                contained_labels.append(clean_name)
+                    
+                    final_name = "Unknown"
+                    final_score = 0.0
+                    
+                    if contained_labels:
+                        # 💡 Found pills inside! Use the most common pill name.
+                        # "ไม่ต้องเช็ค" -> Skip Trinity Inference completely
+                        most_common = Counter(contained_labels).most_common(1)[0][0]
+                        final_name = most_common # ชื่อเดียวกับ Pills เลย
+                        final_score = 1.0        # ให้คะแนนเต็มเพราะเห็นเม็ดยาชัดๆ
+                    else:
+                        # 💡 Empty Pack -> Run normal checking
+                        final_name, final_score = process_crop(crop, False)
 
-                    nm, sc = process_crop(crop, False)
-                    detections.append({'label':nm, 'score':sc, 'type':'pack', 'box':(x1,y1,x2,y2)})
+                    temp_packs.append({'label':final_name, 'score':final_score, 'type':'pack', 'box':(x1,y1,x2,y2)})
 
-                with self.lock: self.results = detections
+                # Merge Results
+                with self.lock: self.results = temp_pills + temp_packs
             
             except Exception as e:
                 print(f"[ERROR-AI-LOOP] {e}")
@@ -378,52 +410,46 @@ def draw_boxes_on_items(frame, results):
         threshold = SCORE_PASS_PILL if is_pill else SCORE_PASS_PACK
         color = (0, 255, 0)
         if score < threshold or "?" in label: color = (0, 0, 255)
+        
+        # Draw Box
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+        # Draw Label
         label_text = f"{label.replace('?','')} {score:.0%}"
         cv2.putText(frame, label_text, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-# 🔥 SUMMARY BOX (UPDATED)
+# 🔥 UPDATED SUMMARY BOX WITH MODEL NAME
 def draw_summary_box(frame, results):
     if not results: return
     H, W = frame.shape[:2]
     
-    # 1. Group & Calculate Stats
-    summary = {} # {name: [score1, score2]}
+    summary = {} 
     for r in results:
         name = r['label'].replace("?", "")
         score = r['score']
         if name not in summary: summary[name] = []
         summary[name].append(score)
         
-    # 2. Draw Setup
-    box_w = 400
-    line_h = 40
-    padding = 20
-    total_lines = len(summary) + 1 # Header + Items
+    box_w = 400; line_h = 40; padding = 20
+    total_lines = len(summary) + 1 
     box_h = (total_lines * line_h) + (padding * 2)
+    start_x = W - box_w - 10; start_y = H - box_h - 10
     
-    start_x = W - box_w - 10
-    start_y = H - box_h - 10
-    
-    # Background
     overlay = frame.copy()
     cv2.rectangle(overlay, (start_x, start_y), (W-10, H-10), (0,0,0), -1)
     cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
     cv2.rectangle(frame, (start_x, start_y), (W-10, H-10), (255,255,255), 2)
     
-    # Header
-    cv2.putText(frame, "DETECTED SUMMARY", (start_x+15, start_y+35), 
+    # 🔥 Add Model Name here
+    header = f"SUMMARY ({MODEL_TYPE_NAME})" 
+    cv2.putText(frame, header, (start_x+15, start_y+35), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
     
-    # Items
     for i, (name, scores) in enumerate(summary.items()):
         count = len(scores)
         avg_conf = sum(scores) / count
-        
-        # Color Logic
-        color = (0, 255, 0) # Green
-        if avg_conf < 0.6: color = (0, 255, 255) # Yellow
-        if "Unknown" in name: color = (0, 0, 255) # Red
+        color = (0, 255, 0) 
+        if avg_conf < 0.6: color = (0, 255, 255) 
+        if "Unknown" in name: color = (0, 0, 255) 
             
         text = f"{name} : {count} ({avg_conf:.0%})"
         y_pos = start_y + 35 + ((i+1) * line_h)
@@ -461,14 +487,13 @@ def main():
             display = frame_rgb.copy()
             results, cur_patient = ai.get_results()
             
-            # 🔥 1. Conditional Boxes (PT=Show, ONNX=Hide)
+            # 🔥 1. Conditional Boxes
             if SHOW_BOXES:
                 draw_boxes_on_items(display, results)
             
-            # 🔥 2. Summary Box (Always Show, Accurate %)
+            # 🔥 2. Summary Box (Includes Model Name)
             draw_summary_box(display, results)
             
-            # 3. Patient Info
             if cur_patient: draw_patient_info(display, cur_patient)
             
             curr_time = time.time()
