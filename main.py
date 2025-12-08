@@ -38,8 +38,8 @@ AI_IMG_SIZE = 416
 
 # Thresholds
 CONF_PILL = 0.45    
-CONF_PACK = 0.7     # ลดลงนิดหน่อยเพื่อให้ Detect เจอกล่องง่ายขึ้น แล้วไปคัดที่ Logic แทน
-SCORE_PASS_PILL = 0.19
+CONF_PACK = 0.6     # ลดลงนิดหน่อยเพื่อให้ Detect เจอกล่องง่ายขึ้น แล้วไปคัดที่ Logic แทน
+SCORE_PASS_PILL = 0.18
 SCORE_PASS_PACK = 0.7
 
 device = torch.device("cpu")
