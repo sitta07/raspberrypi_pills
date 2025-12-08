@@ -23,8 +23,9 @@ except ImportError:
     sys.exit(1)
 
 # ================= CONFIGURATION =================
-MODEL_PILL_PATH = 'models/pills.pt'          
-MODEL_PACK_PATH = 'models/best_process_2.onnx'
+# 🔥 TIPS: ถ้าจะใช้ ONNX ให้เปลี่ยนนามสกุลไฟล์ตรงนี้เป็น .onnx
+MODEL_PILL_PATH = 'models/pills.pt'   # หรือ .pt
+MODEL_PACK_PATH = 'models/best_process_2.onnx' # หรือ .pt
 
 DB_FILES = {
     'pills': {'vec': 'database/db_pills.pkl', 'col': 'database/colors_pills.pkl'},
@@ -36,8 +37,9 @@ HIS_FILE_PATH = 'prescription.txt'
 # 📺 Display Resolution
 DISPLAY_W, DISPLAY_H = 1280, 720
 
-# 🚀 AI Resolution
-AI_IMG_SIZE = 416 
+# 🚀 AI Resolution (ต้องตรงกับ Model ที่ Export มา เป๊ะๆ สำหรับ ONNX)
+# ถ้า Error: "expect 640" ให้แก้ตรงนี้เป็น 640 ครับ
+AI_IMG_SIZE = 640 
 
 # Thresholds
 CONF_PILL = 0.15    
@@ -46,7 +48,7 @@ SCORE_PASS_PILL = 0.10
 SCORE_PASS_PACK = 0.85  
 
 device = torch.device("cpu")
-print(f"🚀 SYSTEM STARTING ON: {device} (HD Box Mode)")
+print(f"🚀 SYSTEM STARTING ON: {device} (HD Box Mode + ONNX Ready)")
 
 # ================= UTILS =================
 def get_cpu_temperature():
@@ -68,7 +70,6 @@ class WebcamStream:
         print("[DEBUG] Initializing Picamera2 (720p HD)...")
         try:
             self.picam2 = Picamera2()
-            # 🔥 Config HD 1280x720, Limit 15 FPS
             config = self.picam2.create_preview_configuration(
                 main={"size": (DISPLAY_W, DISPLAY_H), "format": "RGB888"},
                 controls={"FrameDurationLimits": (66666, 66666)} 
@@ -167,8 +168,11 @@ if os.path.exists(IMG_DB_FOLDER):
         sift_db[folder] = des_list
 
 try:
+    # 🔥 Ultralytics YOLO รองรับ .pt และ .onnx โดยอัตโนมัติ
+    # แต่ถ้าเป็น .onnx ต้องระวังเรื่อง AI_IMG_SIZE ต้องตรงกับตอน export
     model_pill = YOLO(MODEL_PILL_PATH, task='detect')
     model_pack = YOLO(MODEL_PACK_PATH, task='detect')
+    
     weights = models.ResNet50_Weights.DEFAULT
     embedder = torch.nn.Sequential(*list(models.resnet50(weights=weights).children())[:-1])
     embedder.eval().to(device)
@@ -294,11 +298,11 @@ class AIProcessor:
             if frame_HD is None: 
                 time.sleep(0.001); continue
 
-            # Resize for YOLO
+            # 🔥 Fix: Resize ให้ตรงกับที่โมเดลต้องการ (640 หรือ 416)
             frame_yolo = cv2.resize(frame_HD, (AI_IMG_SIZE, AI_IMG_SIZE))
-            frame_yolo_clean = np.ascontiguousarray(frame_yolo)
+            # บางที ONNX ต้องการ C,H,W และ Normalize แต่ Ultralytics YOLO จัดการให้เราเองถ้าใช้ class YOLO()
             
-            # Scale Factors
+            # Scale Factors สำหรับแปลงกลับเป็น HD
             scale_x = DISPLAY_W / AI_IMG_SIZE
             scale_y = DISPLAY_H / AI_IMG_SIZE
 
@@ -314,10 +318,9 @@ class AIProcessor:
 
             try:
                 # 1. Pills 
-                pill_res = model_pill(frame_yolo_clean, verbose=False, conf=CONF_PILL, imgsz=AI_IMG_SIZE, max_det=10, agnostic_nms=True)
+                pill_res = model_pill(frame_yolo, verbose=False, conf=CONF_PILL, imgsz=AI_IMG_SIZE, max_det=10, agnostic_nms=True)
                 for box in pill_res[0].boxes.xyxy.cpu().numpy().astype(int):
                     x1_s, y1_s, x2_s, y2_s = box
-                    # Scale to HD
                     x1 = int(x1_s * scale_x); y1 = int(y1_s * scale_y)
                     x2 = int(x2_s * scale_x); y2 = int(y2_s * scale_y)
                     
@@ -326,11 +329,10 @@ class AIProcessor:
                     if crop.size == 0: continue
 
                     nm, sc = process_crop(crop, True)
-                    # 🔥 เก็บพิกัดกรอบด้วย (HD Box)
                     detections.append({'label':nm, 'score':sc, 'type':'pill', 'box':(x1,y1,x2,y2)})
 
                 # 2. Packs
-                pack_res = model_pack(frame_yolo_clean, verbose=False, conf=CONF_PACK, imgsz=AI_IMG_SIZE, max_det=5, agnostic_nms=True)
+                pack_res = model_pack(frame_yolo, verbose=False, conf=CONF_PACK, imgsz=AI_IMG_SIZE, max_det=5, agnostic_nms=True)
                 for box in pack_res[0].boxes.xyxy.cpu().numpy().astype(int):
                     x1_s, y1_s, x2_s, y2_s = box
                     x1 = int(x1_s * scale_x); y1 = int(y1_s * scale_y)
@@ -341,7 +343,6 @@ class AIProcessor:
                     if crop.size == 0: continue
 
                     nm, sc = process_crop(crop, False)
-                    # 🔥 เก็บพิกัดกรอบด้วย (HD Box)
                     detections.append({'label':nm, 'score':sc, 'type':'pack', 'box':(x1,y1,x2,y2)})
 
                 with self.lock: self.results = detections
@@ -367,24 +368,16 @@ def draw_patient_info(frame, patient_data):
         y = 35 + (i * line_h)
         cv2.putText(frame, line, (start_x+15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
 
-# 🔥 New Function: Draw Bounding Boxes
 def draw_boxes_on_items(frame, results):
     for r in results:
         x1, y1, x2, y2 = r['box']
         label = r['label']
         score = r['score']
         is_pill = r['type'] == 'pill'
-        
-        # Determine Color based on confidence
         threshold = SCORE_PASS_PILL if is_pill else SCORE_PASS_PACK
-        color = (0, 255, 0) # Green (Confident)
-        if score < threshold or "?" in label:
-             color = (0, 0, 255) # Red (Unsure)
-             
-        # Draw Box
+        color = (0, 255, 0)
+        if score < threshold or "?" in label: color = (0, 0, 255)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-        
-        # Draw Mini Label above box
         label_text = f"{label.replace('?','')} {score:.0%}"
         cv2.putText(frame, label_text, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
@@ -404,7 +397,7 @@ def main():
     cv2.resizeWindow(window_name, DISPLAY_W, DISPLAY_H) 
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    print(f"🎥 RUNNING... (HD Mode {DISPLAY_W}x{DISPLAY_H} with Boxes)")
+    print(f"🎥 RUNNING... (HD Mode {DISPLAY_W}x{DISPLAY_H} + Boxes)")
     fps = 0; prev_time = 0
     TARGET_FPS = 15
     FRAME_TIME = 1.0 / TARGET_FPS
@@ -421,7 +414,9 @@ def main():
             
             # 🔥 Draw Boxes First
             draw_boxes_on_items(display, results)
-            # Then Draw Summaries
+            
+            # ❌ [REMOVED] draw_summary_box(display, results)
+            
             if cur_patient: draw_patient_info(display, cur_patient)
             
             curr_time = time.time()
