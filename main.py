@@ -45,7 +45,7 @@ CONF_PACK = 0.75
 
 # Accuracy Thresholds
 SCORE_PASS_PILL = 0.2
-SCORE_PASS_PACK = 0.75 
+SCORE_PASS_PACK = 0.85 
 
 device = torch.device("cpu")
 print(f"🚀 SYSTEM STARTING ON: {device} (Optimized Mode)")
@@ -565,15 +565,21 @@ def draw_boxes_on_items(frame, results):
         score = r['score']
         obj_type = r.get('type', 'pill')
         
-        # Determine color
+        # Determine color based on type and score
         if obj_type == 'pack':
-            color = (0, 255, 255)  # Yellow for packs
-        elif "?" in label or score < SCORE_PASS_PILL:
-            color = (0, 0, 255)    # Red for uncertain
-        elif "Unknown" in label:
-            color = (255, 0, 0)    # Blue for unknown
+            # Pack: Green if >= 0.75, Yellow if < 0.75
+            if score >= SCORE_PASS_PACK:
+                color = (0, 255, 0)    # Green - passed
+            else:
+                color = (0, 255, 255)  # Yellow - below threshold
         else:
-            color = (0, 255, 0)    # Green for confident
+            # Pill logic
+            if "?" in label or score < SCORE_PASS_PILL:
+                color = (0, 0, 255)    # Red for uncertain
+            elif "Unknown" in label:
+                color = (255, 0, 0)    # Blue for unknown
+            else:
+                color = (0, 255, 0)    # Green for confident
 
         # Draw box and label
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
