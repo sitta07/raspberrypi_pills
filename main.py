@@ -23,7 +23,7 @@ except ImportError:
 # ================= CONFIGURATION =================
 # Paths
 MODEL_PILL_PATH = 'models/pills.pt'          
-MODEL_PACK_PATH = 'models/best_process_2.onnx'
+MODEL_PACK_PATH = 'models/best_process_2.pt'
 DB_FILES = {
     'pills': {'vec': 'database/db_pills.pkl', 'col': 'database/colors_pills.pkl'},
     'packs': {'vec': 'database/db_packs.pkl', 'col': 'database/colors_packs.pkl'}
@@ -738,7 +738,6 @@ def main():
     window_name = "PillTrack Senior Edition (RGB888)"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, DISPLAY_W, DISPLAY_H) 
-    # cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
     print(f"🎥 RUNNING... (RGB888 STRICT)")
     
@@ -753,24 +752,26 @@ def main():
         while True:
             start_loop = time.perf_counter()
             
-            # --- INPUT: RGB888 ---
+            # 1. ได้ภาพสด (Clean)
             frame_rgb = cam.read()
             if frame_rgb is None: 
                 time.sleep(0.01)
                 continue
             
-            # --- PROCESS: Uses RGB Frame internally ---
-            ai.update_frame(frame_rgb)
+            # 2. ส่ง "สำเนา" ให้ AI (เพื่อให้ AI ได้ภาพคลีนๆ ไม่มีเส้น)
+            ai.update_frame(frame_rgb.copy()) 
+            
+            # 3. รับผล
             results, cur_patient = ai.get_results()
             
-            # --- DRAWING: Directly on RGB Frame (No Conversion) ---
-            # NOTE: frame_rgb is modified in-place
+            # 4. วาดเส้นลงบนภาพ "ตัวจริง" (In-place modification)
             draw_boxes_on_items(frame_rgb, results)
             
             if cur_patient: 
                 clickable_areas = draw_patient_info(frame_rgb, cur_patient)
                 cv2.setMouseCallback(window_name, mouse_callback, (clickable_areas, ai))
             
+            # 5. คำนวณ FPS
             curr_time = time.perf_counter()
             fps = 1 / (curr_time - prev_time) if (curr_time - prev_time) > 0 else 0
             prev_time = curr_time
@@ -779,7 +780,7 @@ def main():
             cv2.putText(frame_rgb, f"FPS: {fps:.1f} | {temp}", (30, 50), 
                        FONT, 1.2, RGB_GREEN, THICKNESS_BOX)
             
-            # --- OUTPUT: Display RGB888 directly ---
+            # 6. แสดงผลภาพที่วาดแล้ว
             cv2.imshow(window_name, frame_rgb)
             
             key = cv2.waitKey(1) & 0xFF
