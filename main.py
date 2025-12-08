@@ -38,9 +38,9 @@ AI_IMG_SIZE = 416
 
 # Thresholds
 CONF_PILL = 0.5    
-CONF_PACK = 0.5     
-SCORE_PASS_PILL = 0.9
-SCORE_PASS_PACK = 0.9
+CONF_PACK = 0.5     # ลดลงนิดหน่อยเพื่อให้ Detect เจอกล่องง่ายขึ้น แล้วไปคัดที่ Logic แทน
+SCORE_PASS_PILL = 0.2
+SCORE_PASS_PACK = 0.6
 
 device = torch.device("cpu")
 print(f"🚀 SYSTEM STARTING ON: {device} (Ultra-Optimized Mode)")
@@ -54,6 +54,7 @@ def get_cpu_temperature():
         return "N/A"
 
 def is_point_in_box(point, box):
+    """Optimized: inline unpacking"""
     px, py = point
     x1, y1, x2, y2 = box
     return x1 < px < x2 and y1 < py < y2
@@ -138,18 +139,10 @@ class HISLoader:
 class PrescriptionManager:
     @staticmethod
     def filter_db(drug_names_list, source_vecs, source_lbls):
-        """
-        FIXED: Returns empty tensors instead of None if no match found.
-        Ensures strict filtering.
-        """
-        # Create empty defaults
-        empty_tensor = torch.empty((0, 2048), device=device) # Assuming ResNet size
-        
         if not drug_names_list or not source_vecs: 
-            return empty_tensor, []
+            return None, None
         
         drug_set = set(drug_names_list)
-        # Permissive matching (contains) to find subset
         indices = [i for i, label in enumerate(source_lbls) 
                    if any(drug in label.lower() for drug in drug_set)]
         
@@ -157,11 +150,10 @@ class PrescriptionManager:
             filtered_vecs = [source_vecs[i] for i in indices]
             filtered_lbls = [source_lbls[i] for i in indices]
             return torch.tensor(np.array(filtered_vecs), device=device), filtered_lbls
-            
-        # If we have a list but found no matches in DB, return EMPTY, not None
-        return empty_tensor, []
+        return None, None
 
 class PrescriptionState:
+    """Manages verified/remaining drugs with checkbox state"""
     def __init__(self):
         self.all_drugs = []  
         self.verified_drugs = set()
@@ -184,6 +176,7 @@ class PrescriptionState:
                 self.verified_drugs.add(drug_name)
 
     def verify_drug(self, drug_name):
+        """Force mark a drug as verified (Automatic)"""
         with self.lock:
             if drug_name not in self.verified_drugs:
                 print(f"✨ AUTO-VERIFIED: {drug_name}")
@@ -275,7 +268,7 @@ except Exception as e:
     print(f"[CRITICAL] Model Error: {e}")
     sys.exit(1)
 
-# ================= 3. TRINITY ENGINE (FIXED STRICT MODE) =================
+# ================= 3. TRINITY ENGINE =================
 COLOR_NORM = np.array([90.0, 255.0, 255.0])
 SIFT_RATIO = 0.75
 SIFT_MAX_MATCHES = 15.0
@@ -284,24 +277,13 @@ def trinity_inference(img_crop, is_pill=True,
                       session_pills=None, session_pills_lbl=None,
                       session_packs=None, session_packs_lbl=None):
     
-    # FIX: Strict Selection. 
-    # If session_pills passed (even if empty), USE IT. Do not fallback to global.
-    # We only use Global (matrix_pills) if session_pills is strictly None (which means no patient loaded).
-    
-    target_matrix = None
-    target_labels = None
+    target_matrix = (session_pills if session_pills is not None else matrix_pills) if is_pill else \
+                    (session_packs if session_packs is not None else matrix_packs)
+    target_labels = (session_pills_lbl if session_pills_lbl is not None else pills_lbls) if is_pill else \
+                    (session_packs_lbl if session_packs_lbl is not None else packs_lbls)
 
-    if is_pill:
-        target_matrix = session_pills if session_pills is not None else matrix_pills
-        target_labels = session_pills_lbl if session_pills_lbl is not None else pills_lbls
-    else:
-        target_matrix = session_packs if session_packs is not None else matrix_packs
-        target_labels = session_packs_lbl if session_packs_lbl is not None else packs_lbls
-
-    # CRITICAL CHECK: If we are in prescription mode, matrix might be empty (0 rows)
-    # If so, it means the item is NOT in the prescription. Stop here.
-    if target_matrix is None or target_matrix.numel() == 0 or target_matrix.size(0) == 0:
-        return "Not in Rx", 0.0
+    if target_matrix is None: 
+        return "DB Error", 0.0
 
     try:
         if is_pill: 
@@ -315,28 +297,16 @@ def trinity_inference(img_crop, is_pill=True,
         live_vec = embedder(input_tensor).flatten()
         live_vec = live_vec / live_vec.norm()
         
-        # Calculate scores against RESTRICTED database
         scores = torch.matmul(live_vec, target_matrix.T).squeeze(0)
-        
-        # Ensure we don't request more top-k than we have candidates
         k_val = min(10, len(target_labels))
         if k_val == 0: 
-            return "Not in Rx", 0.0
+            return "Unknown", 0.0
         
         top_k_val, top_k_idx = torch.topk(scores, k=k_val)
         candidates = []
         seen = set()
         
-        # Safe unpacking
-        vals = top_k_val.detach().cpu().numpy()
-        idxs = top_k_idx.detach().cpu().numpy()
-        
-        # Handle single item case (scalar output)
-        if vals.ndim == 0:
-            vals = [vals]
-            idxs = [idxs]
-
-        for idx, sc in zip(idxs, vals):
+        for idx, sc in zip(top_k_idx.detach().cpu().numpy(), top_k_val.detach().cpu().numpy()):
             name = target_labels[idx]
             if name not in seen:
                 candidates.append((name, float(sc)))
@@ -393,7 +363,7 @@ def trinity_inference(img_crop, is_pill=True,
         print(f"[Trinity Error] {e}")
         return "Error", 0.0
 
-# ================= 4. AI WORKER (STRICT LOGIC) =================
+# ================= 4. AI WORKER (AUTO-CHECK LOGIC) =================
 class AIProcessor:
     __slots__ = ('latest_frame', 'results', 'stopped', 'lock', 'is_rx_mode', 
                  'current_patient_info', 'sess_mat_pills', 'sess_lbl_pills',
@@ -407,12 +377,10 @@ class AIProcessor:
         self.lock = threading.Lock()
         self.is_rx_mode = False
         self.current_patient_info = None
-        # Initialize as None (Global mode) by default
         self.sess_mat_pills = None
         self.sess_lbl_pills = None
         self.sess_mat_packs = None
         self.sess_lbl_packs = None
-        
         self.scale_x = DISPLAY_W / AI_IMG_SIZE
         self.scale_y = DISPLAY_H / AI_IMG_SIZE
         self.resize_interpolation = cv2.INTER_LINEAR
@@ -420,7 +388,6 @@ class AIProcessor:
     def load_patient(self, patient_data):
         with self.lock:
             if not patient_data:
-                # Reset to Global Mode
                 self.is_rx_mode = False
                 self.current_patient_info = None
                 self.sess_mat_pills = None
@@ -433,27 +400,26 @@ class AIProcessor:
                 self.current_patient_info = patient_data
                 drugs = patient_data['drugs']
                 prescription_state.load_drugs(drugs)
-                
-                # Load Strict Subsets (Even if empty)
                 self.sess_mat_pills, self.sess_lbl_pills = PrescriptionManager.filter_db(
                     drugs, pills_vecs, pills_lbls)
                 self.sess_mat_packs, self.sess_lbl_packs = PrescriptionManager.filter_db(
                     drugs, packs_vecs, packs_lbls)
-                print(f"🏥 Loaded: {patient_data['name']} (Restricted DB)")
+                print(f"🏥 Loaded: {patient_data['name']}")
     
     def update_remaining_drugs(self):
-        """Modified: Only checks remaining items. Does NOT fallback to global."""
         with self.lock:
             if self.current_patient_info:
                 remaining = prescription_state.get_remaining_drugs()
-                # Strict check on remaining items only
-                self.sess_mat_pills, self.sess_lbl_pills = PrescriptionManager.filter_db(
-                    remaining, pills_vecs, pills_lbls)
-                self.sess_mat_packs, self.sess_lbl_packs = PrescriptionManager.filter_db(
-                    remaining, packs_vecs, packs_lbls)
-                
-                # NOTE: If remaining is empty, sess_mat will be empty tensor. 
-                # trinity_inference will detect this and return "Not in Rx" immediately.
+                if remaining:
+                    self.sess_mat_pills, self.sess_lbl_pills = PrescriptionManager.filter_db(
+                        remaining, pills_vecs, pills_lbls)
+                    self.sess_mat_packs, self.sess_lbl_packs = PrescriptionManager.filter_db(
+                        remaining, packs_vecs, packs_lbls)
+                else:
+                    self.sess_mat_pills = matrix_pills
+                    self.sess_lbl_pills = pills_lbls
+                    self.sess_mat_packs = matrix_packs
+                    self.sess_lbl_packs = packs_lbls
 
     def start(self): 
         threading.Thread(target=self.run, daemon=True).start()
@@ -484,13 +450,14 @@ class AIProcessor:
             
             final_detections = []
             detected_pills_raw = [] 
-            valid_pills = [] 
+            valid_pills = [] # Pills that are good enough to verify packs
 
             try:
                 # --- 1. DETECT PILLS ---
                 pill_res = model_pill(frame_yolo, verbose=False, conf=CONF_PILL, 
                                      imgsz=AI_IMG_SIZE, max_det=10, agnostic_nms=True)
                 
+                # Assumption Logic Helper
                 best_pill_score = -1
                 best_pill_name = None
 
@@ -503,17 +470,15 @@ class AIProcessor:
                     crop = frame_HD[y1:y2, x1:x2]
                     if crop.size == 0: continue
 
-                    # Strict Inference
                     nm, sc = trinity_inference(crop, is_pill=True,
                                               session_pills=self.sess_mat_pills,
                                               session_pills_lbl=self.sess_lbl_pills,
                                               session_packs=self.sess_mat_packs,
                                               session_packs_lbl=self.sess_lbl_packs)
                     
-                    if nm == "Not in Rx": continue # Skip if not in prescription
-
                     cx, cy = (x1+x2)>>1, (y1+y2)>>1
                     
+                    # Store for assumption
                     if "?" not in nm and "Unknown" not in nm and sc > best_pill_score:
                         best_pill_score = sc
                         best_pill_name = nm
@@ -522,6 +487,7 @@ class AIProcessor:
                         'name': nm, 'score': sc, 'center': (cx, cy), 'box': (x1, y1, x2, y2)
                     })
 
+                # Process Pills & Auto-Tick
                 for pill in detected_pills_raw:
                     nm, sc = pill['name'], pill['score']
                     
@@ -529,13 +495,16 @@ class AIProcessor:
                     if best_pill_name and ("?" in nm or "Unknown" in nm or sc < SCORE_PASS_PILL):
                         nm, sc = best_pill_name, best_pill_score
                     
+                    # --- LOGIC #1: Auto-Tick Pill ---
                     if "?" not in nm and "Unknown" not in nm and sc >= SCORE_PASS_PILL:
                         prescription_state.verify_drug(nm.lower())
                         self.update_remaining_drugs()
 
+                    # Check verification status
                     is_verified = prescription_state.is_verified(nm.lower())
                     
                     if "?" not in nm and "Unknown" not in nm:
+                        # Add to valid list for Pack checking
                         valid_pills.append({
                             'name': nm, 'center': pill['center'], 'verified': is_verified, 'score': sc
                         })
@@ -558,44 +527,35 @@ class AIProcessor:
                     crop = frame_HD[y1:y2, x1:x2]
                     if crop.size == 0: continue
                     
-                    # Strict Inference
                     nm, sc = trinity_inference(crop, is_pill=False,
                                               session_pills=self.sess_mat_pills,
                                               session_pills_lbl=self.sess_lbl_pills,
                                               session_packs=self.sess_mat_packs,
                                               session_packs_lbl=self.sess_lbl_packs)
                     
-                    # If empty DB returned "Not in Rx", but we have an inner pill, we might still want to show the box?
-                    # But for now, let's respect the "Strict" rule. If it's not in Rx, ignore it unless inner pill overrides.
-                    
+                    # --- LOGIC #2: Auto-Tick Pack (Native) ---
                     clean_name = nm.replace("_pack", "").lower()
-                    
-                    if nm != "Not in Rx" and "?" not in nm and "Unknown" not in nm and sc >= SCORE_PASS_PACK:
+                    if "?" not in nm and "Unknown" not in nm and sc >= SCORE_PASS_PACK:
                         prescription_state.verify_drug(clean_name)
                         self.update_remaining_drugs()
                     
-                    pack_verified = False
-                    if clean_name != "not in rx":
-                         pack_verified = prescription_state.is_verified(clean_name)
+                    # --- LOGIC #3: Check for Inner Pill (Inheritance) ---
+                    pack_verified = prescription_state.is_verified(clean_name)
                     
-                    # Inheritance Logic
-                    found_inner_pill = False
                     for pill in valid_pills:
                         if is_point_in_box(pill['center'], (x1, y1, x2, y2)):
-                            # TRUST THE PILL -> Force Verify Pack
-                            pack_verified = True
-                            nm = pill['name'] 
-                            sc = max(sc, pill['score']) 
-                            found_inner_pill = True
-                            
-                            prescription_state.verify_drug(nm.lower())
-                            self.update_remaining_drugs()
-                            break
+                            # Found a pill inside this pack
+                            if pill['score'] >= SCORE_PASS_PILL or pill['verified']:
+                                # TRUST THE PILL -> Force Verify Pack
+                                pack_verified = True
+                                nm = pill['name'] # Override Name
+                                sc = max(sc, pill['score']) # Boost Score
+                                
+                                # Auto-tick based on inner pill
+                                prescription_state.verify_drug(nm.lower())
+                                self.update_remaining_drugs()
+                                break
                     
-                    # If not in Rx AND no inner pill found -> Skip it (Don't draw box)
-                    if nm == "Not in Rx" and not found_inner_pill:
-                        continue
-
                     final_detections.append({
                         'label': nm, 'score': sc, 'type': 'pack',
                         'verified': pack_verified,
@@ -698,10 +658,10 @@ def draw_boxes_on_items(frame, results):
             if score >= SCORE_PASS_PACK:
                 color = (0, 255, 0)
             else:
-                color = (0, 255, 255) 
+                color = (0, 255, 255) # Yellow for unsure pack
             label_display = label
         elif "?" in label or score < SCORE_PASS_PILL:
-            color = (0, 0, 255) 
+            color = (0, 0, 255) # Red for bad pill
             label_display = label
         else:
             color = (0, 255, 0)
@@ -743,7 +703,7 @@ def main():
     cv2.resizeWindow(window_name, DISPLAY_W, DISPLAY_H) 
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    print(f"🎥 RUNNING... (STRICT PRESCRIPTION MODE)")
+    print(f"🎥 RUNNING... (Auto-Check & Mouse Mode)")
     
     fps = 0
     prev_time = time.perf_counter()
