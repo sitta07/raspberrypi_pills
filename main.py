@@ -23,7 +23,7 @@ except ImportError:
 # ================= CONFIGURATION =================
 # Paths
 MODEL_PILL_PATH = 'models/pills.pt'          
-MODEL_PACK_PATH = 'models/best_process_2.pt'
+MODEL_PACK_PATH = 'models/best_process_2.onnx'
 DB_FILES = {
     'pills': {'vec': 'database/db_pills.pkl', 'col': 'database/colors_pills.pkl'},
     'packs': {'vec': 'database/db_packs.pkl', 'col': 'database/colors_packs.pkl'}
