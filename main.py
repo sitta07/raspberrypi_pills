@@ -39,8 +39,8 @@ AI_IMG_SIZE = 832
 # Thresholds
 CONF_PILL = 0.45    
 CONF_PACK = 0.7     # ลดลงนิดหน่อยเพื่อให้ Detect เจอกล่องง่ายขึ้น แล้วไปคัดที่ Logic แทน
-SCORE_PASS_PILL = 0.2
-SCORE_PASS_PACK = 0.5
+SCORE_PASS_PILL = 0.25
+SCORE_PASS_PACK = 0.45
 
 device = torch.device("cpu")
 print(f"🚀 SYSTEM STARTING ON: {device} (Ultra-Optimized Mode)")
