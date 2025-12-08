@@ -40,7 +40,7 @@ AI_IMG_SIZE = 416
 CONF_PILL = 0.5    
 CONF_PACK = 0.5     
 SCORE_PASS_PILL = 0.2
-SCORE_PASS_PACK = 0.75
+SCORE_PASS_PACK = 0.85
 
 device = torch.device("cpu")
 print(f"🚀 SYSTEM STARTING ON: {device} (Ultra-Optimized Mode)")
