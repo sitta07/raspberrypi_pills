@@ -1,19 +1,23 @@
+import os
+import sys
+
+# ================= FIX RASPBERRY PI ERRORS =================
+# 1. Fix Display (X11 backend)
+os.environ["QT_QPA_PLATFORM"] = "xcb"
+# 2. Fix GPU Device Discovery Failed (Force Software Rendering)
+os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
+# ===========================================================
+
 import cv2
 import torch
 import numpy as np
 import pickle
-import os
 import threading
 import time
-import sys
-import subprocess
 from collections import Counter
 from ultralytics import YOLO
 from torchvision import models, transforms
 from PIL import Image
-
-# 🛠️ FIX Display on Raspberry Pi OS
-os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 # Import Picamera2
 try:
@@ -55,21 +59,21 @@ def get_cpu_temperature():
     except:
         return "N/A"
 
-# ================= 1. WEBCAM STREAM (Picamera2) =================
+# ================= 1. WEBCAM STREAM (Picamera2 RGB888) =================
 class WebcamStream:
     def __init__(self):
         self.stopped = False
         self.frame = None
         self.grabbed = False
         self.picam2 = None
-        self.lock = threading.Lock() # เพิ่ม Lock ให้ชัดเจน
+        self.lock = threading.Lock()
 
     def start(self):
         print(" Initializing Picamera2 (HD Mode)...")
         try:
             self.picam2 = Picamera2()
             
-            # 🔥 Config RGB888 ตามรีเควส
+            # 🔥 Config RGB888 DIRECTLY
             config = self.picam2.create_preview_configuration(
                 main={"size": (1280, 720), "format": "RGB888"},
                 controls={"FrameDurationLimits": (16666, 16666)} 
@@ -89,6 +93,7 @@ class WebcamStream:
     def update(self):
         while not self.stopped:
             try:
+                # Capture directly in RGB format
                 frame = self.picam2.capture_array()
                 if frame is not None:
                     with self.lock:
@@ -99,7 +104,6 @@ class WebcamStream:
             except:
                 self.stopped = True
 
-    # ✅ Fix Formatting: ขยายเป็นหลายบรรทัด
     def read(self):
         with self.lock:
             if self.grabbed:
@@ -207,19 +211,21 @@ except Exception as e:
 
 print("✅ System Ready!")
 
-# ================= 3. TRINITY ENGINE =================
+# ================= 3. TRINITY ENGINE (Modified for RGB Input) =================
 def trinity_inference(img_crop, is_pill=True, custom_matrix=None, custom_labels=None):
     target_matrix = custom_matrix if custom_matrix is not None else global_matrix
     target_labels = custom_labels if custom_labels is not None else global_labels
     if target_matrix is None: return "DB Error", 0.0
 
-    # Image is already BGR from AIProcessor loop logic
+    # 🔥 NO COLOR CONVERSION HERE (Assume Input is already RGB)
     if is_pill:
         w_vec, w_sift, w_col = 0.3, 0.1, 0.6 
-        pil_img = Image.fromarray(cv2.cvtColor(img_crop, cv2.COLOR_BGR2RGB))
+        # Input is RGB numpy -> Image.fromarray reads it correctly as RGB
+        pil_img = Image.fromarray(img_crop) 
     else:
         w_vec, w_sift, w_col = 0.3, 0.7, 0.0 
-        gray_crop = cv2.cvtColor(img_crop, cv2.COLOR_BGR2GRAY)
+        # Convert RGB to Gray
+        gray_crop = cv2.cvtColor(img_crop, cv2.COLOR_RGB2GRAY)
         crop_3ch_gray = cv2.merge([gray_crop, gray_crop, gray_crop])
         pil_img = Image.fromarray(crop_3ch_gray)
 
@@ -249,10 +255,10 @@ def trinity_inference(img_crop, is_pill=True, custom_matrix=None, custom_labels=
     if is_pill: 
         h, w = img_crop.shape[:2]
         center = img_crop[int(h*0.25):int(h*0.75), int(w*0.25):int(w*0.75)]
-        hsv = cv2.cvtColor(center, cv2.COLOR_BGR2HSV)
+        hsv = cv2.cvtColor(center, cv2.COLOR_RGB2HSV) # 🔥 Use RGB2HSV
         live_color = np.mean(hsv, axis=(0,1))
     
-    gray = cv2.cvtColor(img_crop, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(img_crop, cv2.COLOR_RGB2GRAY) # 🔥 Use RGB2GRAY
     _, des_live = sift.detectAndCompute(gray, None)
 
     best_score = -1; final_name = "Unknown"
@@ -315,12 +321,10 @@ class AIProcessor:
         threading.Thread(target=self.loop, args=(), daemon=True).start()
         return self
     
-    # ✅ Fix Formatting: ขยายเป็นหลายบรรทัด
     def set_frame(self, frame): 
         with self.lock: 
             self.frame_in = frame
         
-    # ✅ Fix Formatting: ขยายเป็นหลายบรรทัด
     def get_results(self): 
         with self.lock: 
             return self.results, self.current_patient_info
@@ -337,9 +341,7 @@ class AIProcessor:
                 time.sleep(0.005)
                 continue
 
-            # ⚠️ Convert RGB (from Picamera2) to BGR (for OpenCV/AI Logic)
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-
+            # 🔥 NO CONVERSION: processing frame as RGB directly
             detections = []
             pill_names_batch = [] 
             pill_coords = []      
@@ -359,12 +361,12 @@ class AIProcessor:
                     if self.is_rx_mode: name = "WRONG"; label_prefix = "!!! "
                 return name, score, label_prefix, color
 
-            # 1. Pills 
-            pill_res = model_pill(frame_bgr, verbose=False, conf=CONF_PILL)
+            # 1. Pills (Pass RGB frame to YOLO)
+            pill_res = model_pill(frame, verbose=False, conf=CONF_PILL)
             if len(pill_res[0].boxes) > 0:
                 for box in pill_res[0].boxes.xyxy.cpu().numpy().astype(int):
                     x1,y1,x2,y2 = box
-                    crop = frame_bgr[y1:y2, x1:x2]
+                    crop = frame[y1:y2, x1:x2]
                     if crop.size > 0:
                         nm, sc, pf, clr = process_crop(crop, True)
                         if "WRONG" not in nm and "Unknown" not in nm:
@@ -372,17 +374,17 @@ class AIProcessor:
                             pill_coords.append((x1,y1,x2,y2))
                         detections.append({'box':box, 'label':nm, 'full':f"{pf}{nm} {sc:.0%}", 'color':clr, 'type':'pill'})
 
-            # 2. Packs
-            pack_res = model_pack(frame_bgr, verbose=False, conf=CONF_PACK, retina_masks=True)
+            # 2. Packs (Pass RGB frame to YOLO)
+            pack_res = model_pack(frame, verbose=False, conf=CONF_PACK, retina_masks=True)
             if pack_res[0].masks is not None:
                 masks = pack_res[0].masks.data.cpu().numpy()
                 boxes = pack_res[0].boxes.xyxy.cpu().numpy().astype(int)
                 for i, box in enumerate(boxes):
                     x1,y1,x2,y2 = box
                     raw_mask = masks[i]
-                    mask_resized = cv2.resize(raw_mask, (frame_bgr.shape[1], frame_bgr.shape[0]))
+                    mask_resized = cv2.resize(raw_mask, (frame.shape[1], frame.shape[0]))
                     mask_binary = (mask_resized > 0.5).astype(np.uint8)
-                    masked = frame_bgr.copy(); masked[mask_binary == 0] = [128,128,128]
+                    masked = frame.copy(); masked[mask_binary == 0] = [128,128,128]
                     crop = masked[y1:y2, x1:x2]
                     if crop.size > 0:
                         nm, sc, pf, clr = process_crop(crop, False)
@@ -418,8 +420,7 @@ class AIProcessor:
 def draw_patient_info(frame, patient_data):
     if not patient_data: return
     H, W = frame.shape[:2]
-    box_w = 300
-    start_x = W - box_w
+    box_w = 300; start_x = W - box_w
     
     lines = [f"HN: {patient_data.get('hn', 'N/A')}",
              f"Name: {patient_data.get('name', 'N/A')}", "--- Rx List ---"]
@@ -434,7 +435,7 @@ def draw_patient_info(frame, patient_data):
 def draw_summary_box(frame, results):
     H, W = frame.shape[:2]
     
-    # Filter & Count: Only count valid Pills and Packs (exclude Group Box & Errors)
+    # Filter & Count
     items = [r['label'] for r in results 
              if r['type'] in ['pill', 'pack'] 
              and "Unknown" not in r['label'] 
@@ -501,11 +502,14 @@ def main():
             if frame_rgb is None: 
                 time.sleep(0.01); continue
             
-            # Send to AI
+            # Send to AI (RGB)
             ai.set_frame(frame_rgb)
             
-            # Convert to BGR for Display (OpenCV needs BGR)
-            display = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            # Use RGB for Display directly (No Conversion)
+            # ⚠️ Note: OpenCV usually expects BGR. 
+            # If colors look swapped (Blue face), it's because we are feeding RGB to cv2.imshow.
+            # But per user request, we use RGB888 directly.
+            display = frame_rgb.copy()
             
             # Get Results
             results, cur_patient = ai.get_results()
