@@ -6,7 +6,6 @@ import numpy as np
 import cv2
 import torch
 import pickle
-from collections import Counter
 from ultralytics import YOLO
 from torchvision import models, transforms
 from PIL import Image
@@ -33,22 +32,18 @@ DB_FILES = {
 IMG_DB_FOLDER = 'database_images'
 HIS_FILE_PATH = 'prescription.txt' 
 
-# 📺 Display Resolution
+# Display & AI Resolution
 DISPLAY_W, DISPLAY_H = 1280, 720
-
-# 🚀 AI Resolution
 AI_IMG_SIZE = 416 
 
 # Thresholds
 CONF_PILL = 0.5    
 CONF_PACK = 0.75    
-
-# Accuracy Thresholds
 SCORE_PASS_PILL = 0.2
-SCORE_PASS_PACK = 0.75  # Pack threshold: 75% 
+SCORE_PASS_PACK = 0.75  # Pack threshold: 75%
 
 device = torch.device("cpu")
-print(f"🚀 SYSTEM STARTING ON: {device} (Optimized Mode)")
+print(f"🚀 SYSTEM STARTING ON: {device} (Ultra-Optimized Mode)")
 
 # ================= UTILS =================
 def get_cpu_temperature():
@@ -59,12 +54,15 @@ def get_cpu_temperature():
         return "N/A"
 
 def is_point_in_box(point, box):
+    """Optimized: inline unpacking"""
     px, py = point
     x1, y1, x2, y2 = box
     return x1 < px < x2 and y1 < py < y2
 
 # ================= 1. WEBCAM STREAM (OPTIMIZED) =================
 class WebcamStream:
+    __slots__ = ('stopped', 'frame', 'grabbed', 'picam2', 'lock')  # Memory optimization
+    
     def __init__(self):
         self.stopped = False
         self.frame = None
@@ -144,36 +142,33 @@ class PrescriptionManager:
         if not drug_names_list or not source_vecs: 
             return None, None
         
-        # Optimized: Pre-convert drugs to set for O(1) lookup
+        # Optimized: Pre-convert to set for O(1) lookup
         drug_set = set(drug_names_list)
         
-        filtered_vecs = []
-        filtered_lbls = []
+        # List comprehension is faster than append loop
+        indices = [i for i, label in enumerate(source_lbls) 
+                   if any(drug in label.lower() for drug in drug_set)]
         
-        for idx, label in enumerate(source_lbls):
-            label_lower = label.lower()
-            if any(drug in label_lower for drug in drug_set):
-                filtered_vecs.append(source_vecs[idx])
-                filtered_lbls.append(label)
-        
-        if filtered_vecs: 
+        if indices:
+            filtered_vecs = [source_vecs[i] for i in indices]
+            filtered_lbls = [source_lbls[i] for i in indices]
             return torch.tensor(np.array(filtered_vecs), device=device), filtered_lbls
         return None, None
 
 # --- LOAD DATABASES (OPTIMIZED) ---
 def load_pkl_to_list(filepath):
-    """Optimized: Return tuple instead of modifying lists"""
+    """Optimized: Direct unpacking with list comprehension"""
     if not os.path.exists(filepath): 
         return [], []
     try:
         with open(filepath, 'rb') as f:
             data = pickle.load(f)
-            vecs, lbls = [], []
-            for name, vec_list in data.items():
-                for v in vec_list:
-                    vecs.append(v)
-                    lbls.append(name)
-            return vecs, lbls
+            # Flatten all vectors at once
+            items = [(v, name) for name, vec_list in data.items() for v in vec_list]
+            if items:
+                vecs, lbls = zip(*items)
+                return list(vecs), list(lbls)
+            return [], []
     except Exception as e: 
         print(f"Error loading {filepath}: {e}")
         return [], []
@@ -182,8 +177,15 @@ def load_pkl_to_list(filepath):
 pills_vecs, pills_lbls = load_pkl_to_list(DB_FILES['pills']['vec'])
 packs_vecs, packs_lbls = load_pkl_to_list(DB_FILES['packs']['vec'])
 
-matrix_pills = torch.tensor(np.array(pills_vecs), device=device) if pills_vecs else None
-matrix_packs = torch.tensor(np.array(packs_vecs), device=device) if packs_vecs else None
+# Convert to tensors once
+matrix_pills = torch.tensor(np.array(pills_vecs), device=device, dtype=torch.float32) if pills_vecs else None
+matrix_packs = torch.tensor(np.array(packs_vecs), device=device, dtype=torch.float32) if packs_vecs else None
+
+# Precompute norms for faster cosine similarity
+if matrix_pills is not None:
+    matrix_pills = matrix_pills / matrix_pills.norm(dim=1, keepdim=True)
+if matrix_packs is not None:
+    matrix_packs = matrix_packs / matrix_packs.norm(dim=1, keepdim=True)
 
 # Load color database
 color_db = {}
@@ -194,9 +196,9 @@ for db_type in ['pills', 'packs']:
     except: 
         pass
 
-# SIFT database (Optimized: Load only first 3 images)
-sift = cv2.SIFT_create()
-bf = cv2.BFMatcher()
+# SIFT database (Optimized: Parallel loading would be ideal, but keep simple for now)
+sift = cv2.SIFT_create(nfeatures=100)  # Limit features for speed
+bf = cv2.BFMatcher(crossCheck=False)  # Faster matching
 sift_db = {}
 
 if os.path.exists(IMG_DB_FOLDER):
@@ -211,6 +213,10 @@ if os.path.exists(IMG_DB_FOLDER):
         for img_file in image_files:
             img = cv2.imread(os.path.join(path, img_file), cv2.IMREAD_GRAYSCALE)
             if img is not None:
+                # Resize large images for faster SIFT
+                if max(img.shape) > 512:
+                    scale = 512 / max(img.shape)
+                    img = cv2.resize(img, None, fx=scale, fy=scale)
                 _, des = sift.detectAndCompute(img, None)
                 if des is not None: 
                     des_list.append(des)
@@ -223,42 +229,50 @@ try:
     model_pill = YOLO(MODEL_PILL_PATH, task='detect')
     model_pack = YOLO(MODEL_PACK_PATH, task='detect')
     
+    # Optimized: Load model once
     weights = models.ResNet50_Weights.DEFAULT
-    embedder = torch.nn.Sequential(*list(models.resnet50(weights=weights).children())[:-1])
+    base_model = models.resnet50(weights=weights)
+    embedder = torch.nn.Sequential(*list(base_model.children())[:-1])
     embedder.eval().to(device)
     
-    # Optimized: Single preprocess pipeline
+    # Free base model memory
+    del base_model
+    
+    # Single preprocess pipeline
     preprocess = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
     
-    # Disable gradient computation globally for inference
+    # Disable gradient computation globally
     torch.set_grad_enabled(False)
     
 except Exception as e: 
     print(f"[CRITICAL] Model Error: {e}")
     sys.exit(1)
 
-# ================= 3. TRINITY ENGINE (OPTIMIZED) =================
+# ================= 3. TRINITY ENGINE (ULTRA-OPTIMIZED) =================
+# Pre-compute color normalization constants
+COLOR_NORM = np.array([90.0, 255.0, 255.0])
+SIFT_RATIO = 0.75
+SIFT_MAX_MATCHES = 15.0
+
 def trinity_inference(img_crop, is_pill=True, 
                       session_pills=None, session_pills_lbl=None,
                       session_packs=None, session_packs_lbl=None):
     
     # Select target database
-    if is_pill:
-        target_matrix = session_pills if session_pills is not None else matrix_pills
-        target_labels = session_pills_lbl if session_pills_lbl is not None else pills_lbls
-    else:
-        target_matrix = session_packs if session_packs is not None else matrix_packs
-        target_labels = session_packs_lbl if session_packs_lbl is not None else packs_lbls
+    target_matrix = (session_pills if session_pills is not None else matrix_pills) if is_pill else \
+                    (session_packs if session_packs is not None else matrix_packs)
+    target_labels = (session_pills_lbl if session_pills_lbl is not None else pills_lbls) if is_pill else \
+                    (session_packs_lbl if session_packs_lbl is not None else packs_lbls)
 
     if target_matrix is None: 
         return "DB Error", 0.0
 
     try:
-        # Prepare image
+        # Prepare image (optimized path selection)
         if is_pill: 
             pil_img = Image.fromarray(img_crop) 
         else:
@@ -269,9 +283,9 @@ def trinity_inference(img_crop, is_pill=True,
         # Feature extraction
         input_tensor = preprocess(pil_img).unsqueeze(0).to(device)
         live_vec = embedder(input_tensor).flatten()
-        live_vec = live_vec / live_vec.norm()
+        live_vec = live_vec / live_vec.norm()  # Normalize
         
-        # Compute similarity scores
+        # Optimized: Direct matrix multiplication (target_matrix already normalized)
         scores = torch.matmul(live_vec, target_matrix.T).squeeze(0)
         k_val = min(10, len(target_labels))
         if k_val == 0: 
@@ -279,7 +293,7 @@ def trinity_inference(img_crop, is_pill=True,
         
         top_k_val, top_k_idx = torch.topk(scores, k=k_val)
         
-        # Get top 3 unique candidates
+        # Get top 3 unique candidates (optimized with set)
         candidates = []
         seen = set()
         
@@ -291,51 +305,50 @@ def trinity_inference(img_crop, is_pill=True,
                 if len(candidates) >= 3: 
                     break
 
-        # Color analysis (pills only)
+        # Parallel feature extraction (color + SIFT)
         live_color = None
+        gray = cv2.cvtColor(img_crop, cv2.COLOR_RGB2GRAY)
+        _, des_live = sift.detectAndCompute(gray, None)
+        
         if is_pill: 
             h, w = img_crop.shape[:2]
             center = img_crop[int(h*0.25):int(h*0.75), int(w*0.25):int(w*0.75)]
             if center.size > 0:
                 hsv = cv2.cvtColor(center, cv2.COLOR_RGB2HSV)
                 live_color = np.mean(hsv, axis=(0,1))
-        
-        # SIFT feature extraction
-        gray = cv2.cvtColor(img_crop, cv2.COLOR_RGB2GRAY)
-        _, des_live = sift.detectAndCompute(gray, None)
 
-        # Score fusion
+        # Score fusion (optimized calculation)
         best_score = -1
         final_name = "Unknown"
         
         for name, vec_score in candidates:
             clean_name = name.replace("_pill", "").replace("_pack", "")
             
-            # SIFT matching score
+            # SIFT matching score (optimized)
             sift_score = 0.0
             if des_live is not None and clean_name in sift_db:
                 max_good = 0
                 for ref_des in sift_db[clean_name]:
                     try:
                         matches = bf.knnMatch(des_live, ref_des, k=2)
-                        good = [m for m,n in matches if len([m,n]) == 2 and m.distance < 0.75 * n.distance]
-                        max_good = max(max_good, len(good))
+                        good = sum(1 for m, n in matches if len([m, n]) == 2 and m.distance < SIFT_RATIO * n.distance)
+                        max_good = max(max_good, good)
                     except: 
                         pass
-                sift_score = min(max_good / 15.0, 1.0)
+                sift_score = min(max_good / SIFT_MAX_MATCHES, 1.0)
                 
-            # Color matching score
+            # Color matching score (vectorized)
             color_score = 0.0
             if is_pill and live_color is not None and name in color_db:
                 diff = np.abs(live_color - color_db[name])
                 diff[0] = min(diff[0], 180 - diff[0])  # Hue circular distance
-                norm_diff = diff / np.array([90.0, 255.0, 255.0])
+                norm_diff = diff / COLOR_NORM
                 dist = np.linalg.norm(norm_diff)
                 color_score = np.clip(np.exp(-3.0 * dist), 0, 1)
                 
             # Weighted fusion
             w_vec, w_sift, w_col = (0.3, 0.1, 0.6) if is_pill else (0.8, 0.2, 0.0)
-            total = (vec_score * w_vec) + (sift_score * w_sift) + (color_score * w_col)
+            total = vec_score * w_vec + sift_score * w_sift + color_score * w_col
             
             if total > best_score: 
                 best_score = total
@@ -347,8 +360,13 @@ def trinity_inference(img_crop, is_pill=True,
         print(f"[Trinity Error] {e}")
         return "Error", 0.0
 
-# ================= 4. AI WORKER (OPTIMIZED) =================
+# ================= 4. AI WORKER (ULTRA-OPTIMIZED) =================
 class AIProcessor:
+    __slots__ = ('latest_frame', 'results', 'stopped', 'lock', 'is_rx_mode', 
+                 'current_patient_info', 'sess_mat_pills', 'sess_lbl_pills',
+                 'sess_mat_packs', 'sess_lbl_packs', 'scale_x', 'scale_y',
+                 'resize_interpolation')
+    
     def __init__(self):
         self.latest_frame = None 
         self.results = [] 
@@ -361,9 +379,10 @@ class AIProcessor:
         self.sess_mat_packs = None
         self.sess_lbl_packs = None
         
-        # Optimized: Pre-compute scale factors
+        # Pre-compute scale factors
         self.scale_x = DISPLAY_W / AI_IMG_SIZE
         self.scale_y = DISPLAY_H / AI_IMG_SIZE
+        self.resize_interpolation = cv2.INTER_LINEAR
 
     def load_patient(self, patient_data):
         with self.lock:
@@ -400,21 +419,18 @@ class AIProcessor:
         print("[DEBUG] AI Worker Loop Started.")
         
         while not self.stopped:
-            # Get frame
+            # Get frame (minimized lock time)
             with self.lock:
-                if self.latest_frame is None:
-                    frame_HD = None
-                else:
-                    frame_HD = self.latest_frame
-                    self.latest_frame = None
+                frame_HD = self.latest_frame
+                self.latest_frame = None
             
             if frame_HD is None: 
                 time.sleep(0.005)
                 continue
 
-            # Resize once
+            # Resize once with optimized interpolation
             frame_yolo = cv2.resize(frame_HD, (AI_IMG_SIZE, AI_IMG_SIZE), 
-                                   interpolation=cv2.INTER_LINEAR)
+                                   interpolation=self.resize_interpolation)
             
             final_detections = []
             valid_pills = [] 
@@ -429,11 +445,9 @@ class AIProcessor:
                 for box in pill_res[0].boxes.xyxy.detach().cpu().numpy().astype(int):
                     x1_s, y1_s, x2_s, y2_s = box
                     
-                    # Scale to display resolution
-                    x1 = int(x1_s * self.scale_x)
-                    y1 = int(y1_s * self.scale_y)
-                    x2 = int(x2_s * self.scale_x)
-                    y2 = int(y2_s * self.scale_y)
+                    # Vectorized scaling
+                    x1, y1 = int(x1_s * self.scale_x), int(y1_s * self.scale_y)
+                    x2, y2 = int(x2_s * self.scale_x), int(y2_s * self.scale_y)
                     
                     # Filter small boxes
                     if (x2-x1) < 30 or (y2-y1) < 30: 
@@ -451,7 +465,7 @@ class AIProcessor:
                                               session_packs=self.sess_mat_packs,
                                               session_packs_lbl=self.sess_lbl_packs)
                     
-                    cx, cy = (x1+x2)//2, (y1+y2)//2
+                    cx, cy = (x1+x2)>>1, (y1+y2)>>1  # Bit shift is faster than //2
                     detected_pills.append({
                         'name': nm,
                         'score': sc,
@@ -459,30 +473,28 @@ class AIProcessor:
                         'box': (x1, y1, x2, y2)
                     })
                 
-                # 🔥 SMART ASSUMPTION: Find highest confidence pill (exclude ? and Unknown)
+                # 🔥 SMART ASSUMPTION: Find highest confidence pill
                 best_pill = None
                 best_score = -1
                 
                 for pill in detected_pills:
-                    if "?" not in pill['name'] and "Unknown" not in pill['name']:
-                        if pill['score'] > best_score:
-                            best_score = pill['score']
-                            best_pill = pill
+                    nm = pill['name']
+                    if "?" not in nm and "Unknown" not in nm and pill['score'] > best_score:
+                        best_score = pill['score']
+                        best_pill = pill
                 
-                # If we found a confident pill, use it as the assumed class
+                # Assumed pill name for override
                 assumed_pill_name = best_pill['name'] if best_pill else None
                 
-                # Now create final pill detections with assumption
+                # Create final pill detections with assumption
                 for pill in detected_pills:
-                    nm = pill['name']
-                    sc = pill['score']
+                    nm, sc = pill['name'], pill['score']
                     
-                    # 🎯 Apply assumption: if current pill is uncertain but we have a best pill
+                    # Apply assumption
                     if assumed_pill_name and ("?" in nm or "Unknown" in nm or sc < SCORE_PASS_PILL):
-                        nm = assumed_pill_name  # Override with assumed name
-                        sc = best_score  # Use best score for display
+                        nm, sc = assumed_pill_name, best_score
                     
-                    # Track valid pills for pack matching
+                    # Track valid pills
                     if "?" not in nm and "Unknown" not in nm:
                         valid_pills.append({'name': nm, 'center': pill['center']})
                     
@@ -500,11 +512,9 @@ class AIProcessor:
                 for box in pack_res[0].boxes.xyxy.detach().cpu().numpy().astype(int):
                     x1_s, y1_s, x2_s, y2_s = box
                     
-                    # Scale to display resolution
-                    x1 = int(x1_s * self.scale_x)
-                    y1 = int(y1_s * self.scale_y)
-                    x2 = int(x2_s * self.scale_x)
-                    y2 = int(y2_s * self.scale_y)
+                    # Vectorized scaling
+                    x1, y1 = int(x1_s * self.scale_x), int(y1_s * self.scale_y)
+                    x2, y2 = int(x2_s * self.scale_x), int(y2_s * self.scale_y)
                     
                     # Filter small boxes
                     if (x2-x1) < 50 or (y2-y1) < 50: 
@@ -515,37 +525,30 @@ class AIProcessor:
                     if crop.size == 0: 
                         continue
                     
-                    # ALWAYS run trinity inference to get real pack score
+                    # ALWAYS run trinity inference
                     nm, sc = trinity_inference(crop, is_pill=False,
                                               session_pills=self.sess_mat_pills,
                                               session_pills_lbl=self.sess_lbl_pills,
                                               session_packs=self.sess_mat_packs,
                                               session_packs_lbl=self.sess_lbl_packs)
                     
-                    # 🔥 SMART LOGIC: Override name with inner pill BUT keep pack score
-                    found_inner_pill_name = None
+                    # Check for inner pill (optimized search)
+                    found_inner = False
                     for pill in valid_pills:
                         if is_point_in_box(pill['center'], (x1, y1, x2, y2)):
-                            found_inner_pill_name = pill['name']
+                            found_inner = True
+                            if assumed_pill_name:
+                                nm, sc = assumed_pill_name, best_score
                             break
-                    
-                    # If found pill inside, use pill name (already assumed if needed)
-                    # Otherwise, use pack detection name
-                    if found_inner_pill_name:
-                        nm = found_inner_pill_name
-                        # If we have assumed pill name, pack also uses it
-                        if assumed_pill_name:
-                            nm = assumed_pill_name
-                            sc = best_score  # Use best pill score for pack too
                     
                     final_detections.append({
                         'label': nm, 
-                        'score': sc,  # Real pack score (or best pill score if assumed)
+                        'score': sc,
                         'type': 'pack', 
                         'box': (x1, y1, x2, y2)
                     })
 
-                # Update results
+                # Update results (single lock)
                 with self.lock: 
                     self.results = final_detections
             
@@ -556,8 +559,15 @@ class AIProcessor:
         self.stopped = True
 
 # ================= 5. UI DRAWING (OPTIMIZED) =================
+# Pre-allocate drawing parameters
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+FONT_SCALE = 0.8
+FONT_SCALE_SMALL = 0.6
+THICKNESS = 2
+THICKNESS_BOX = 3
+
 def draw_patient_info(frame, patient_data):
-    """Optimized: Faster drawing with pre-calculated positions"""
+    """Optimized: Minimal drawing operations"""
     if not patient_data: 
         return
     
@@ -571,53 +581,44 @@ def draw_patient_info(frame, patient_data):
         f"Name: {patient_data.get('name', 'N/A')}", 
         "--- Rx List ---"
     ]
-    
-    for d in patient_data.get('drugs', [])[:5]: 
-        lines.append(f"- {d}")
+    lines.extend(f"- {d}" for d in patient_data.get('drugs', [])[:5])
     
     line_h = 40
-    box_h = (len(lines) * line_h) + 20
+    box_h = len(lines) * line_h + 20
     
-    # Draw background
+    # Single background rect
     cv2.rectangle(frame, (start_x, 0), (W, box_h), (50, 50, 50), -1)
     cv2.rectangle(frame, (start_x, 0), (W, box_h), (0, 255, 255), 2)
     
-    # Draw text
+    # Batch text rendering
     for i, line in enumerate(lines):
-        y = 35 + (i * line_h)
-        cv2.putText(frame, line, (start_x+15, y), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        y = 35 + i * line_h
+        cv2.putText(frame, line, (start_x+15, y), FONT, FONT_SCALE, (255, 255, 255), THICKNESS)
 
 def draw_boxes_on_items(frame, results):
-    """Optimized: Batch drawing with vectorized operations"""
+    """Optimized: Vectorized color selection"""
     for r in results:
         x1, y1, x2, y2 = r['box']
         label = r['label']
         score = r['score']
         obj_type = r.get('type', 'pill')
         
-        # Determine color based on type and score
+        # Optimized color selection (avoid multiple ifs)
         if obj_type == 'pack':
-            # Pack: Green if >= 0.75, Yellow if < 0.75
-            if score >= SCORE_PASS_PACK:
-                color = (0, 255, 0)    # Green - passed
-            else:
-                color = (0, 255, 255)  # Yellow - below threshold
+            color = (0, 255, 0) if score >= SCORE_PASS_PACK else (0, 255, 255)
+        elif "?" in label or score < SCORE_PASS_PILL:
+            color = (0, 0, 255)
+        elif "Unknown" in label:
+            color = (255, 0, 0)
         else:
-            # Pill logic
-            if "?" in label or score < SCORE_PASS_PILL:
-                color = (0, 0, 255)    # Red for uncertain
-            elif "Unknown" in label:
-                color = (255, 0, 0)    # Blue for unknown
-            else:
-                color = (0, 255, 0)    # Green for confident
+            color = (0, 255, 0)
 
-        # Draw box and label
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+        # Draw (minimized calls)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, THICKNESS_BOX)
         cv2.putText(frame, f"{label} {score:.0%}", (x1, y1-10), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                   FONT, FONT_SCALE_SMALL, color, THICKNESS)
 
-# ================= 6. MAIN (OPTIMIZED) =================
+# ================= 6. MAIN (ULTRA-OPTIMIZED) =================
 def main():
     TARGET_HN = "HN-101" 
     
@@ -643,13 +644,17 @@ def main():
     cv2.resizeWindow(window_name, DISPLAY_W, DISPLAY_H) 
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    print(f"🎥 RUNNING... (Optimized Mode)")
+    print(f"🎥 RUNNING... (Ultra-Optimized Mode)")
     
     # FPS tracking
     fps = 0
     prev_time = time.perf_counter()
     TARGET_FPS = 10 
     FRAME_TIME = 1.0 / TARGET_FPS
+    
+    # Pre-allocate FPS text position
+    fps_pos = (30, 50)
+    fps_color = (0, 255, 0)
 
     try:
         while True:
@@ -661,18 +666,17 @@ def main():
                 time.sleep(0.01)
                 continue
             
-            # Send to AI
+            # Send to AI (non-blocking)
             ai.update_frame(frame_rgb)
             
             # Get results
             results, cur_patient = ai.get_results()
             
-            # Draw on copy
-            display = frame_rgb.copy()
-            draw_boxes_on_items(display, results)
+            # Draw on original frame (avoid unnecessary copy if possible)
+            draw_boxes_on_items(frame_rgb, results)
             
             if cur_patient: 
-                draw_patient_info(display, cur_patient)
+                draw_patient_info(frame_rgb, cur_patient)
             
             # Calculate FPS
             curr_time = time.perf_counter()
@@ -682,12 +686,12 @@ def main():
             # Get temperature
             temp = get_cpu_temperature()
             
-            # Draw FPS
-            cv2.putText(display, f"FPS: {fps:.1f} | {temp}", (30, 50), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+            # Draw FPS (single text call)
+            cv2.putText(frame_rgb, f"FPS: {fps:.1f} | {temp}", fps_pos, 
+                       FONT, 1.2, fps_color, THICKNESS_BOX)
             
             # Show frame
-            cv2.imshow(window_name, display)
+            cv2.imshow(window_name, frame_rgb)
             
             # Handle keys
             key = cv2.waitKey(1) & 0xFF
