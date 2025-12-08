@@ -11,13 +11,10 @@ from ultralytics import YOLO
 from torchvision import models, transforms
 from PIL import Image
 
-# ================= 🚀 EXTREME PERFORMANCE TUNING =================
+# ================= FIX RASPBERRY PI ENVIRONMENT =================
 os.environ["QT_QPA_PLATFORM"] = "xcb"
 os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
-
-# 🔥 ให้ AI ใช้ CPU 3 Core (เหลือ 1 Core ไว้ให้ OS และวาดหน้าจอ)
 os.environ["OMP_NUM_THREADS"] = "3"
-os.environ["MKL_NUM_THREADS"] = "3"
 
 try:
     from picamera2 import Picamera2
@@ -36,16 +33,13 @@ DB_FILES = {
 IMG_DB_FOLDER = 'database_images'
 HIS_FILE_PATH = 'prescription.txt' 
 
-# 🔥 416 คือจุดสมดุลความเร็ว/ความแม่นบน Pi (เร็วกว่า 640 ถึง 2 เท่า)
 AI_IMG_SIZE = 416 
-
-# Thresholds
 CONF_PILL = 0.15    
 CONF_PACK = 0.20    
 SCORE_PASS = 0.60  
 
 device = torch.device("cpu")
-print(f"🚀 SYSTEM STARTING ON: {device} (Optimized Mode)")
+print(f"🚀 SYSTEM STARTING ON: {device}")
 
 # ================= UTILS =================
 def get_cpu_temperature():
@@ -54,7 +48,7 @@ def get_cpu_temperature():
             return f"{float(f.read()) / 1000.0:.1f}C"
     except: return "N/A"
 
-# ================= 1. WEBCAM STREAM (LOCKED @ 15FPS) =================
+# ================= 1. WEBCAM STREAM =================
 class WebcamStream:
     def __init__(self):
         self.stopped = False
@@ -64,11 +58,10 @@ class WebcamStream:
         self.lock = threading.Lock()
 
     def start(self):
-        print("[DEBUG] Initializing Picamera2 (15 FPS Mode)...")
+        print("[DEBUG] Initializing Picamera2...")
         try:
             self.picam2 = Picamera2()
-            # 🔥 Config Hardware Limit to 15 FPS (Save CPU for AI)
-            # 1,000,000 / 15 = 66666 microseconds
+            # Config Hardware Limit 15 FPS
             config = self.picam2.create_preview_configuration(
                 main={"size": (640, 640), "format": "RGB888"},
                 controls={"FrameDurationLimits": (66666, 66666)} 
@@ -92,10 +85,8 @@ class WebcamStream:
                     with self.lock:
                         self.frame = frame.copy()
                         self.grabbed = True
-                else:
-                    self.stopped = True
-            except:
-                self.stopped = True
+                else: self.stopped = True
+            except: self.stopped = True
 
     def read(self):
         with self.lock:
@@ -138,7 +129,6 @@ class PrescriptionManager:
         if s_vec: return torch.tensor(np.array(s_vec)).to(device), s_lbl
         return None, None
 
-print("[DEBUG] Loading Resources...")
 vec_db, color_db = {}, {}
 try:
     with open(DB_FILES['pills']['vec'], 'rb') as f: vec_db.update(pickle.load(f))
@@ -170,22 +160,17 @@ if os.path.exists(IMG_DB_FOLDER):
         sift_db[folder] = des_list
 
 try:
-    # โหลดโมเดล
     model_pill = YOLO(MODEL_PILL_PATH, task='detect')
     model_pack = YOLO(MODEL_PACK_PATH, task='detect')
-    
     weights = models.ResNet50_Weights.DEFAULT
     embedder = torch.nn.Sequential(*list(models.resnet50(weights=weights).children())[:-1])
     embedder.eval().to(device)
-    
-    # Pre-define transforms to save init time
     preprocess = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
-except Exception as e:
-    print(f"[CRITICAL] Model Error: {e}"); sys.exit(1)
+except Exception as e: print(f"[CRITICAL] Model Error: {e}"); sys.exit(1)
 
 # ================= 3. TRINITY ENGINE =================
 def trinity_inference(img_crop, is_pill=True, custom_matrix=None, custom_labels=None):
@@ -194,8 +179,7 @@ def trinity_inference(img_crop, is_pill=True, custom_matrix=None, custom_labels=
     if target_matrix is None: return "DB Error", 0.0
 
     try:
-        if is_pill:
-            pil_img = Image.fromarray(img_crop) 
+        if is_pill: pil_img = Image.fromarray(img_crop) 
         else:
             gray_crop = cv2.cvtColor(img_crop, cv2.COLOR_RGB2GRAY)
             crop_3ch_gray = cv2.merge([gray_crop, gray_crop, gray_crop])
@@ -300,13 +284,10 @@ class AIProcessor:
                     frame_to_process = self.latest_frame
                     self.latest_frame = None 
             
-            # 🔥 Don't sleep too much, run as fast as possible!
             if frame_to_process is None: 
-                time.sleep(0.001) 
-                continue
+                time.sleep(0.001); continue
 
-            # 🔥 NO COLOR CONVERSION (RGB Direct)
-            # Memory Fix
+            # RGB Direct + Contiguous Memory
             frame_clean = np.ascontiguousarray(frame_to_process)
             
             detections = []
@@ -315,29 +296,27 @@ class AIProcessor:
                 name, score = trinity_inference(crop, is_pill=is_pill_mode,
                                                 custom_matrix=self.session_matrix,
                                                 custom_labels=self.session_labels)
-                # No Threshold Filtering here -> Show EVERYTHING
+                # ส่งชื่อออกไปเลย พร้อมเครื่องหมาย ? ถ้าคะแนนต่ำ
                 if score <= SCORE_PASS: name = f"{name}?"
                 return name, score
 
             try:
-                # 🚀 SPEED: imgsz=416, max_det=10, agnostic_nms=True
+                # 1. Pills 
                 pill_res = model_pill(frame_clean, verbose=False, conf=CONF_PILL, imgsz=AI_IMG_SIZE, max_det=10, agnostic_nms=True)
                 for box in pill_res[0].boxes.xyxy.cpu().numpy().astype(int):
                     x1,y1,x2,y2 = box
-                    # 🔥 OPTIMIZATION: Skip very small objects (Noise)
-                    if (x2-x1) < 20 or (y2-y1) < 20: continue
-                    
+                    if (x2-x1) < 20 or (y2-y1) < 20: continue # Skip noise
                     crop = frame_to_process[y1:y2, x1:x2]
                     if crop.size == 0: continue
 
                     nm, sc = process_crop(crop, True)
                     detections.append({'label':nm, 'score':sc, 'type':'pill'})
 
+                # 2. Packs
                 pack_res = model_pack(frame_clean, verbose=False, conf=CONF_PACK, imgsz=AI_IMG_SIZE, max_det=5, agnostic_nms=True)
                 for box in pack_res[0].boxes.xyxy.cpu().numpy().astype(int):
                     x1,y1,x2,y2 = box
-                    if (x2-x1) < 30 or (y2-y1) < 30: continue # Skip small packs
-                    
+                    if (x2-x1) < 30 or (y2-y1) < 30: continue
                     crop = frame_to_process[y1:y2, x1:x2]
                     if crop.size == 0: continue
 
@@ -351,144 +330,135 @@ class AIProcessor:
             
     def stop(self): self.stopped = True
 
-# ================= 5. UI DRAWING (DISPLAY ONLY) =================
+# ================= 5. UI DRAWING (FULLSCREEN) =================
 def draw_patient_info(frame, patient_data):
     if not patient_data: return
     H, W = frame.shape[:2]
-    box_w = 300; start_x = W - box_w
+    box_w = 350; start_x = W - box_w
     lines = [f"HN: {patient_data.get('hn', 'N/A')}",
              f"Name: {patient_data.get('name', 'N/A')}", "--- Rx List ---"]
     for d in patient_data.get('drugs', [])[:5]: lines.append(f"- {d}")
-    box_h = (len(lines) * 25) + 15
+    
+    # Scale fonts up for Fullscreen
+    font_scale = 0.8
+    line_h = 35
+    box_h = (len(lines) * line_h) + 20
+    
     cv2.rectangle(frame, (start_x, 0), (W, box_h), (50,50,50), -1)
     cv2.rectangle(frame, (start_x, 0), (W, box_h), (0,255,255), 2)
+    
     for i, line in enumerate(lines):
-        cv2.putText(frame, line, (start_x+10, 25+(i*25)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
+        y = 30 + (i * line_h)
+        cv2.putText(frame, line, (start_x+15, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255,255,255), 2)
 
 def draw_summary_box(frame, results):
     H, W = frame.shape[:2]
     
     if not results:
-        cv2.putText(frame, "Analyzing...", (W-250, H-30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200,200,200), 2)
+        # Show Big Scanning Text
+        text = "Analyzing..."
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 1.5
+        (tw, th), _ = cv2.getTextSize(text, font, scale, 3)
+        cv2.putText(frame, text, (W - tw - 30, H - 50), font, scale, (200,200,200), 3)
         return
 
     summary = {}
     for r in results:
-        name = r['label']
+        name = r['label'].replace("?", "")
         score = r['score']
-        
-        # Clean name
-        clean = name.replace("?", "")
-        if clean not in summary: summary[clean] = []
-        summary[clean].append(score)
+        if name not in summary: summary[name] = []
+        summary[name].append(score)
 
-    box_w = 450; line_h = 45; padding = 20
+    # Config Big Box for Fullscreen
+    box_w = 500
+    line_h = 50
+    padding = 20
     total_lines = len(summary) + 1
     total_h = (total_lines * line_h) + (padding * 2)
-    start_x = W - box_w - 10; start_y = H - total_h - 10
+    start_x = W - box_w - 20
+    start_y = H - total_h - 20
     
     overlay = frame.copy()
-    cv2.rectangle(overlay, (start_x, start_y), (W-10, H-10), (0,0,0), -1)
+    cv2.rectangle(overlay, (start_x, start_y), (W-20, H-20), (0,0,0), -1)
     cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
-    cv2.rectangle(frame, (start_x, start_y), (W-10, H-10), (255,255,255), 2)
+    cv2.rectangle(frame, (start_x, start_y), (W-20, H-20), (255,255,255), 2)
     
-    cv2.putText(frame, "DETECTED ITEMS", (start_x+20, start_y+35), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
-    cv2.line(frame, (start_x+20, start_y+45), (W-30, start_y+45), (200,200,200), 1)
+    # Header
+    cv2.putText(frame, "DETECTED ITEMS", (start_x+20, start_y+40), 
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,255), 3)
+    cv2.line(frame, (start_x+20, start_y+55), (W-40, start_y+55), (200,200,200), 2)
 
     for i, (name, scores) in enumerate(summary.items()):
         count = len(scores)
-        avg_conf = sum(scores) / count
+        avg = sum(scores)/count
         
-        color = (0, 255, 0) # Green
+        color = (0, 255, 0)
         display_name = name
-        
-        if avg_conf < SCORE_PASS:
-            color = (255, 255, 0) # Yellow for Low Conf
-            display_name = f"{name} (Low Conf)"
-        
-        if "Unknown" in name:
-            color = (100, 100, 255) # Light Red
-            display_name = "Unknown Object"
+        if avg < SCORE_PASS: 
+            color = (255, 255, 0); display_name = f"{name} (Low Conf)"
+        if "Unknown" in name: 
+            color = (100, 100, 255); display_name = "Unknown Object"
 
-        y = start_y + 85 + (i * line_h)
-        text = f"{display_name} : {count} pcs ({avg_conf:.0%})"
+        y = start_y + 100 + (i * line_h)
+        text = f"{display_name} : {count} ({avg:.0%})"
         
         cv2.putText(frame, text, (start_x+20, y), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
 
-# ================= 6. MAIN (15 FPS LIMIT) =================
+# ================= 6. MAIN (15 FPS + FULLSCREEN) =================
 def main():
-    # ================= USER CONFIG =================
-    TARGET_HN = "HN-101"  
-    # ===============================================
-
-    cam = CameraStream(src=0).start()
+    TARGET_HN = "HN-101" 
+    cam = WebcamStream().start()
     ai = AIProcessor().start()
-    
     his_db = HISLoader.load_database(HIS_FILE_PATH)
+    if TARGET_HN in his_db: d = his_db[TARGET_HN]; d['hn'] = TARGET_HN; ai.load_patient(d)
     
-    if TARGET_HN in his_db:
-        data = his_db[TARGET_HN]
-        data['hn'] = TARGET_HN 
-        ai.load_patient(data)
-    else:
-        print(f"⚠️ Target HN '{TARGET_HN}' not found in file.")
-
-    print("🎥 SYSTEM RUNNING... Press 'R' to Reload File")
+    print(" Waiting for camera feed...")
+    while cam.read() is None: time.sleep(0.1)
     
-    # 🔥🔥🔥 SETUP FULL SCREEN 🔥🔥🔥
-    window_name = "Smart Pharma HIS"
+    window_name = "PillTrack"
+    # 🔥 FULLSCREEN SETUP
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-    
-    fps_time = time.time(); frame_count = 0; fps = 0
-    
-    while True:
-        frame = cam.read()
-        if frame is None: break
-        
-        ai.set_frame(frame)
-        results, cur_patient = ai.get_results()
-        
-        display = frame.copy()
-        
-        for det in results:
-            x1,y1,x2,y2 = det['box']
-            cv2.rectangle(display, (x1,y1), (x2,y2), det['color'], 2)
+
+    print("🎥 RUNNING... (Optimized Fullscreen)")
+    fps = 0; prev_time = 0
+    TARGET_FPS = 15
+    FRAME_TIME = 1.0 / TARGET_FPS
+
+    try:
+        while True:
+            start_loop = time.time()
+            frame_rgb = cam.read()
+            if frame_rgb is None: time.sleep(0.01); continue
             
-            if det.get('type') == 'pill':
-                text_y = min(y1 + 20, y2 - 5)
-                cv2.putText(display, det['full'], (x1 + 5, text_y), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, det['color'], 2)
-            else:
-                cv2.putText(display, det['full'], (x1, y1-10), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, det['color'], 2)
+            ai.update_frame(frame_rgb)
+            display = frame_rgb.copy()
+            results, cur_patient = ai.get_results()
+            
+            draw_summary_box(display, results)
+            if cur_patient: draw_patient_info(display, cur_patient)
+            
+            curr_time = time.time()
+            if (curr_time - prev_time) > 0: fps = 1 / (curr_time - prev_time)
+            prev_time = curr_time
+            temp = get_cpu_temperature()
+            
+            cv2.putText(display, f"FPS: {fps:.1f} | Temp: {temp}", (20, 40), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 2)
+            cv2.imshow(window_name, display)
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'): break
+            if cv2.waitKey(1) & 0xFF == ord('r'):
+                his_db = HISLoader.load_database(HIS_FILE_PATH)
+                if TARGET_HN in his_db: d = his_db[TARGET_HN]; d['hn'] = TARGET_HN; ai.load_patient(d)
 
-        if cur_patient:
-            draw_patient_info(display, cur_patient)
+            elapsed = time.time() - start_loop
+            if elapsed < FRAME_TIME: time.sleep(FRAME_TIME - elapsed)
 
-        cv2.putText(display, f"FPS: {fps:.1f}", (10, 30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+    except KeyboardInterrupt: print("\n Stopping...")
+    finally: cam.stop(); ai.stop(); cv2.destroyAllWindows(); print(" Bye Bye!")
 
-        frame_count += 1
-        if time.time() - fps_time > 1.0:
-            fps = frame_count; frame_count = 0; fps_time = time.time()
-
-        # 🔥 ใช้ชื่อ window_name ที่ตั้งไว้ข้างบน
-        cv2.imshow(window_name, display)
-        
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'): break
-        elif key == ord('r'): 
-            his_db = HISLoader.load_database(HIS_FILE_PATH)
-            if TARGET_HN in his_db:
-                data = his_db[TARGET_HN]
-                data['hn'] = TARGET_HN
-                ai.load_patient(data)
-
-    cam.stop(); ai.stop(); cv2.destroyAllWindows()
-    
 if __name__ == "__main__":
     main()
