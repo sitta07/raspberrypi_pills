@@ -37,9 +37,9 @@ DISPLAY_W, DISPLAY_H = 1280, 720
 AI_IMG_SIZE = 416 
 
 # Thresholds
-CONF_PILL = 0.45    
-CONF_PACK = 0.6     # ลดลงนิดหน่อยเพื่อให้ Detect เจอกล่องง่ายขึ้น แล้วไปคัดที่ Logic แทน
-SCORE_PASS_PILL = 0.18
+CONF_PILL = 0.4    
+CONF_PACK = 0.7     # ลดลงนิดหน่อยเพื่อให้ Detect เจอกล่องง่ายขึ้น แล้วไปคัดที่ Logic แทน
+SCORE_PASS_PILL = 0.2
 SCORE_PASS_PACK = 0.7
 
 device = torch.device("cpu")
@@ -351,7 +351,7 @@ def trinity_inference(img_crop, is_pill=True,
                 dist = np.linalg.norm(norm_diff)
                 color_score = np.clip(np.exp(-3.0 * dist), 0, 1)
                 
-            w_vec, w_sift, w_col = (0.3, 0.1, 0.6) if is_pill else (0.8, 0.2, 0.0)
+            w_vec, w_sift, w_col = (0.4, 0.1, 0.5) if is_pill else (0.8, 0.2, 0.0)
             total = vec_score * w_vec + sift_score * w_sift + color_score * w_col
             
             if total > best_score: 
