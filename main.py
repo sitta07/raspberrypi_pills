@@ -38,9 +38,9 @@ AI_IMG_SIZE = 416
 
 # Thresholds
 CONF_PILL = 0.5    
-CONF_PACK = 0.75    
+CONF_PACK = 0.5     # ลดลงนิดหน่อยเพื่อให้ Detect เจอกล่องง่ายขึ้น แล้วไปคัดที่ Logic แทน
 SCORE_PASS_PILL = 0.2
-SCORE_PASS_PACK = 0.75  # Pack threshold: 75%
+SCORE_PASS_PACK = 0.75
 
 device = torch.device("cpu")
 print(f"🚀 SYSTEM STARTING ON: {device} (Ultra-Optimized Mode)")
@@ -59,9 +59,9 @@ def is_point_in_box(point, box):
     x1, y1, x2, y2 = box
     return x1 < px < x2 and y1 < py < y2
 
-# ================= 1. WEBCAM STREAM (OPTIMIZED) =================
+# ================= 1. WEBCAM STREAM =================
 class WebcamStream:
-    __slots__ = ('stopped', 'frame', 'grabbed', 'picam2', 'lock')  # Memory optimization
+    __slots__ = ('stopped', 'frame', 'grabbed', 'picam2', 'lock')
     
     def __init__(self):
         self.stopped = False
@@ -113,7 +113,7 @@ class WebcamStream:
             self.picam2.stop()
             self.picam2.close()
 
-# ================= 2. RESOURCES (OPTIMIZED LOADING) =================
+# ================= 2. RESOURCES & STATE =================
 class HISLoader:
     @staticmethod
     def load_database(filename):
@@ -142,10 +142,7 @@ class PrescriptionManager:
         if not drug_names_list or not source_vecs: 
             return None, None
         
-        # Optimized: Pre-convert to set for O(1) lookup
         drug_set = set(drug_names_list)
-        
-        # List comprehension is faster than append loop
         indices = [i for i, label in enumerate(source_lbls) 
                    if any(drug in label.lower() for drug in drug_set)]
         
@@ -155,12 +152,11 @@ class PrescriptionManager:
             return torch.tensor(np.array(filtered_vecs), device=device), filtered_lbls
         return None, None
 
-# ================= PRESCRIPTION CHECKBOX STATE =================
 class PrescriptionState:
     """Manages verified/remaining drugs with checkbox state"""
     def __init__(self):
-        self.all_drugs = []  # Original full list
-        self.verified_drugs = set()  # Checked drugs
+        self.all_drugs = []  
+        self.verified_drugs = set()
         self.lock = threading.Lock()
     
     def load_drugs(self, drug_list):
@@ -178,6 +174,13 @@ class PrescriptionState:
                 self.verified_drugs.remove(drug_name)
             else:
                 self.verified_drugs.add(drug_name)
+
+    def verify_drug(self, drug_name):
+        """Force mark a drug as verified (Automatic)"""
+        with self.lock:
+            if drug_name not in self.verified_drugs:
+                print(f"✨ AUTO-VERIFIED: {drug_name}")
+                self.verified_drugs.add(drug_name)
     
     def is_verified(self, drug_name):
         with self.lock:
@@ -187,18 +190,15 @@ class PrescriptionState:
         with self.lock:
             return self.all_drugs.copy()
 
-# Global prescription state
 prescription_state = PrescriptionState()
 
-# --- LOAD DATABASES (OPTIMIZED) ---
+# --- LOAD DATABASES ---
 def load_pkl_to_list(filepath):
-    """Optimized: Direct unpacking with list comprehension"""
     if not os.path.exists(filepath): 
         return [], []
     try:
         with open(filepath, 'rb') as f:
             data = pickle.load(f)
-            # Flatten all vectors at once
             items = [(v, name) for name, vec_list in data.items() for v in vec_list]
             if items:
                 vecs, lbls = zip(*items)
@@ -208,21 +208,17 @@ def load_pkl_to_list(filepath):
         print(f"Error loading {filepath}: {e}")
         return [], []
 
-# Load all databases
 pills_vecs, pills_lbls = load_pkl_to_list(DB_FILES['pills']['vec'])
 packs_vecs, packs_lbls = load_pkl_to_list(DB_FILES['packs']['vec'])
 
-# Convert to tensors once
 matrix_pills = torch.tensor(np.array(pills_vecs), device=device, dtype=torch.float32) if pills_vecs else None
 matrix_packs = torch.tensor(np.array(packs_vecs), device=device, dtype=torch.float32) if packs_vecs else None
 
-# Precompute norms for faster cosine similarity
 if matrix_pills is not None:
     matrix_pills = matrix_pills / matrix_pills.norm(dim=1, keepdim=True)
 if matrix_packs is not None:
     matrix_packs = matrix_packs / matrix_packs.norm(dim=1, keepdim=True)
 
-# Load color database
 color_db = {}
 for db_type in ['pills', 'packs']:
     try:
@@ -231,64 +227,48 @@ for db_type in ['pills', 'packs']:
     except: 
         pass
 
-# SIFT database (Optimized: Parallel loading would be ideal, but keep simple for now)
-sift = cv2.SIFT_create(nfeatures=100)  # Limit features for speed
-bf = cv2.BFMatcher(crossCheck=False)  # Faster matching
+sift = cv2.SIFT_create(nfeatures=100)
+bf = cv2.BFMatcher(crossCheck=False)
 sift_db = {}
 
 if os.path.exists(IMG_DB_FOLDER):
     for folder in os.listdir(IMG_DB_FOLDER):
         path = os.path.join(IMG_DB_FOLDER, folder)
-        if not os.path.isdir(path): 
-            continue
-        
+        if not os.path.isdir(path): continue
         des_list = []
         image_files = [x for x in os.listdir(path) if x.lower().endswith(('jpg', 'png', 'jpeg'))][:3]
-        
         for img_file in image_files:
             img = cv2.imread(os.path.join(path, img_file), cv2.IMREAD_GRAYSCALE)
             if img is not None:
-                # Resize large images for faster SIFT
                 if max(img.shape) > 512:
                     scale = 512 / max(img.shape)
                     img = cv2.resize(img, None, fx=scale, fy=scale)
                 _, des = sift.detectAndCompute(img, None)
                 if des is not None: 
                     des_list.append(des)
-        
         if des_list:
             sift_db[folder] = des_list
 
-# Load models
 try:
     model_pill = YOLO(MODEL_PILL_PATH, task='detect')
     model_pack = YOLO(MODEL_PACK_PATH, task='detect')
-    
-    # Optimized: Load model once
     weights = models.ResNet50_Weights.DEFAULT
     base_model = models.resnet50(weights=weights)
     embedder = torch.nn.Sequential(*list(base_model.children())[:-1])
     embedder.eval().to(device)
-    
-    # Free base model memory
     del base_model
     
-    # Single preprocess pipeline
     preprocess = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
-    
-    # Disable gradient computation globally
     torch.set_grad_enabled(False)
-    
 except Exception as e: 
     print(f"[CRITICAL] Model Error: {e}")
     sys.exit(1)
 
-# ================= 3. TRINITY ENGINE (ULTRA-OPTIMIZED) =================
-# Pre-compute color normalization constants
+# ================= 3. TRINITY ENGINE =================
 COLOR_NORM = np.array([90.0, 255.0, 255.0])
 SIFT_RATIO = 0.75
 SIFT_MAX_MATCHES = 15.0
@@ -297,7 +277,6 @@ def trinity_inference(img_crop, is_pill=True,
                       session_pills=None, session_pills_lbl=None,
                       session_packs=None, session_packs_lbl=None):
     
-    # Select target database
     target_matrix = (session_pills if session_pills is not None else matrix_pills) if is_pill else \
                     (session_packs if session_packs is not None else matrix_packs)
     target_labels = (session_pills_lbl if session_pills_lbl is not None else pills_lbls) if is_pill else \
@@ -307,7 +286,6 @@ def trinity_inference(img_crop, is_pill=True,
         return "DB Error", 0.0
 
     try:
-        # Prepare image (optimized path selection)
         if is_pill: 
             pil_img = Image.fromarray(img_crop) 
         else:
@@ -315,20 +293,16 @@ def trinity_inference(img_crop, is_pill=True,
             crop_3ch_gray = cv2.merge([gray_crop, gray_crop, gray_crop])
             pil_img = Image.fromarray(crop_3ch_gray)
 
-        # Feature extraction
         input_tensor = preprocess(pil_img).unsqueeze(0).to(device)
         live_vec = embedder(input_tensor).flatten()
-        live_vec = live_vec / live_vec.norm()  # Normalize
+        live_vec = live_vec / live_vec.norm()
         
-        # Optimized: Direct matrix multiplication (target_matrix already normalized)
         scores = torch.matmul(live_vec, target_matrix.T).squeeze(0)
         k_val = min(10, len(target_labels))
         if k_val == 0: 
             return "Unknown", 0.0
         
         top_k_val, top_k_idx = torch.topk(scores, k=k_val)
-        
-        # Get top 3 unique candidates (optimized with set)
         candidates = []
         seen = set()
         
@@ -340,7 +314,6 @@ def trinity_inference(img_crop, is_pill=True,
                 if len(candidates) >= 3: 
                     break
 
-        # Parallel feature extraction (color + SIFT)
         live_color = None
         gray = cv2.cvtColor(img_crop, cv2.COLOR_RGB2GRAY)
         _, des_live = sift.detectAndCompute(gray, None)
@@ -352,14 +325,12 @@ def trinity_inference(img_crop, is_pill=True,
                 hsv = cv2.cvtColor(center, cv2.COLOR_RGB2HSV)
                 live_color = np.mean(hsv, axis=(0,1))
 
-        # Score fusion (optimized calculation)
         best_score = -1
         final_name = "Unknown"
         
         for name, vec_score in candidates:
             clean_name = name.replace("_pill", "").replace("_pack", "")
             
-            # SIFT matching score (optimized)
             sift_score = 0.0
             if des_live is not None and clean_name in sift_db:
                 max_good = 0
@@ -372,16 +343,14 @@ def trinity_inference(img_crop, is_pill=True,
                         pass
                 sift_score = min(max_good / SIFT_MAX_MATCHES, 1.0)
                 
-            # Color matching score (vectorized)
             color_score = 0.0
             if is_pill and live_color is not None and name in color_db:
                 diff = np.abs(live_color - color_db[name])
-                diff[0] = min(diff[0], 180 - diff[0])  # Hue circular distance
+                diff[0] = min(diff[0], 180 - diff[0]) 
                 norm_diff = diff / COLOR_NORM
                 dist = np.linalg.norm(norm_diff)
                 color_score = np.clip(np.exp(-3.0 * dist), 0, 1)
                 
-            # Weighted fusion
             w_vec, w_sift, w_col = (0.3, 0.1, 0.6) if is_pill else (0.8, 0.2, 0.0)
             total = vec_score * w_vec + sift_score * w_sift + color_score * w_col
             
@@ -390,12 +359,11 @@ def trinity_inference(img_crop, is_pill=True,
                 final_name = clean_name
 
         return final_name, best_score
-        
     except Exception as e:
         print(f"[Trinity Error] {e}")
         return "Error", 0.0
 
-# ================= 4. AI WORKER (ULTRA-OPTIMIZED) =================
+# ================= 4. AI WORKER (AUTO-CHECK LOGIC) =================
 class AIProcessor:
     __slots__ = ('latest_frame', 'results', 'stopped', 'lock', 'is_rx_mode', 
                  'current_patient_info', 'sess_mat_pills', 'sess_lbl_pills',
@@ -413,8 +381,6 @@ class AIProcessor:
         self.sess_lbl_pills = None
         self.sess_mat_packs = None
         self.sess_lbl_packs = None
-        
-        # Pre-compute scale factors
         self.scale_x = DISPLAY_W / AI_IMG_SIZE
         self.scale_y = DISPLAY_H / AI_IMG_SIZE
         self.resize_interpolation = cv2.INTER_LINEAR
@@ -433,11 +399,7 @@ class AIProcessor:
                 self.is_rx_mode = True
                 self.current_patient_info = patient_data
                 drugs = patient_data['drugs']
-                
-                # Load into prescription state
                 prescription_state.load_drugs(drugs)
-                
-                # Initially filter with ALL drugs
                 self.sess_mat_pills, self.sess_lbl_pills = PrescriptionManager.filter_db(
                     drugs, pills_vecs, pills_lbls)
                 self.sess_mat_packs, self.sess_lbl_packs = PrescriptionManager.filter_db(
@@ -445,7 +407,6 @@ class AIProcessor:
                 print(f"🏥 Loaded: {patient_data['name']}")
     
     def update_remaining_drugs(self):
-        """Update session database to only include remaining (unchecked) drugs"""
         with self.lock:
             if self.current_patient_info:
                 remaining = prescription_state.get_remaining_drugs()
@@ -455,7 +416,6 @@ class AIProcessor:
                     self.sess_mat_packs, self.sess_lbl_packs = PrescriptionManager.filter_db(
                         remaining, packs_vecs, packs_lbls)
                 else:
-                    # All verified - use full database
                     self.sess_mat_pills = matrix_pills
                     self.sess_lbl_pills = pills_lbls
                     self.sess_mat_packs = matrix_packs
@@ -477,7 +437,6 @@ class AIProcessor:
         print("[DEBUG] AI Worker Loop Started.")
         
         while not self.stopped:
-            # Get frame (minimized lock time)
             with self.lock:
                 frame_HD = self.latest_frame
                 self.latest_frame = None
@@ -486,146 +445,123 @@ class AIProcessor:
                 time.sleep(0.005)
                 continue
 
-            # Resize once with optimized interpolation
             frame_yolo = cv2.resize(frame_HD, (AI_IMG_SIZE, AI_IMG_SIZE), 
                                    interpolation=self.resize_interpolation)
             
             final_detections = []
-            valid_pills = [] 
+            detected_pills_raw = [] 
+            valid_pills = [] # Pills that are good enough to verify packs
 
             try:
-                # 1. DETECT PILLS
+                # --- 1. DETECT PILLS ---
                 pill_res = model_pill(frame_yolo, verbose=False, conf=CONF_PILL, 
                                      imgsz=AI_IMG_SIZE, max_det=10, agnostic_nms=True)
                 
-                detected_pills = []  # Store all pill detections first
-                
+                # Assumption Logic Helper
+                best_pill_score = -1
+                best_pill_name = None
+
                 for box in pill_res[0].boxes.xyxy.detach().cpu().numpy().astype(int):
                     x1_s, y1_s, x2_s, y2_s = box
-                    
-                    # Vectorized scaling
                     x1, y1 = int(x1_s * self.scale_x), int(y1_s * self.scale_y)
                     x2, y2 = int(x2_s * self.scale_x), int(y2_s * self.scale_y)
                     
-                    # Filter small boxes
-                    if (x2-x1) < 30 or (y2-y1) < 30: 
-                        continue
-                    
-                    # Extract crop
+                    if (x2-x1) < 30 or (y2-y1) < 30: continue
                     crop = frame_HD[y1:y2, x1:x2]
-                    if crop.size == 0: 
-                        continue
+                    if crop.size == 0: continue
 
-                    # Inference
                     nm, sc = trinity_inference(crop, is_pill=True,
                                               session_pills=self.sess_mat_pills,
                                               session_pills_lbl=self.sess_lbl_pills,
                                               session_packs=self.sess_mat_packs,
                                               session_packs_lbl=self.sess_lbl_packs)
                     
-                    cx, cy = (x1+x2)>>1, (y1+y2)>>1  # Bit shift is faster than //2
-                    detected_pills.append({
-                        'name': nm,
-                        'score': sc,
-                        'center': (cx, cy),
-                        'box': (x1, y1, x2, y2)
+                    cx, cy = (x1+x2)>>1, (y1+y2)>>1
+                    
+                    # Store for assumption
+                    if "?" not in nm and "Unknown" not in nm and sc > best_pill_score:
+                        best_pill_score = sc
+                        best_pill_name = nm
+                        
+                    detected_pills_raw.append({
+                        'name': nm, 'score': sc, 'center': (cx, cy), 'box': (x1, y1, x2, y2)
                     })
-                
-                # 🔥 SMART ASSUMPTION: Find highest confidence pill
-                best_pill = None
-                best_score = -1
-                
-                for pill in detected_pills:
-                    nm = pill['name']
-                    if "?" not in nm and "Unknown" not in nm and pill['score'] > best_score:
-                        best_score = pill['score']
-                        best_pill = pill
-                
-                # Assumed pill name for override
-                assumed_pill_name = best_pill['name'] if best_pill else None
-                
-                # Create final pill detections with assumption
-                for pill in detected_pills:
+
+                # Process Pills & Auto-Tick
+                for pill in detected_pills_raw:
                     nm, sc = pill['name'], pill['score']
                     
-                    # Apply assumption
-                    if assumed_pill_name and ("?" in nm or "Unknown" in nm or sc < SCORE_PASS_PILL):
-                        nm, sc = assumed_pill_name, best_score
+                    # Apply Assumption
+                    if best_pill_name and ("?" in nm or "Unknown" in nm or sc < SCORE_PASS_PILL):
+                        nm, sc = best_pill_name, best_pill_score
                     
-                    # Track valid pills with verified status
+                    # --- LOGIC #1: Auto-Tick Pill ---
+                    if "?" not in nm and "Unknown" not in nm and sc >= SCORE_PASS_PILL:
+                        prescription_state.verify_drug(nm.lower())
+                        self.update_remaining_drugs()
+
+                    # Check verification status
                     is_verified = prescription_state.is_verified(nm.lower())
                     
                     if "?" not in nm and "Unknown" not in nm:
+                        # Add to valid list for Pack checking
                         valid_pills.append({
-                            'name': nm, 
-                            'center': pill['center'],
-                            'verified': is_verified
+                            'name': nm, 'center': pill['center'], 'verified': is_verified, 'score': sc
                         })
-                    
-                    final_detections.append({
-                        'label': nm, 
-                        'score': sc, 
-                        'type': 'pill',
-                        'verified': is_verified,
-                        'box': pill['box']
-                    })
-                    
-                    # Debug: Print verification status
-                    if is_verified:
-                        print(f"[VERIFIED PILL] {nm} at {pill['box']}")
 
-                # 2. DETECT PACKS
+                    final_detections.append({
+                        'label': nm, 'score': sc, 'type': 'pill',
+                        'verified': is_verified, 'box': pill['box']
+                    })
+
+                # --- 2. DETECT PACKS ---
                 pack_res = model_pack(frame_yolo, verbose=False, conf=CONF_PACK, 
                                      imgsz=AI_IMG_SIZE, max_det=5, agnostic_nms=True)
                 
                 for box in pack_res[0].boxes.xyxy.detach().cpu().numpy().astype(int):
                     x1_s, y1_s, x2_s, y2_s = box
-                    
-                    # Vectorized scaling
                     x1, y1 = int(x1_s * self.scale_x), int(y1_s * self.scale_y)
                     x2, y2 = int(x2_s * self.scale_x), int(y2_s * self.scale_y)
                     
-                    # Filter small boxes
-                    if (x2-x1) < 50 or (y2-y1) < 50: 
-                        continue
-                    
-                    # Extract crop
+                    if (x2-x1) < 50 or (y2-y1) < 50: continue
                     crop = frame_HD[y1:y2, x1:x2]
-                    if crop.size == 0: 
-                        continue
+                    if crop.size == 0: continue
                     
-                    # ALWAYS run trinity inference
                     nm, sc = trinity_inference(crop, is_pill=False,
                                               session_pills=self.sess_mat_pills,
                                               session_pills_lbl=self.sess_lbl_pills,
                                               session_packs=self.sess_mat_packs,
                                               session_packs_lbl=self.sess_lbl_packs)
                     
-                    # Check for inner pill (optimized search)
-                    found_inner = False
-                    pack_verified = False
+                    # --- LOGIC #2: Auto-Tick Pack (Native) ---
+                    clean_name = nm.replace("_pack", "").lower()
+                    if "?" not in nm and "Unknown" not in nm and sc >= SCORE_PASS_PACK:
+                        prescription_state.verify_drug(clean_name)
+                        self.update_remaining_drugs()
+                    
+                    # --- LOGIC #3: Check for Inner Pill (Inheritance) ---
+                    pack_verified = prescription_state.is_verified(clean_name)
                     
                     for pill in valid_pills:
                         if is_point_in_box(pill['center'], (x1, y1, x2, y2)):
-                            found_inner = True
-                            pack_verified = pill['verified']  # Pack inherits pill verification
-                            if assumed_pill_name:
-                                nm, sc = assumed_pill_name, best_score
-                            break
+                            # Found a pill inside this pack
+                            if pill['score'] >= SCORE_PASS_PILL or pill['verified']:
+                                # TRUST THE PILL -> Force Verify Pack
+                                pack_verified = True
+                                nm = pill['name'] # Override Name
+                                sc = max(sc, pill['score']) # Boost Score
+                                
+                                # Auto-tick based on inner pill
+                                prescription_state.verify_drug(nm.lower())
+                                self.update_remaining_drugs()
+                                break
                     
                     final_detections.append({
-                        'label': nm, 
-                        'score': sc,
-                        'type': 'pack',
-                        'verified': pack_verified,  # Pack is verified if inner pill is verified
+                        'label': nm, 'score': sc, 'type': 'pack',
+                        'verified': pack_verified,
                         'box': (x1, y1, x2, y2)
                     })
-                    
-                    # Debug: Print pack verification status
-                    if pack_verified:
-                        print(f"[VERIFIED PACK] {nm} wrapping verified pill")
 
-                # Update results (single lock)
                 with self.lock: 
                     self.results = final_detections
             
@@ -635,111 +571,79 @@ class AIProcessor:
     def stop(self): 
         self.stopped = True
 
-# ================= 5. UI DRAWING (OPTIMIZED WITH CHECKBOX) =================
-# Pre-allocate drawing parameters
+# ================= 5. UI DRAWING =================
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 FONT_SCALE = 0.8
 FONT_SCALE_SMALL = 0.6
 THICKNESS = 2
 THICKNESS_BOX = 3
-
-# Checkbox parameters
 CHECKBOX_SIZE = 25
-CHECKBOX_PADDING = 5
 
 def draw_patient_info(frame, patient_data):
-    """Optimized: Interactive prescription list with checkboxes"""
-    if not patient_data: 
-        return []
+    if not patient_data: return []
     
     H, W = frame.shape[:2]
     box_w = 450
     start_x = W - box_w
     
-    # Header lines
     header_lines = [
         f"HN: {patient_data.get('hn', 'N/A')}",
         f"Name: {patient_data.get('name', 'N/A')}", 
         "--- Prescription List ---"
     ]
     
-    # Get all drugs with verification status
     all_drugs = prescription_state.get_all_drugs()
+    line_h = 45
+    box_h = (len(header_lines) + len(all_drugs)) * line_h + 20
     
-    line_h = 45  # Increased for better click area
-    header_h = len(header_lines) * line_h
-    total_lines = len(header_lines) + len(all_drugs)
-    box_h = total_lines * line_h + 20
-    
-    # Draw background
     cv2.rectangle(frame, (start_x, 0), (W, box_h), (50, 50, 50), -1)
     cv2.rectangle(frame, (start_x, 0), (W, box_h), (0, 255, 255), 2)
     
-    # Draw header
     for i, line in enumerate(header_lines):
         y = 35 + i * line_h
         cv2.putText(frame, line, (start_x+15, y), FONT, FONT_SCALE, (255, 255, 255), THICKNESS)
     
-    # Draw drug list with checkboxes
     clickable_areas = []
-    
     for i, drug in enumerate(all_drugs):
         y_base = 35 + (len(header_lines) + i) * line_h
         checkbox_x = start_x + 15
-        checkbox_y = y_base - 20  # Adjust checkbox position
+        checkbox_y = y_base - 20
         
         is_checked = prescription_state.is_verified(drug.lower())
         
-        # DEBUG: Show checked status
-        if i == 0:  # Only for first drug to avoid spam
-            print(f"[DRAW] Drug '{drug}' checked={is_checked}, verified_set={prescription_state.verified_drugs}")
-        
-        # Checkbox border (white outline) - THICKER for visibility
         cv2.rectangle(frame, (checkbox_x, checkbox_y), 
                      (checkbox_x + CHECKBOX_SIZE, checkbox_y + CHECKBOX_SIZE), 
                      (255, 255, 255), 3)
         
-        # Checkbox fill (green if checked, dark gray if not)
         if is_checked:
-            # Fill green background
             cv2.rectangle(frame, (checkbox_x + 3, checkbox_y + 3), 
                          (checkbox_x + CHECKBOX_SIZE - 3, checkbox_y + CHECKBOX_SIZE - 3), 
-                         (0, 255, 0), -1)  # BRIGHT GREEN
-            
-            # Draw checkmark (✓) - LARGER and THICKER
+                         (0, 255, 0), -1)
             cv2.line(frame, (checkbox_x + 6, checkbox_y + 14), 
                     (checkbox_x + 11, checkbox_y + 20), (255, 255, 255), 4)
             cv2.line(frame, (checkbox_x + 11, checkbox_y + 20), 
                     (checkbox_x + 20, checkbox_y + 8), (255, 255, 255), 4)
         else:
-            # Empty checkbox (dark fill)
             cv2.rectangle(frame, (checkbox_x + 3, checkbox_y + 3), 
                          (checkbox_x + CHECKBOX_SIZE - 3, checkbox_y + CHECKBOX_SIZE - 3), 
                          (60, 60, 60), -1)
         
-        # Drug name (strikethrough if checked)
         text_x = checkbox_x + CHECKBOX_SIZE + 10
         text_y = y_base
         drug_text = drug
-        text_color = (100, 100, 100) if is_checked else (255, 255, 255)  # Darker gray when checked
+        text_color = (100, 100, 100) if is_checked else (255, 255, 255)
         cv2.putText(frame, drug_text, (text_x, text_y), FONT, 0.75, text_color, THICKNESS)
         
-        # Strikethrough if checked - THICKER LINE
         if is_checked:
             text_size = cv2.getTextSize(drug_text, FONT, 0.75, THICKNESS)[0]
-            cv2.line(frame, (text_x, text_y - 10), (text_x + text_size[0], text_y - 10), (255, 0, 0), 3)  # RED LINE
+            cv2.line(frame, (text_x, text_y - 10), (text_x + text_size[0], text_y - 10), (255, 0, 0), 3)
         
-        # Store clickable area (larger area for easier clicking)
         click_box = (checkbox_x - 5, checkbox_y - 5, checkbox_x + 300, checkbox_y + CHECKBOX_SIZE + 10)
-        clickable_areas.append({
-            'drug': drug,
-            'box': click_box
-        })
+        clickable_areas.append({'drug': drug, 'box': click_box})
     
     return clickable_areas
 
 def draw_boxes_on_items(frame, results):
-    """Optimized: Color based on verification status"""
     for r in results:
         x1, y1, x2, y2 = r['box']
         label = r['label']
@@ -747,158 +651,96 @@ def draw_boxes_on_items(frame, results):
         obj_type = r.get('type', 'pill')
         is_verified = r.get('verified', False)
         
-        # Color logic with verification
         if is_verified:
-            # Verified items are ALWAYS GREEN with ✓ (both pills and packs)
-            color = (0, 255, 0)
-            label_display = f"✓ {label}"
+            color = (0, 255, 0) # Green for verified
+            label_display = f"OK {label}"
         elif obj_type == 'pack':
-            # Unverified pack: Green if score >= 75%, Yellow if < 75%
             if score >= SCORE_PASS_PACK:
                 color = (0, 255, 0)
             else:
-                color = (0, 255, 255)
+                color = (0, 255, 255) # Yellow for unsure pack
             label_display = label
         elif "?" in label or score < SCORE_PASS_PILL:
-            color = (0, 0, 255)
-            label_display = label
-        elif "Unknown" in label:
-            color = (255, 0, 0)
+            color = (0, 0, 255) # Red for bad pill
             label_display = label
         else:
             color = (0, 255, 0)
             label_display = label
 
-        # Draw box and label
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, THICKNESS_BOX)
         cv2.putText(frame, f"{label_display} {score:.0%}", (x1, y1-10), 
                    FONT, FONT_SCALE_SMALL, color, THICKNESS)
 
-# ================= 6. MAIN (ULTRA-OPTIMIZED WITH INTERACTION) =================
-# Mouse callback for checkbox interaction
-mouse_click_debug = {"last_click": None}
-
+# ================= 6. MAIN =================
 def mouse_callback(event, x, y, flags, param):
     if event == cv2.EVENT_LBUTTONDOWN:
-        print(f"[MOUSE] Click at ({x}, {y})")
         clickable_areas, ai_processor = param
-        
-        if not clickable_areas:
-            print("[MOUSE] No clickable areas!")
-            return
-            
         for area in clickable_areas:
             x1, y1, x2, y2 = area['box']
-            print(f"[MOUSE] Checking area: {area['drug']} at ({x1},{y1},{x2},{y2})")
-            
             if x1 <= x <= x2 and y1 <= y <= y2:
-                # Toggle drug verification
                 drug = area['drug']
-                print(f"[MOUSE] HIT! Toggling: {drug}")
-                
                 prescription_state.toggle_drug(drug.lower())
-                is_now_verified = prescription_state.is_verified(drug.lower())
-                
-                # Update AI processor to use remaining drugs only
                 ai_processor.update_remaining_drugs()
-                
-                # Print status
-                status = '✓ VERIFIED' if is_now_verified else '☐ UNVERIFIED'
-                print(f"[STATUS] {status}: {drug}")
-                print(f"[STATE] Verified drugs: {prescription_state.verified_drugs}")
-                
-                mouse_click_debug["last_click"] = drug
                 return
-        
-        print("[MOUSE] No area matched!")
 
 def main():
     TARGET_HN = "HN-101" 
     
-    # Initialize components
     cam = WebcamStream().start()
     ai = AIProcessor().start()
     
-    # Load patient database
     his_db = HISLoader.load_database(HIS_FILE_PATH)
     if TARGET_HN in his_db: 
         d = his_db[TARGET_HN]
         d['hn'] = TARGET_HN
         ai.load_patient(d)
     
-    # Wait for camera
     print("⏳ Waiting for camera feed...")
-    while cam.read() is None: 
-        time.sleep(0.1)
+    while cam.read() is None: time.sleep(0.1)
     
-    # Setup window
     window_name = "PillTrack"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, DISPLAY_W, DISPLAY_H) 
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    print(f"🎥 RUNNING... (Interactive Mode)")
-    print("📋 Click checkboxes to mark drugs as verified")
+    print(f"🎥 RUNNING... (Auto-Check & Mouse Mode)")
     
-    # FPS tracking
     fps = 0
     prev_time = time.perf_counter()
     TARGET_FPS = 10 
     FRAME_TIME = 1.0 / TARGET_FPS
     
-    # Pre-allocate FPS text position
-    fps_pos = (30, 50)
-    fps_color = (0, 255, 0)
-    
-    # Store clickable areas for mouse callback
     clickable_areas = []
 
     try:
         while True:
             start_loop = time.perf_counter()
-            
-            # Get frame
             frame_rgb = cam.read()
             if frame_rgb is None: 
                 time.sleep(0.01)
                 continue
             
-            # Send to AI (non-blocking)
             ai.update_frame(frame_rgb)
-            
-            # Get results
             results, cur_patient = ai.get_results()
             
-            # Draw on original frame
             draw_boxes_on_items(frame_rgb, results)
             
-            # Draw patient info and get clickable areas
             if cur_patient: 
                 clickable_areas = draw_patient_info(frame_rgb, cur_patient)
-                # Setup mouse callback with current clickable areas (UPDATE EVERY FRAME)
                 cv2.setMouseCallback(window_name, mouse_callback, (clickable_areas, ai))
-            else:
-                clickable_areas = []
             
-            # Calculate FPS
             curr_time = time.perf_counter()
             fps = 1 / (curr_time - prev_time) if (curr_time - prev_time) > 0 else 0
             prev_time = curr_time
             
-            # Get temperature
             temp = get_cpu_temperature()
+            cv2.putText(frame_rgb, f"FPS: {fps:.1f} | {temp}", (30, 50), 
+                       FONT, 1.2, (0, 255, 0), THICKNESS_BOX)
             
-            # Draw FPS
-            cv2.putText(frame_rgb, f"FPS: {fps:.1f} | {temp}", fps_pos, 
-                       FONT, 1.2, fps_color, THICKNESS_BOX)
-            
-            # Show frame
             cv2.imshow(window_name, frame_rgb)
             
-            # Handle keys
             key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'): 
-                break
+            if key == ord('q'): break
             if key == ord('r'):
                 his_db = HISLoader.load_database(HIS_FILE_PATH)
                 if TARGET_HN in his_db: 
@@ -906,7 +748,6 @@ def main():
                     d['hn'] = TARGET_HN
                     ai.load_patient(d)
 
-            # Frame rate limiting
             elapsed = time.perf_counter() - start_loop
             if elapsed < FRAME_TIME: 
                 time.sleep(FRAME_TIME - elapsed)
