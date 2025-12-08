@@ -42,7 +42,7 @@ SCORE_PASS_PILL = 0.2
 SCORE_PASS_PACK = 0.6
 
 # --- SENIOR UPGRADES ---
-CONSISTENCY_THRESHOLD = 2   # ลดลงเหลือ 3 เพื่อให้ตัดเร็วขึ้น (Responsiveness)
+CONSISTENCY_THRESHOLD = 1   # ลดลงเหลือ 3 เพื่อให้ตัดเร็วขึ้น (Responsiveness)
 MAX_OBJ_AREA_RATIO = 0.40   
 
 device = torch.device("cpu")
