@@ -420,65 +420,75 @@ def draw_summary_box(frame, results):
 
 # ================= 6. MAIN (15 FPS LIMIT) =================
 def main():
-    TARGET_HN = "HN-101" 
-    cam = WebcamStream().start()
+    # ================= USER CONFIG =================
+    TARGET_HN = "HN-101"  
+    # ===============================================
+
+    cam = CameraStream(src=0).start()
     ai = AIProcessor().start()
+    
     his_db = HISLoader.load_database(HIS_FILE_PATH)
-    if TARGET_HN in his_db: d = his_db[TARGET_HN]; d['hn'] = TARGET_HN; ai.load_patient(d)
     
-    print(" Waiting for camera feed...")
-    while cam.read() is None: time.sleep(0.1)
+    if TARGET_HN in his_db:
+        data = his_db[TARGET_HN]
+        data['hn'] = TARGET_HN 
+        ai.load_patient(data)
+    else:
+        print(f"⚠️ Target HN '{TARGET_HN}' not found in file.")
+
+    print("🎥 SYSTEM RUNNING... Press 'R' to Reload File")
     
-    window_name = "PillTrack"
+    # 🔥🔥🔥 SETUP FULL SCREEN 🔥🔥🔥
+    window_name = "Smart Pharma HIS"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    
+    fps_time = time.time(); frame_count = 0; fps = 0
+    
+    while True:
+        frame = cam.read()
+        if frame is None: break
+        
+        ai.set_frame(frame)
+        results, cur_patient = ai.get_results()
+        
+        display = frame.copy()
+        
+        for det in results:
+            x1,y1,x2,y2 = det['box']
+            cv2.rectangle(display, (x1,y1), (x2,y2), det['color'], 2)
+            
+            if det.get('type') == 'pill':
+                text_y = min(y1 + 20, y2 - 5)
+                cv2.putText(display, det['full'], (x1 + 5, text_y), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, det['color'], 2)
+            else:
+                cv2.putText(display, det['full'], (x1, y1-10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, det['color'], 2)
 
-    print("🎥 RUNNING... (15 FPS Optimized)")
-    fps = 0; prev_time = 0
+        if cur_patient:
+            draw_patient_info(display, cur_patient)
 
-    # 🔥 Lock Display at 15 FPS (Save CPU for AI!)
-    TARGET_FPS = 15 
-    FRAME_TIME = 1.0 / TARGET_FPS
+        cv2.putText(display, f"FPS: {fps:.1f}", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
 
-    try:
-        while True:
-            start_loop = time.time()
-            
-            frame_rgb = cam.read()
-            if frame_rgb is None: time.sleep(0.01); continue
-            
-            # Send to AI
-            ai.update_frame(frame_rgb)
-            
-            # Draw
-            display = frame_rgb.copy()
-            results, cur_patient = ai.get_results()
-            
-            draw_summary_box(display, results)
-            if cur_patient: draw_patient_info(display, cur_patient)
-            
-            # Stats
-            curr_time = time.time()
-            if (curr_time - prev_time) > 0: fps = 1 / (curr_time - prev_time)
-            prev_time = curr_time
-            temp = get_cpu_temperature()
-            
-            cv2.putText(display, f"Display FPS: {fps:.1f} | Temp: {temp}", (10, 30), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
-            cv2.imshow(window_name, display)
-            
-            if cv2.waitKey(1) & 0xFF == ord('q'): break
-            if cv2.waitKey(1) & 0xFF == ord('r'):
-                his_db = HISLoader.load_database(HIS_FILE_PATH)
-                if TARGET_HN in his_db: d = his_db[TARGET_HN]; d['hn'] = TARGET_HN; ai.load_patient(d)
+        frame_count += 1
+        if time.time() - fps_time > 1.0:
+            fps = frame_count; frame_count = 0; fps_time = time.time()
 
-            # Cap Frame Rate strict
-            elapsed = time.time() - start_loop
-            if elapsed < FRAME_TIME:
-                time.sleep(FRAME_TIME - elapsed)
+        # 🔥 ใช้ชื่อ window_name ที่ตั้งไว้ข้างบน
+        cv2.imshow(window_name, display)
+        
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'): break
+        elif key == ord('r'): 
+            his_db = HISLoader.load_database(HIS_FILE_PATH)
+            if TARGET_HN in his_db:
+                data = his_db[TARGET_HN]
+                data['hn'] = TARGET_HN
+                ai.load_patient(data)
 
-    except KeyboardInterrupt: print("\n Stopping...")
-    finally: cam.stop(); ai.stop(); cv2.destroyAllWindows(); print(" Bye Bye!")
-
+    cam.stop(); ai.stop(); cv2.destroyAllWindows()
+    
 if __name__ == "__main__":
     main()
