@@ -569,6 +569,10 @@ class AIProcessor:
                         'verified': is_verified,
                         'box': pill['box']
                     })
+                    
+                    # Debug: Print verification status
+                    if is_verified:
+                        print(f"[VERIFIED PILL] {nm} at {pill['box']}")
 
                 # 2. DETECT PACKS
                 pack_res = model_pack(frame_yolo, verbose=False, conf=CONF_PACK, 
@@ -616,6 +620,10 @@ class AIProcessor:
                         'verified': pack_verified,  # Pack is verified if inner pill is verified
                         'box': (x1, y1, x2, y2)
                     })
+                    
+                    # Debug: Print pack verification status
+                    if pack_verified:
+                        print(f"[VERIFIED PACK] {nm} wrapping verified pill")
 
                 # Update results (single lock)
                 with self.lock: 
@@ -658,7 +666,7 @@ def draw_patient_info(frame, patient_data):
     # Get all drugs with verification status
     all_drugs = prescription_state.get_all_drugs()
     
-    line_h = 40
+    line_h = 45  # Increased for better click area
     header_h = len(header_lines) * line_h
     total_lines = len(header_lines) + len(all_drugs)
     box_h = total_lines * line_h + 20
@@ -676,42 +684,51 @@ def draw_patient_info(frame, patient_data):
     clickable_areas = []
     
     for i, drug in enumerate(all_drugs):
-        y = 35 + (len(header_lines) + i) * line_h
+        y_base = 35 + (len(header_lines) + i) * line_h
         checkbox_x = start_x + 15
-        checkbox_y = y - CHECKBOX_SIZE + 5
+        checkbox_y = y_base - 20  # Adjust checkbox position
         
-        # Checkbox background
         is_checked = prescription_state.is_verified(drug.lower())
-        checkbox_color = (0, 200, 0) if is_checked else (100, 100, 100)
-        cv2.rectangle(frame, (checkbox_x, checkbox_y), 
-                     (checkbox_x + CHECKBOX_SIZE, checkbox_y + CHECKBOX_SIZE), 
-                     checkbox_color, -1)
+        
+        # Checkbox border (white outline)
         cv2.rectangle(frame, (checkbox_x, checkbox_y), 
                      (checkbox_x + CHECKBOX_SIZE, checkbox_y + CHECKBOX_SIZE), 
                      (255, 255, 255), 2)
         
-        # Checkmark if verified
+        # Checkbox fill (green if checked, dark gray if not)
         if is_checked:
-            cv2.line(frame, (checkbox_x + 5, checkbox_y + 12), 
-                    (checkbox_x + 10, checkbox_y + 20), (255, 255, 255), 3)
-            cv2.line(frame, (checkbox_x + 10, checkbox_y + 20), 
-                    (checkbox_x + 20, checkbox_y + 5), (255, 255, 255), 3)
+            # Fill green background
+            cv2.rectangle(frame, (checkbox_x + 2, checkbox_y + 2), 
+                         (checkbox_x + CHECKBOX_SIZE - 2, checkbox_y + CHECKBOX_SIZE - 2), 
+                         (0, 200, 0), -1)
+            
+            # Draw checkmark (✓)
+            cv2.line(frame, (checkbox_x + 6, checkbox_y + 13), 
+                    (checkbox_x + 10, checkbox_y + 18), (255, 255, 255), 3)
+            cv2.line(frame, (checkbox_x + 10, checkbox_y + 18), 
+                    (checkbox_x + 19, checkbox_y + 7), (255, 255, 255), 3)
+        else:
+            # Empty checkbox (dark fill)
+            cv2.rectangle(frame, (checkbox_x + 2, checkbox_y + 2), 
+                         (checkbox_x + CHECKBOX_SIZE - 2, checkbox_y + CHECKBOX_SIZE - 2), 
+                         (80, 80, 80), -1)
         
         # Drug name (strikethrough if checked)
         text_x = checkbox_x + CHECKBOX_SIZE + 10
+        text_y = y_base
         drug_text = drug
         text_color = (150, 150, 150) if is_checked else (255, 255, 255)
-        cv2.putText(frame, drug_text, (text_x, y), FONT, 0.7, text_color, THICKNESS)
+        cv2.putText(frame, drug_text, (text_x, text_y), FONT, 0.75, text_color, THICKNESS)
         
         # Strikethrough if checked
         if is_checked:
-            text_size = cv2.getTextSize(drug_text, FONT, 0.7, THICKNESS)[0]
-            cv2.line(frame, (text_x, y - 8), (text_x + text_size[0], y - 8), (150, 150, 150), 2)
+            text_size = cv2.getTextSize(drug_text, FONT, 0.75, THICKNESS)[0]
+            cv2.line(frame, (text_x, text_y - 10), (text_x + text_size[0], text_y - 10), (150, 150, 150), 2)
         
-        # Store clickable area
+        # Store clickable area (larger area for easier clicking)
         clickable_areas.append({
             'drug': drug,
-            'box': (checkbox_x, checkbox_y, checkbox_x + CHECKBOX_SIZE + 200, checkbox_y + CHECKBOX_SIZE)
+            'box': (checkbox_x - 5, checkbox_y - 5, checkbox_x + 250, checkbox_y + CHECKBOX_SIZE + 5)
         })
     
     return clickable_areas
@@ -727,21 +744,29 @@ def draw_boxes_on_items(frame, results):
         
         # Color logic with verification
         if is_verified:
-            # Verified items are always GREEN with ✓
+            # Verified items are ALWAYS GREEN with ✓ (both pills and packs)
             color = (0, 255, 0)
-            label = f"✓ {label}"
+            label_display = f"✓ {label}"
         elif obj_type == 'pack':
-            color = (0, 255, 0) if score >= SCORE_PASS_PACK else (0, 255, 255)
+            # Unverified pack: Green if score >= 75%, Yellow if < 75%
+            if score >= SCORE_PASS_PACK:
+                color = (0, 255, 0)
+            else:
+                color = (0, 255, 255)
+            label_display = label
         elif "?" in label or score < SCORE_PASS_PILL:
             color = (0, 0, 255)
+            label_display = label
         elif "Unknown" in label:
             color = (255, 0, 0)
+            label_display = label
         else:
             color = (0, 255, 0)
+            label_display = label
 
-        # Draw
+        # Draw box and label
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, THICKNESS_BOX)
-        cv2.putText(frame, f"{label} {score:.0%}", (x1, y1-10), 
+        cv2.putText(frame, f"{label_display} {score:.0%}", (x1, y1-10), 
                    FONT, FONT_SCALE_SMALL, color, THICKNESS)
 
 # ================= 6. MAIN (ULTRA-OPTIMIZED WITH INTERACTION) =================
@@ -755,9 +780,14 @@ def mouse_callback(event, x, y, flags, param):
                 # Toggle drug verification
                 drug = area['drug']
                 prescription_state.toggle_drug(drug.lower())
+                is_now_verified = prescription_state.is_verified(drug.lower())
+                
                 # Update AI processor to use remaining drugs only
                 ai_processor.update_remaining_drugs()
-                print(f"{'✓' if prescription_state.is_verified(drug.lower()) else '☐'} {drug}")
+                
+                # Print status
+                status = '✓ VERIFIED' if is_now_verified else '☐ UNVERIFIED'
+                print(f"{status}: {drug}")
                 break
 
 def main():
