@@ -43,12 +43,12 @@ AI_IMG_SIZE = 416
 CONF_PILL = 0.5    
 CONF_PACK = 0.75    
 
-# Accuracy Thresholds (แยกกัน)
-SCORE_PASS_PILL = 0.2  # ยาเม็ด: 10% เอาหมด
-SCORE_PASS_PACK = 0.85  # กล่อง: ต้อง 85% (แต่ถ้ามีเม็ดอยู่ข้างใน จะถูก override)
+# Accuracy Thresholds
+SCORE_PASS_PILL = 0.2
+SCORE_PASS_PACK = 0.85 
 
 device = torch.device("cpu")
-print(f"🚀 SYSTEM STARTING ON: {device} (10 FPS + Smart Box Logic)")
+print(f"🚀 SYSTEM STARTING ON: {device} (Split-DB Mode)")
 
 # ================= UTILS =================
 def get_cpu_temperature():
@@ -58,12 +58,11 @@ def get_cpu_temperature():
     except: return "N/A"
 
 def is_point_in_box(point, box):
-    """เช็คว่าจุดกึ่งกลาง (px, py) อยู่ในกล่อง (x1, y1, x2, y2) หรือไม่"""
     px, py = point
     x1, y1, x2, y2 = box
     return x1 < px < x2 and y1 < py < y2
 
-# ================= 1. WEBCAM STREAM (LOCKED @ 10 FPS) =================
+# ================= 1. WEBCAM STREAM =================
 class WebcamStream:
     def __init__(self):
         self.stopped = False
@@ -76,7 +75,6 @@ class WebcamStream:
         print("[DEBUG] Initializing Picamera2 (10 FPS Mode)...")
         try:
             self.picam2 = Picamera2()
-            # 🔥 Config 10 FPS (1,000,000 / 10 = 100,000 us)
             config = self.picam2.create_preview_configuration(
                 main={"size": (DISPLAY_W, DISPLAY_H), "format": "RGB888"},
                 controls={"FrameDurationLimits": (100000, 100000)} 
@@ -112,7 +110,7 @@ class WebcamStream:
         self.stopped = True
         if self.picam2: self.picam2.stop(); self.picam2.close()
 
-# ================= 2. RESOURCES =================
+# ================= 2. RESOURCES (UPDATED: SPLIT DB) =================
 class HISLoader:
     @staticmethod
     def load_database(filename):
@@ -132,33 +130,56 @@ class HISLoader:
         except: return {}
 
 class PrescriptionManager:
-    def __init__(self, global_vecs, global_lbls):
-        self.g_vec = global_vecs; self.g_lbl = global_lbls
-    def create_session_db(self, drug_names_list):
-        if not drug_names_list: return None, None
+    """Helper class to filter databases based on drug names"""
+    @staticmethod
+    def filter_db(drug_names_list, source_vecs, source_lbls):
+        if not drug_names_list or not source_vecs: return None, None
         s_vec, s_lbl = [], []
-        for idx, label in enumerate(self.g_lbl):
+        for idx, label in enumerate(source_lbls):
             for target in drug_names_list:
+                # Check containment (case insensitive)
                 if target in label.lower():
-                    s_vec.append(self.g_vec[idx]); s_lbl.append(label)
-        if s_vec: return torch.tensor(np.array(s_vec)).to(device), s_lbl
+                    s_vec.append(source_vecs[idx])
+                    s_lbl.append(label)
+                    break # Found match, next label
+        
+        if s_vec: 
+            return torch.tensor(np.array(s_vec)).to(device), s_lbl
         return None, None
 
-vec_db, color_db = {}, {}
+# --- LOAD DATABASES SEPARATELY ---
+pills_vecs, pills_lbls = [], []
+packs_vecs, packs_lbls = [], []
+color_db = {}
+
+def load_pkl_to_list(filepath, vec_list, lbl_list):
+    if not os.path.exists(filepath): return
+    try:
+        with open(filepath, 'rb') as f:
+            data = pickle.load(f)
+            for name, vecs in data.items():
+                for v in vecs:
+                    vec_list.append(v)
+                    lbl_list.append(name)
+    except Exception as e: print(f"Error loading {filepath}: {e}")
+
+# Load Vectors
+load_pkl_to_list(DB_FILES['pills']['vec'], pills_vecs, pills_lbls)
+load_pkl_to_list(DB_FILES['packs']['vec'], packs_vecs, packs_lbls)
+
+# Create Torch Matrices
+matrix_pills = torch.tensor(np.array(pills_vecs)).to(device) if pills_vecs else None
+matrix_packs = torch.tensor(np.array(packs_vecs)).to(device) if packs_vecs else None
+
+print(f"📊 Loaded DB: {len(pills_lbls)} Pills | {len(packs_lbls)} Packs")
+
+# Load Colors (Combined dict is fine, keys are unique enough)
 try:
-    with open(DB_FILES['pills']['vec'], 'rb') as f: vec_db.update(pickle.load(f))
     with open(DB_FILES['pills']['col'], 'rb') as f: color_db.update(pickle.load(f))
-    with open(DB_FILES['packs']['vec'], 'rb') as f: vec_db.update(pickle.load(f))
     with open(DB_FILES['packs']['col'], 'rb') as f: color_db.update(pickle.load(f))
 except: pass
 
-global_vectors, global_labels = [], []
-for name, vec_list in vec_db.items():
-    for vec in vec_list:
-        global_vectors.append(vec); global_labels.append(name)
-global_matrix = torch.tensor(np.array(global_vectors)).to(device) if global_vectors else None
-rx_manager = PrescriptionManager(global_vectors, global_labels)
-
+# SIFT (Load Images)
 sift = cv2.SIFT_create()
 bf = cv2.BFMatcher()
 sift_db = {}
@@ -174,6 +195,7 @@ if os.path.exists(IMG_DB_FOLDER):
                 if des is not None: des_list.append(des)
         sift_db[folder] = des_list
 
+# Models
 try:
     model_pill = YOLO(MODEL_PILL_PATH, task='detect')
     model_pack = YOLO(MODEL_PACK_PATH, task='detect')
@@ -187,10 +209,19 @@ try:
     ])
 except Exception as e: print(f"[CRITICAL] Model Error: {e}"); sys.exit(1)
 
-# ================= 3. TRINITY ENGINE =================
-def trinity_inference(img_crop, is_pill=True, custom_matrix=None, custom_labels=None):
-    target_matrix = custom_matrix if custom_matrix is not None else global_matrix
-    target_labels = custom_labels if custom_labels is not None else global_labels
+# ================= 3. TRINITY ENGINE (UPDATED) =================
+def trinity_inference(img_crop, is_pill=True, 
+                      session_pills=None, session_pills_lbl=None,
+                      session_packs=None, session_packs_lbl=None):
+    
+    # 🎯 SELECT THE RIGHT DATABASE
+    if is_pill:
+        target_matrix = session_pills if session_pills is not None else matrix_pills
+        target_labels = session_pills_lbl if session_pills_lbl is not None else pills_lbls
+    else:
+        target_matrix = session_packs if session_packs is not None else matrix_packs
+        target_labels = session_packs_lbl if session_packs_lbl is not None else packs_lbls
+
     if target_matrix is None: return "DB Error", 0.0
 
     try:
@@ -211,14 +242,15 @@ def trinity_inference(img_crop, is_pill=True, custom_matrix=None, custom_labels=
         
         top_k_val, top_k_idx = torch.topk(scores, k=k_val)
         candidates, seen = [], set()
-        target_suffix = "_pill" if is_pill else "_pack"
         
+        # 🟢 No need to check suffixes anymore, the DB is already clean!
         for idx, sc in zip(top_k_idx.cpu().numpy(), top_k_val.cpu().numpy()):
             name = target_labels[idx]
-            if name.endswith(target_suffix) and name not in seen:
+            if name not in seen:
                 candidates.append((name, float(sc))); seen.add(name)
                 if len(candidates) >= 3: break
 
+        # --- SIFT & COLOR (Logic Remains Same) ---
         live_color = None; des_live = None
         if is_pill: 
             h, w = img_crop.shape[:2]
@@ -267,18 +299,26 @@ class AIProcessor:
         self.lock = threading.Lock()
         self.is_rx_mode = False
         self.current_patient_info = None
-        self.session_matrix = None; self.session_labels = None
+        
+        # Session Matrices (Separate)
+        self.sess_mat_pills = None; self.sess_lbl_pills = None
+        self.sess_mat_packs = None; self.sess_lbl_packs = None
 
     def load_patient(self, patient_data):
         with self.lock:
             if not patient_data:
                 self.is_rx_mode = False; self.current_patient_info = None
-                self.session_matrix = None; self.session_labels = None
+                self.sess_mat_pills = None; self.sess_lbl_pills = None
+                self.sess_mat_packs = None; self.sess_lbl_packs = None
             else:
                 self.is_rx_mode = True; self.current_patient_info = patient_data
                 drugs = patient_data['drugs']
-                self.session_matrix, self.session_labels = rx_manager.create_session_db(drugs)
-                print(f"🏥 Loaded: {patient_data['name']}")
+                
+                # Filter BOTH Databases
+                self.sess_mat_pills, self.sess_lbl_pills = PrescriptionManager.filter_db(drugs, pills_vecs, pills_lbls)
+                self.sess_mat_packs, self.sess_lbl_packs = PrescriptionManager.filter_db(drugs, packs_vecs, packs_lbls)
+                
+                print(f"🏥 Loaded: {patient_data['name']} (Filtered DB)")
 
     def start(self): 
         threading.Thread(target=self.run, daemon=True).start()
@@ -306,30 +346,29 @@ class AIProcessor:
             frame_yolo = cv2.resize(frame_HD, (AI_IMG_SIZE, AI_IMG_SIZE))
             frame_yolo_clean = np.ascontiguousarray(frame_yolo)
             
-            # Scale Factors
             scale_x = DISPLAY_W / AI_IMG_SIZE
             scale_y = DISPLAY_H / AI_IMG_SIZE
 
             final_detections = []
-            
-            # Temporary storage for smart logic
             valid_pills = [] 
 
             def process_crop(crop, is_pill_mode):
+                # Pass all session matrices (trinity will pick the right one)
                 name, score = trinity_inference(crop, is_pill=is_pill_mode,
-                                                custom_matrix=self.session_matrix,
-                                                custom_labels=self.session_labels)
+                                                session_pills=self.sess_mat_pills,
+                                                session_pills_lbl=self.sess_lbl_pills,
+                                                session_packs=self.sess_mat_packs,
+                                                session_packs_lbl=self.sess_lbl_packs)
+                
                 threshold = SCORE_PASS_PILL if is_pill_mode else SCORE_PASS_PACK
-                # ถ้าเป็น Pills คะแนนต่ำก็ส่งชื่อไปเลย แต่ถ้า Pack เดี๋ยวไปเช็คข้างในอีกที
                 if score <= threshold: name = f"{name}?"
                 return name, score
 
             try:
-                # 1. DETECT PILLS FIRST
+                # 1. DETECT PILLS
                 pill_res = model_pill(frame_yolo_clean, verbose=False, conf=CONF_PILL, imgsz=AI_IMG_SIZE, max_det=10, agnostic_nms=True)
                 for box in pill_res[0].boxes.xyxy.cpu().numpy().astype(int):
                     x1_s, y1_s, x2_s, y2_s = box
-                    # Scale to HD
                     x1 = int(x1_s * scale_x); y1 = int(y1_s * scale_y)
                     x2 = int(x2_s * scale_x); y2 = int(y2_s * scale_y)
                     
@@ -337,17 +376,15 @@ class AIProcessor:
                     crop = frame_HD[y1:y2, x1:x2]
                     if crop.size == 0: continue
 
-                    nm, sc = process_crop(crop, True)
+                    nm, sc = process_crop(crop, True) # Mode: Pill
                     
-                    # Store Valid Pills for Box Checking
-                    # ถ้าชื่อไม่ Unknown และไม่ ? ให้ถือว่าเป็น Verified Pill
                     if "?" not in nm and "Unknown" not in nm:
                         cx, cy = (x1+x2)//2, (y1+y2)//2
                         valid_pills.append({'name': nm, 'center': (cx, cy)})
 
                     final_detections.append({'label':nm, 'score':sc, 'type':'pill', 'box':(x1,y1,x2,y2)})
 
-                # 2. DETECT PACKS & CHECK INSIDE
+                # 2. DETECT PACKS
                 pack_res = model_pack(frame_yolo_clean, verbose=False, conf=CONF_PACK, imgsz=AI_IMG_SIZE, max_det=5, agnostic_nms=True)
                 for box in pack_res[0].boxes.xyxy.cpu().numpy().astype(int):
                     x1_s, y1_s, x2_s, y2_s = box
@@ -356,23 +393,21 @@ class AIProcessor:
                     
                     if (x2-x1) < 50 or (y2-y1) < 50: continue
                     
-                    # 🔥 SMART LOGIC: Check if any valid pill is inside this pack
+                    # 🔥 Check Inner Pills
                     found_inner_pill_name = None
                     for pill in valid_pills:
                         if is_point_in_box(pill['center'], (x1, y1, x2, y2)):
                             found_inner_pill_name = pill['name']
-                            break # Found one! assume the pack is this drug
+                            break 
                     
                     if found_inner_pill_name:
-                        # ✅ Override Pack Name with Pill Name!
                         nm = f"Box: {found_inner_pill_name}"
-                        sc = 1.0 # Force High Score
+                        sc = 1.0 
                         final_detections.append({'label':nm, 'score':sc, 'type':'pack', 'box':(x1,y1,x2,y2)})
                     else:
-                        # ❌ No pill inside, use Trinity
                         crop = frame_HD[y1:y2, x1:x2]
                         if crop.size == 0: continue
-                        nm, sc = process_crop(crop, False)
+                        nm, sc = process_crop(crop, False) # Mode: Pack
                         final_detections.append({'label':nm, 'score':sc, 'type':'pack', 'box':(x1,y1,x2,y2)})
 
                 with self.lock: self.results = final_detections
@@ -382,7 +417,7 @@ class AIProcessor:
             
     def stop(self): self.stopped = True
 
-# ================= 5. UI DRAWING =================
+# ================= 5. UI DRAWING (SAME) =================
 def draw_patient_info(frame, patient_data):
     if not patient_data: return
     H, W = frame.shape[:2]
@@ -404,16 +439,15 @@ def draw_boxes_on_items(frame, results):
         label = r['label']
         score = r['score']
         
-        # Color Logic
-        color = (0, 255, 0) # Green
-        if "?" in label or score < SCORE_PASS_PILL: color = (0, 0, 255) # Red
-        if "Unknown" in label: color = (255, 0, 0) # Blue
-        if "Box:" in label: color = (0, 255, 255) # Yellow for Verified Box
+        color = (0, 255, 0)
+        if "?" in label or score < SCORE_PASS_PILL: color = (0, 0, 255)
+        if "Unknown" in label: color = (255, 0, 0)
+        if "Box:" in label: color = (0, 255, 255)
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
         cv2.putText(frame, f"{label} {score:.0%}", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-# ================= 6. MAIN (10 FPS) =================
+# ================= 6. MAIN =================
 def main():
     TARGET_HN = "HN-101" 
     cam = WebcamStream().start()
@@ -429,7 +463,7 @@ def main():
     cv2.resizeWindow(window_name, DISPLAY_W, DISPLAY_H) 
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    print(f"🎥 RUNNING... (10 FPS Optimized)")
+    print(f"🎥 RUNNING... (Split-DB Optimized)")
     fps = 0; prev_time = 0
     TARGET_FPS = 10 
     FRAME_TIME = 1.0 / TARGET_FPS
@@ -455,8 +489,9 @@ def main():
             cv2.putText(display, f"FPS: {fps:.1f} | {temp}", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,255,0), 3)
             cv2.imshow(window_name, display)
             
-            if cv2.waitKey(1) & 0xFF == ord('q'): break
-            if cv2.waitKey(1) & 0xFF == ord('r'):
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'): break
+            if key == ord('r'):
                 his_db = HISLoader.load_database(HIS_FILE_PATH)
                 if TARGET_HN in his_db: d = his_db[TARGET_HN]; d['hn'] = TARGET_HN; ai.load_patient(d)
 
