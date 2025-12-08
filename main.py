@@ -18,13 +18,12 @@ os.environ["OMP_NUM_THREADS"] = "3"
 try:
     from picamera2 import Picamera2
 except ImportError:
-    print("⚠️ Warning: Picamera2 not found.")
-    sys.exit(1)
+    print("⚠️ Warning: Picamera2 not found. (If not on Pi, ignore this)")
 
 # ================= CONFIGURATION =================
+# Paths
 MODEL_PILL_PATH = 'models/pills.pt'          
 MODEL_PACK_PATH = 'models/best_process_2.pt'
-
 DB_FILES = {
     'pills': {'vec': 'database/db_pills.pkl', 'col': 'database/colors_pills.pkl'},
     'packs': {'vec': 'database/db_packs.pkl', 'col': 'database/colors_packs.pkl'}
@@ -34,16 +33,20 @@ HIS_FILE_PATH = 'prescription.txt'
 
 # Display & AI Resolution
 DISPLAY_W, DISPLAY_H = 1280, 720
-AI_IMG_SIZE = 832 
+AI_IMG_SIZE = 416 
 
 # Thresholds
 CONF_PILL = 0.45    
-CONF_PACK = 0.7     # ลดลงนิดหน่อยเพื่อให้ Detect เจอกล่องง่ายขึ้น แล้วไปคัดที่ Logic แทน
-SCORE_PASS_PILL = 0.25
-SCORE_PASS_PACK = 0.45
+CONF_PACK = 0.6     
+SCORE_PASS_PILL = 0.18
+SCORE_PASS_PACK = 0.7
+
+# --- SENIOR UPGRADES ---
+CONSISTENCY_THRESHOLD = 4   # ต้องเจอติดกัน 4 เฟรม ถึงจะนับ (0.4 วิ)
+MAX_OBJ_AREA_RATIO = 0.40   # วัตถุใหญ่เกิน 40% ของจอ = ขยะ/ป้ายชื่อ (ตัดทิ้ง)
 
 device = torch.device("cpu")
-print(f"🚀 SYSTEM STARTING ON: {device} (Ultra-Optimized Mode)")
+print(f"🚀 SYSTEM STARTING ON: {device} (Senior Mode Activated)")
 
 # ================= UTILS =================
 def get_cpu_temperature():
@@ -54,7 +57,6 @@ def get_cpu_temperature():
         return "N/A"
 
 def is_point_in_box(point, box):
-    """Optimized: inline unpacking"""
     px, py = point
     x1, y1, x2, y2 = box
     return x1 < px < x2 and y1 < py < y2
@@ -71,7 +73,7 @@ class WebcamStream:
         self.lock = threading.Lock()
 
     def start(self):
-        print("[DEBUG] Initializing Picamera2 (10 FPS Mode)...")
+        print("[DEBUG] Initializing Camera...")
         try:
             self.picam2 = Picamera2()
             config = self.picam2.create_preview_configuration(
@@ -83,8 +85,10 @@ class WebcamStream:
             time.sleep(2.0)
             print("[DEBUG] Camera Started")
         except Exception as e:
-            print(f"[ERROR] Camera Init Failed: {e}")
-            self.stopped = True
+            print(f"[ERROR] Picamera2 Failed, using OpenCV: {e}")
+            self.cam = cv2.VideoCapture(0) # Fallback
+            self.cam.set(cv2.CAP_PROP_FRAME_WIDTH, DISPLAY_W)
+            self.cam.set(cv2.CAP_PROP_FRAME_HEIGHT, DISPLAY_H)
             
         threading.Thread(target=self.update, daemon=True).start()
         return self
@@ -92,13 +96,19 @@ class WebcamStream:
     def update(self):
         while not self.stopped:
             try:
-                frame = self.picam2.capture_array()
-                if frame is not None:
-                    with self.lock:
-                        self.frame = frame
-                        self.grabbed = True
-                else: 
-                    self.stopped = True
+                if self.picam2:
+                    frame = self.picam2.capture_array()
+                    if frame is not None:
+                        with self.lock:
+                            self.frame = frame
+                            self.grabbed = True
+                    else: self.stopped = True
+                else:
+                    ret, frame = self.cam.read()
+                    if ret:
+                        with self.lock:
+                            self.frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            self.grabbed = True
             except: 
                 self.stopped = True
                 break
@@ -117,43 +127,22 @@ class WebcamStream:
 class HISLoader:
     @staticmethod
     def load_database(filename):
-        if not os.path.exists(filename): 
-            return {}
+        if not os.path.exists(filename): return {}
         db = {}
         try:
             with open(filename, 'r', encoding='utf-8') as f:
                 for line in f:
                     line = line.strip()
-                    if not line or line.startswith("#"): 
-                        continue
+                    if not line or line.startswith("#"): continue
                     parts = line.split('|')
-                    if len(parts) < 3: 
-                        continue
+                    if len(parts) < 3: continue
                     hn, name = parts[0].strip(), parts[1].strip()
                     drugs = [d.strip().lower() for d in parts[2].split(',') if d.strip()]
                     db[hn] = {'name': name, 'drugs': drugs}
             return db
-        except: 
-            return {}
-
-class PrescriptionManager:
-    @staticmethod
-    def filter_db(drug_names_list, source_vecs, source_lbls):
-        if not drug_names_list or not source_vecs: 
-            return None, None
-        
-        drug_set = set(drug_names_list)
-        indices = [i for i, label in enumerate(source_lbls) 
-                   if any(drug in label.lower() for drug in drug_set)]
-        
-        if indices:
-            filtered_vecs = [source_vecs[i] for i in indices]
-            filtered_lbls = [source_lbls[i] for i in indices]
-            return torch.tensor(np.array(filtered_vecs), device=device), filtered_lbls
-        return None, None
+        except: return {}
 
 class PrescriptionState:
-    """Manages verified/remaining drugs with checkbox state"""
     def __init__(self):
         self.all_drugs = []  
         self.verified_drugs = set()
@@ -176,7 +165,6 @@ class PrescriptionState:
                 self.verified_drugs.add(drug_name)
 
     def verify_drug(self, drug_name):
-        """Force mark a drug as verified (Automatic)"""
         with self.lock:
             if drug_name not in self.verified_drugs:
                 print(f"✨ AUTO-VERIFIED: {drug_name}")
@@ -194,8 +182,7 @@ prescription_state = PrescriptionState()
 
 # --- LOAD DATABASES ---
 def load_pkl_to_list(filepath):
-    if not os.path.exists(filepath): 
-        return [], []
+    if not os.path.exists(filepath): return [], []
     try:
         with open(filepath, 'rb') as f:
             data = pickle.load(f)
@@ -204,28 +191,24 @@ def load_pkl_to_list(filepath):
                 vecs, lbls = zip(*items)
                 return list(vecs), list(lbls)
             return [], []
-    except Exception as e: 
-        print(f"Error loading {filepath}: {e}")
-        return [], []
+    except: return [], []
 
+# Load Global DB (2000 Items)
 pills_vecs, pills_lbls = load_pkl_to_list(DB_FILES['pills']['vec'])
 packs_vecs, packs_lbls = load_pkl_to_list(DB_FILES['packs']['vec'])
 
 matrix_pills = torch.tensor(np.array(pills_vecs), device=device, dtype=torch.float32) if pills_vecs else None
 matrix_packs = torch.tensor(np.array(packs_vecs), device=device, dtype=torch.float32) if packs_vecs else None
 
-if matrix_pills is not None:
-    matrix_pills = matrix_pills / matrix_pills.norm(dim=1, keepdim=True)
-if matrix_packs is not None:
-    matrix_packs = matrix_packs / matrix_packs.norm(dim=1, keepdim=True)
+if matrix_pills is not None: matrix_pills = matrix_pills / matrix_pills.norm(dim=1, keepdim=True)
+if matrix_packs is not None: matrix_packs = matrix_packs / matrix_packs.norm(dim=1, keepdim=True)
 
 color_db = {}
 for db_type in ['pills', 'packs']:
     try:
         with open(DB_FILES[db_type]['col'], 'rb') as f: 
             color_db.update(pickle.load(f))
-    except: 
-        pass
+    except: pass
 
 sift = cv2.SIFT_create(nfeatures=100)
 bf = cv2.BFMatcher(crossCheck=False)
@@ -244,8 +227,7 @@ if os.path.exists(IMG_DB_FOLDER):
                     scale = 512 / max(img.shape)
                     img = cv2.resize(img, None, fx=scale, fy=scale)
                 _, des = sift.detectAndCompute(img, None)
-                if des is not None: 
-                    des_list.append(des)
+                if des is not None: des_list.append(des)
         if des_list:
             sift_db[folder] = des_list
 
@@ -282,8 +264,7 @@ def trinity_inference(img_crop, is_pill=True,
     target_labels = (session_pills_lbl if session_pills_lbl is not None else pills_lbls) if is_pill else \
                     (session_packs_lbl if session_packs_lbl is not None else packs_lbls)
 
-    if target_matrix is None: 
-        return "DB Error", 0.0
+    if target_matrix is None: return "DB Error", 0.0
 
     try:
         if is_pill: 
@@ -299,8 +280,7 @@ def trinity_inference(img_crop, is_pill=True,
         
         scores = torch.matmul(live_vec, target_matrix.T).squeeze(0)
         k_val = min(10, len(target_labels))
-        if k_val == 0: 
-            return "Unknown", 0.0
+        if k_val == 0: return "Unknown", 0.0
         
         top_k_val, top_k_idx = torch.topk(scores, k=k_val)
         candidates = []
@@ -311,8 +291,7 @@ def trinity_inference(img_crop, is_pill=True,
             if name not in seen:
                 candidates.append((name, float(sc)))
                 seen.add(name)
-                if len(candidates) >= 3: 
-                    break
+                if len(candidates) >= 3: break
 
         live_color = None
         gray = cv2.cvtColor(img_crop, cv2.COLOR_RGB2GRAY)
@@ -339,8 +318,7 @@ def trinity_inference(img_crop, is_pill=True,
                         matches = bf.knnMatch(des_live, ref_des, k=2)
                         good = sum(1 for m, n in matches if len([m, n]) == 2 and m.distance < SIFT_RATIO * n.distance)
                         max_good = max(max_good, good)
-                    except: 
-                        pass
+                    except: pass
                 sift_score = min(max_good / SIFT_MAX_MATCHES, 1.0)
                 
             color_score = 0.0
@@ -351,7 +329,7 @@ def trinity_inference(img_crop, is_pill=True,
                 dist = np.linalg.norm(norm_diff)
                 color_score = np.clip(np.exp(-3.0 * dist), 0, 1)
                 
-            w_vec, w_sift, w_col = (0.4, 0.1, 0.5) if is_pill else (0.8, 0.2, 0.0)
+            w_vec, w_sift, w_col = (0.3, 0.1, 0.6) if is_pill else (0.8, 0.2, 0.0)
             total = vec_score * w_vec + sift_score * w_sift + color_score * w_col
             
             if total > best_score: 
@@ -363,15 +341,10 @@ def trinity_inference(img_crop, is_pill=True,
         print(f"[Trinity Error] {e}")
         return "Error", 0.0
 
-# ================= 4. AI WORKER (AUTO-CHECK LOGIC) =================
-# ================= CONFIGURATION FOR STABILITY =================
-CONSISTENCY_THRESHOLD = 2  # ต้องเจอ High Score ติดกัน 4 เฟรม (ประมาณ 0.4 วิ) ถึงจะตัดยอด
-
-# ================= 4. AI WORKER (AUTO-CHECK LOGIC) =================
+# ================= 4. AI WORKER (SMART LOGIC) =================
 class AIProcessor:
     __slots__ = ('latest_frame', 'results', 'stopped', 'lock', 'is_rx_mode', 
-                 'current_patient_info', 'sess_mat_pills', 'sess_lbl_pills',
-                 'sess_mat_packs', 'sess_lbl_packs', 'scale_x', 'scale_y',
+                 'current_patient_info', 'scale_x', 'scale_y',
                  'resize_interpolation', 'consistency_counter')
     
     def __init__(self):
@@ -381,56 +354,26 @@ class AIProcessor:
         self.lock = threading.Lock()
         self.is_rx_mode = False
         self.current_patient_info = None
-        self.sess_mat_pills = None
-        self.sess_lbl_pills = None
-        self.sess_mat_packs = None
-        self.sess_lbl_packs = None
         self.scale_x = DISPLAY_W / AI_IMG_SIZE
         self.scale_y = DISPLAY_H / AI_IMG_SIZE
         self.resize_interpolation = cv2.INTER_LINEAR
-        
-        # [NEW] Dictionary เก็บ state ความต่อเนื่องของวัตถุ { 'drug_name': count }
-        self.consistency_counter = {}
+        self.consistency_counter = {} # กันสั่น
 
     def load_patient(self, patient_data):
         with self.lock:
             if not patient_data:
                 self.is_rx_mode = False
                 self.current_patient_info = None
-                self.sess_mat_pills = None
-                self.sess_lbl_pills = None
-                self.sess_mat_packs = None
-                self.sess_lbl_packs = None
                 prescription_state.load_drugs([])
-                self.consistency_counter.clear() # Reset counter เมื่อเปลี่ยนคน
+                self.consistency_counter.clear()
             else:
                 self.is_rx_mode = True
                 self.current_patient_info = patient_data
                 drugs = patient_data['drugs']
                 prescription_state.load_drugs(drugs)
-                self.sess_mat_pills, self.sess_lbl_pills = PrescriptionManager.filter_db(
-                    drugs, pills_vecs, pills_lbls)
-                self.sess_mat_packs, self.sess_lbl_packs = PrescriptionManager.filter_db(
-                    drugs, packs_vecs, packs_lbls)
-                self.consistency_counter.clear() # Reset counter สำหรับคนไข้ใหม่
+                self.consistency_counter.clear()
                 print(f"🏥 Loaded: {patient_data['name']}")
     
-    def update_remaining_drugs(self):
-        with self.lock:
-            if self.current_patient_info:
-                remaining = prescription_state.get_remaining_drugs()
-                if remaining:
-                    self.sess_mat_pills, self.sess_lbl_pills = PrescriptionManager.filter_db(
-                        remaining, pills_vecs, pills_lbls)
-                    self.sess_mat_packs, self.sess_lbl_packs = PrescriptionManager.filter_db(
-                        remaining, packs_vecs, packs_lbls)
-                else:
-                    # ถ้าครบแล้ว ให้กลับไปโหลด DB เต็มเผื่อหมอเช็คซ้ำ
-                    self.sess_mat_pills = matrix_pills
-                    self.sess_lbl_pills = pills_lbls
-                    self.sess_mat_packs = matrix_packs
-                    self.sess_lbl_packs = packs_lbls
-
     def start(self): 
         threading.Thread(target=self.run, daemon=True).start()
         return self
@@ -443,8 +386,18 @@ class AIProcessor:
         with self.lock: 
             return self.results, self.current_patient_info
 
+    # ฟังก์ชั่นกรองวัตถุขยะ/ป้ายชื่อ
+    def is_valid_detection(self, box, img_w, img_h):
+        x1, y1, x2, y2 = box
+        area = (x2 - x1) * (y2 - y1)
+        image_area = img_w * img_h
+        # ถ้าใหญ่เกิน 40% ของจอ -> ขยะ
+        if area / image_area > MAX_OBJ_AREA_RATIO:
+            return False 
+        return True
+
     def run(self):
-        print("[DEBUG] AI Worker Loop Started (with Stability Logic).")
+        print("[DEBUG] AI Worker Loop Started (Senior Mode).")
         
         while not self.stopped:
             with self.lock:
@@ -461,8 +414,6 @@ class AIProcessor:
             final_detections = []
             detected_pills_raw = [] 
             valid_pills = []
-            
-            # [NEW] Set เพื่อจดจำว่าเฟรมนี้เจอตัวไหนบ้าง (ใช้สำหรับ Reset ตัวที่ไม่เจอ)
             found_in_this_frame = set()
 
             try:
@@ -470,6 +421,7 @@ class AIProcessor:
                 pill_res = model_pill(frame_yolo, verbose=False, conf=CONF_PILL, 
                                      imgsz=AI_IMG_SIZE, max_det=10, agnostic_nms=True)
                 
+                # หา Best Pill เพื่อใช้ Assumption Logic
                 best_pill_score = -1
                 best_pill_name = None
 
@@ -478,57 +430,88 @@ class AIProcessor:
                     x1, y1 = int(x1_s * self.scale_x), int(y1_s * self.scale_y)
                     x2, y2 = int(x2_s * self.scale_x), int(y2_s * self.scale_y)
                     
+                    # Filter: กรองป้ายชื่อ/ขยะ
+                    if not self.is_valid_detection((x1, y1, x2, y2), DISPLAY_W, DISPLAY_H):
+                        continue
+                    
                     if (x2-x1) < 30 or (y2-y1) < 30: continue
                     crop = frame_HD[y1:y2, x1:x2]
                     if crop.size == 0: continue
 
-                    nm, sc = trinity_inference(crop, is_pill=True,
-                                              session_pills=self.sess_mat_pills,
-                                              session_pills_lbl=self.sess_lbl_pills,
-                                              session_packs=self.sess_mat_packs,
-                                              session_packs_lbl=self.sess_lbl_packs)
+                    # 🛡️ GLOBAL CHECK: เทียบกับ 2000 ตัวเสมอ (Sanity Check)
+                    real_name, real_score = trinity_inference(crop, is_pill=True,
+                                              session_pills=matrix_pills,       # Global DB
+                                              session_pills_lbl=pills_lbls,
+                                              session_packs=matrix_packs,
+                                              session_packs_lbl=packs_lbls)
                     
                     cx, cy = (x1+x2)>>1, (y1+y2)>>1
                     
-                    if "?" not in nm and "Unknown" not in nm and sc > best_pill_score:
-                        best_pill_score = sc
-                        best_pill_name = nm
+                    # 🏥 PRESCRIPTION MATCHING logic
+                    final_name = real_name
+                    final_score = real_score
+                    is_wrong_drug = False
+
+                    if self.is_rx_mode:
+                        clean_real = real_name.lower().strip()
+                        allowed_drugs = [d.lower() for d in prescription_state.get_all_drugs()]
+                        
+                        match_found = False
+                        # เช็คว่ายาที่เจอ (Global Result) ตรงกับใบสั่งไหม?
+                        for allowed in allowed_drugs:
+                            if allowed in clean_real: 
+                                match_found = True
+                                final_name = allowed # Map กลับเป็นชื่อในใบสั่ง
+                                break
+                        
+                        if not match_found and "?" not in real_name and "Unknown" not in real_name:
+                            # เจอตัวยาชัดเจน แต่ไม่ใช่ที่หมอสั่ง!
+                            final_name = f"WRONG: {real_name}"
+                            final_score = 0.0 # ตัดคะแนนทิ้งเพื่อไม่ให้ติ๊กถูก
+                            is_wrong_drug = True
+
+                    # เก็บ Best Candidate ไว้เผื่อ Assumption
+                    if not is_wrong_drug and "?" not in final_name and "Unknown" not in final_name and final_score > best_pill_score:
+                        best_pill_score = final_score
+                        best_pill_name = final_name
                         
                     detected_pills_raw.append({
-                        'name': nm, 'score': sc, 'center': (cx, cy), 'box': (x1, y1, x2, y2)
+                        'name': final_name, 'score': final_score, 'center': (cx, cy), 
+                        'box': (x1, y1, x2, y2), 'is_wrong': is_wrong_drug
                     })
 
                 # Process Pills & Auto-Tick
                 for pill in detected_pills_raw:
                     nm, sc = pill['name'], pill['score']
+                    is_wrong = pill['is_wrong']
                     
-                    # Apply Assumption
-                    if best_pill_name and ("?" in nm or "Unknown" in nm or sc < SCORE_PASS_PILL):
+                    # Apply Assumption (ถ้าไม่ใช่ยาผิด)
+                    if not is_wrong and best_pill_name and ("?" in nm or "Unknown" in nm or sc < SCORE_PASS_PILL):
                         nm, sc = best_pill_name, best_pill_score
                     
                     clean_name = nm.lower()
                     
-                    # --- LOGIC #1: Auto-Tick Pill (STABILIZED) ---
-                    if "?" not in nm and "Unknown" not in nm and sc >= SCORE_PASS_PILL:
-                        # [NEW] Increment Counter
+                    # --- LOGIC #1: Auto-Tick Pill (Temporal Consistency) ---
+                    # ต้องไม่ใช่ยาผิด, ไม่ใช่ Unknown, คะแนนถึง
+                    if not is_wrong and "?" not in nm and "Unknown" not in nm and sc >= SCORE_PASS_PILL:
+                        # นับเฟรมต่อเนื่อง
                         self.consistency_counter[clean_name] = self.consistency_counter.get(clean_name, 0) + 1
                         found_in_this_frame.add(clean_name)
                         
-                        # [NEW] Check Threshold
+                        # ครบโควต้าเฟรม -> ติ๊กถูก
                         if self.consistency_counter[clean_name] >= CONSISTENCY_THRESHOLD:
                             prescription_state.verify_drug(clean_name)
-                            self.update_remaining_drugs()
-
+                    
                     is_verified = prescription_state.is_verified(clean_name)
                     
-                    if "?" not in nm and "Unknown" not in nm:
+                    if not is_wrong and "?" not in nm and "Unknown" not in nm:
                         valid_pills.append({
                             'name': nm, 'center': pill['center'], 'verified': is_verified, 'score': sc
                         })
 
                     final_detections.append({
                         'label': nm, 'score': sc, 'type': 'pill',
-                        'verified': is_verified, 'box': pill['box']
+                        'verified': is_verified, 'box': pill['box'], 'is_wrong': is_wrong
                     })
 
                 # --- 2. DETECT PACKS ---
@@ -540,57 +523,77 @@ class AIProcessor:
                     x1, y1 = int(x1_s * self.scale_x), int(y1_s * self.scale_y)
                     x2, y2 = int(x2_s * self.scale_x), int(y2_s * self.scale_y)
                     
+                    # Filter: กรองป้ายชื่อ
+                    if not self.is_valid_detection((x1, y1, x2, y2), DISPLAY_W, DISPLAY_H):
+                        continue
+
                     if (x2-x1) < 50 or (y2-y1) < 50: continue
                     crop = frame_HD[y1:y2, x1:x2]
                     if crop.size == 0: continue
                     
-                    nm, sc = trinity_inference(crop, is_pill=False,
-                                              session_pills=self.sess_mat_pills,
-                                              session_pills_lbl=self.sess_lbl_pills,
-                                              session_packs=self.sess_mat_packs,
-                                              session_packs_lbl=self.sess_lbl_packs)
+                    # Global Check
+                    real_name, real_score = trinity_inference(crop, is_pill=False,
+                                              session_pills=matrix_pills, 
+                                              session_pills_lbl=pills_lbls,
+                                              session_packs=matrix_packs,
+                                              session_packs_lbl=packs_lbls)
                     
-                    clean_name = nm.replace("_pack", "").lower()
+                    # Pack Matching Logic
+                    final_name = real_name
+                    final_score = real_score
+                    is_wrong_drug = False
                     
-                    # --- LOGIC #2: Auto-Tick Pack (STABILIZED) ---
-                    if "?" not in nm and "Unknown" not in nm and sc >= SCORE_PASS_PACK:
-                        # [NEW] Increment Counter
+                    if self.is_rx_mode:
+                        clean_real = real_name.replace("_pack", "").lower().strip()
+                        allowed_drugs = [d.lower() for d in prescription_state.get_all_drugs()]
+                        match_found = False
+                        for allowed in allowed_drugs:
+                            if allowed in clean_real:
+                                match_found = True
+                                final_name = allowed # Map name
+                                break
+                        
+                        if not match_found and "?" not in real_name and "Unknown" not in real_name:
+                            final_name = f"WRONG: {real_name}"
+                            final_score = 0.0
+                            is_wrong_drug = True
+
+                    clean_name = final_name.replace("_pack", "").lower()
+
+                    # --- LOGIC #2: Auto-Tick Pack (Temporal Consistency) ---
+                    if not is_wrong_drug and "?" not in final_name and "Unknown" not in final_name and final_score >= SCORE_PASS_PACK:
                         self.consistency_counter[clean_name] = self.consistency_counter.get(clean_name, 0) + 1
                         found_in_this_frame.add(clean_name)
                         
                         if self.consistency_counter[clean_name] >= CONSISTENCY_THRESHOLD:
                             prescription_state.verify_drug(clean_name)
-                            self.update_remaining_drugs()
                     
-                    # --- LOGIC #3: Check for Inner Pill (Inheritance) ---
+                    # --- LOGIC #3: Inheritance ---
                     pack_verified = prescription_state.is_verified(clean_name)
                     
-                    for pill in valid_pills:
-                        if is_point_in_box(pill['center'], (x1, y1, x2, y2)):
-                            if pill['score'] >= SCORE_PASS_PILL or pill['verified']:
-                                # TRUST THE PILL -> Force Verify Pack
-                                pack_verified = True
-                                nm = pill['name']
-                                sc = max(sc, pill['score'])
-                                clean_name_pill = nm.lower()
-                                
-                                # [NEW] Force Stability for Inheritance
-                                # ถ้าเจอยาข้างในชัดเจน ให้ถือว่า Pack นั้นเสถียรทันที
-                                self.consistency_counter[clean_name_pill] = CONSISTENCY_THRESHOLD + 1
-                                found_in_this_frame.add(clean_name_pill)
-                                
-                                prescription_state.verify_drug(clean_name_pill)
-                                self.update_remaining_drugs()
-                                break
+                    if not is_wrong_drug:
+                        for pill in valid_pills:
+                            if is_point_in_box(pill['center'], (x1, y1, x2, y2)):
+                                if pill['score'] >= SCORE_PASS_PILL or pill['verified']:
+                                    # Inheritance!
+                                    pack_verified = True
+                                    final_name = pill['name']
+                                    final_score = max(final_score, pill['score'])
+                                    clean_pill = final_name.lower()
+                                    
+                                    # Force Stability for Inheritance
+                                    self.consistency_counter[clean_pill] = CONSISTENCY_THRESHOLD + 1
+                                    found_in_this_frame.add(clean_pill)
+                                    
+                                    prescription_state.verify_drug(clean_pill)
+                                    break
                     
                     final_detections.append({
-                        'label': nm, 'score': sc, 'type': 'pack',
-                        'verified': pack_verified,
-                        'box': (x1, y1, x2, y2)
+                        'label': final_name, 'score': final_score, 'type': 'pack',
+                        'verified': pack_verified, 'box': (x1, y1, x2, y2), 'is_wrong': is_wrong_drug
                     })
 
-                # [NEW] CLEANUP: Reset counters for items not seen in this frame
-                # ถ้าเฟรมนี้หายไป ให้ reset counter เป็น 0 ทันที (หรือลดลงทีละนิดก็ได้ถ้าต้องการ decaying)
+                # Cleanup: รีเซ็ต counter ตัวที่ไม่เจอในเฟรมนี้
                 all_tracked = list(self.consistency_counter.keys())
                 for k in all_tracked:
                     if k not in found_in_this_frame:
@@ -684,21 +687,26 @@ def draw_boxes_on_items(frame, results):
         score = r['score']
         obj_type = r.get('type', 'pill')
         is_verified = r.get('verified', False)
+        is_wrong = r.get('is_wrong', False)
         
-        if is_verified:
-            color = (0, 255, 0) # Green for verified
+        # Color Logic
+        if is_wrong:
+            color = (255, 0, 0) # RED for WRONG DRUG
+            label_display = f"!! {label} !!"
+        elif is_verified:
+            color = (0, 255, 0) # Green for Verified
             label_display = f"OK {label}"
         elif obj_type == 'pack':
             if score >= SCORE_PASS_PACK:
                 color = (0, 255, 0)
             else:
-                color = (0, 255, 255) # Yellow for unsure pack
+                color = (0, 255, 255) 
             label_display = label
         elif "?" in label or score < SCORE_PASS_PILL:
-            color = (0, 0, 255) # Red for bad pill
+            color = (0, 0, 255) 
             label_display = label
         else:
-            color = (0, 255, 0)
+            color = (0, 255, 255)
             label_display = label
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, THICKNESS_BOX)
@@ -714,7 +722,6 @@ def mouse_callback(event, x, y, flags, param):
             if x1 <= x <= x2 and y1 <= y <= y2:
                 drug = area['drug']
                 prescription_state.toggle_drug(drug.lower())
-                ai_processor.update_remaining_drugs()
                 return
 
 def main():
@@ -732,16 +739,16 @@ def main():
     print("⏳ Waiting for camera feed...")
     while cam.read() is None: time.sleep(0.1)
     
-    window_name = "PillTrack"
+    window_name = "PillTrack Senior Edition"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, DISPLAY_W, DISPLAY_H) 
-    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    # cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    print(f"🎥 RUNNING... (Auto-Check & Mouse Mode)")
+    print(f"🎥 RUNNING... (Stable & Smart)")
     
     fps = 0
     prev_time = time.perf_counter()
-    TARGET_FPS = 10 
+    TARGET_FPS = 15 
     FRAME_TIME = 1.0 / TARGET_FPS
     
     clickable_areas = []
@@ -757,11 +764,11 @@ def main():
             ai.update_frame(frame_rgb)
             results, cur_patient = ai.get_results()
             
-            # กรอบวัตถุ
-            draw_boxes_on_items(frame_rgb, results)
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            draw_boxes_on_items(frame_bgr, results)
             
             if cur_patient: 
-                clickable_areas = draw_patient_info(frame_rgb, cur_patient)
+                clickable_areas = draw_patient_info(frame_bgr, cur_patient)
                 cv2.setMouseCallback(window_name, mouse_callback, (clickable_areas, ai))
             
             curr_time = time.perf_counter()
@@ -769,10 +776,10 @@ def main():
             prev_time = curr_time
             
             temp = get_cpu_temperature()
-            cv2.putText(frame_rgb, f"FPS: {fps:.1f} | {temp}", (30, 50), 
+            cv2.putText(frame_bgr, f"FPS: {fps:.1f} | {temp}", (30, 50), 
                        FONT, 1.2, (0, 255, 0), THICKNESS_BOX)
             
-            cv2.imshow(window_name, frame_rgb)
+            cv2.imshow(window_name, frame_bgr)
             
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'): break
