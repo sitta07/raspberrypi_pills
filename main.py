@@ -12,9 +12,7 @@ from torchvision import models, transforms
 from PIL import Image
 
 # ================= FIX RASPBERRY PI ENVIRONMENT =================
-# 1. Fix Display (X11 backend)
 os.environ["QT_QPA_PLATFORM"] = "xcb"
-# 2. Fix GPU Device Discovery Failed (Force Software Rendering)
 os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
 
 # Import Picamera2
@@ -34,11 +32,13 @@ DB_FILES = {
 IMG_DB_FOLDER = 'database_images'
 HIS_FILE_PATH = 'prescription.txt' 
 
-CONF_PILL = 0.50    
-CONF_PACK = 0.70    
-SCORE_PASS_PILL = 0.75  
+# 🔥 ลด Threshold ลงเพื่อทดสอบ (ถ้าเจอแล้วค่อยปรับขึ้น)
+CONF_PILL = 0.25    
+CONF_PACK = 0.40    
+SCORE_PASS_PILL = 0.60  
 SCORE_PASS_PACK = 0.60  
 
+# ใช้ CPU สำหรับ Pi
 device = torch.device("cpu")
 print(f"🚀 SYSTEM STARTING ON: {device}")
 
@@ -64,7 +64,7 @@ class WebcamStream:
         print(" Initializing Picamera2 (HD Mode)...")
         try:
             self.picam2 = Picamera2()
-            # 🔥 Config RGB888 DIRECTLY
+            # RGB888
             config = self.picam2.create_preview_configuration(
                 main={"size": (1280, 720), "format": "RGB888"},
                 controls={"FrameDurationLimits": (16666, 16666)} 
@@ -95,7 +95,7 @@ class WebcamStream:
 
     def read(self):
         with self.lock:
-            if self.grabbed:
+            if self.grabbed and self.frame is not None:
                 return self.frame.copy()
             else:
                 return None
@@ -107,7 +107,6 @@ class WebcamStream:
             except: pass
 
 # ================= 2. RESOURCES & LOGIC =================
-
 class HISLoader:
     @staticmethod
     def load_database(filename):
@@ -140,7 +139,7 @@ class PrescriptionManager:
         if not s_vec: return None, None
         return torch.tensor(np.array(s_vec)).to(device), s_lbl
 
-# --- Global Load ---
+# Global Load
 print("⏳ Loading Resources...")
 vec_db, color_db = {}, {}
 try:
@@ -173,8 +172,8 @@ if os.path.exists(IMG_DB_FOLDER):
         sift_db[folder] = des_list
 
 try:
-    model_pill = YOLO(MODEL_PILL_PATH)
-    model_pack = YOLO(MODEL_PACK_PATH)
+    model_pill = YOLO(MODEL_PILL_PATH, task='detect')
+    model_pack = YOLO(MODEL_PACK_PATH, task='detect') # Explicitly state task
     weights = models.ResNet50_Weights.DEFAULT
     embedder = torch.nn.Sequential(*list(models.resnet50(weights=weights).children())[:-1])
     embedder.eval().to(device)
@@ -187,76 +186,79 @@ except Exception as e: print(f"❌ Model Error: {e}"); sys.exit(1)
 
 print("✅ AI Logic Ready!")
 
-# --- Trinity Engine (RGB Version) ---
+# --- Trinity Engine ---
 def trinity_inference(img_crop, is_pill=True, custom_matrix=None, custom_labels=None):
     target_matrix = custom_matrix if custom_matrix is not None else global_matrix
     target_labels = custom_labels if custom_labels is not None else global_labels
     if target_matrix is None: return "DB Error", 0.0
 
-    # Assume img_crop is RGB
-    if is_pill:
-        pil_img = Image.fromarray(img_crop) 
-    else:
-        gray_crop = cv2.cvtColor(img_crop, cv2.COLOR_RGB2GRAY)
-        crop_3ch_gray = cv2.merge([gray_crop, gray_crop, gray_crop])
-        pil_img = Image.fromarray(crop_3ch_gray)
+    try:
+        if is_pill:
+            pil_img = Image.fromarray(img_crop) 
+        else:
+            gray_crop = cv2.cvtColor(img_crop, cv2.COLOR_RGB2GRAY)
+            crop_3ch_gray = cv2.merge([gray_crop, gray_crop, gray_crop])
+            pil_img = Image.fromarray(crop_3ch_gray)
 
-    input_tensor = preprocess(pil_img).unsqueeze(0).to(device)
-    with torch.no_grad():
-        live_vec = embedder(input_tensor).flatten()
-        live_vec = live_vec / live_vec.norm()
+        input_tensor = preprocess(pil_img).unsqueeze(0).to(device)
+        with torch.no_grad():
+            live_vec = embedder(input_tensor).flatten()
+            live_vec = live_vec / live_vec.norm()
+            
+        scores = torch.matmul(live_vec, target_matrix.T).squeeze(0)
+        k_val = min(10, len(target_labels))
+        if k_val == 0: return "Unknown", 0.0
         
-    scores = torch.matmul(live_vec, target_matrix.T).squeeze(0)
-    k_val = min(10, len(target_labels))
-    if k_val == 0: return "Unknown", 0.0
-    
-    top_k_val, top_k_idx = torch.topk(scores, k=k_val)
-    candidates, seen = [], set()
-    target_suffix = "_pill" if is_pill else "_pack"
-    
-    for idx, sc in zip(top_k_idx.cpu().numpy(), top_k_val.cpu().numpy()):
-        name = target_labels[idx]
-        if name.endswith(target_suffix) and name not in seen:
-            candidates.append((name, float(sc))); seen.add(name)
-            if len(candidates) >= 3: break
+        top_k_val, top_k_idx = torch.topk(scores, k=k_val)
+        candidates, seen = [], set()
+        target_suffix = "_pill" if is_pill else "_pack"
+        
+        for idx, sc in zip(top_k_idx.cpu().numpy(), top_k_val.cpu().numpy()):
+            name = target_labels[idx]
+            if name.endswith(target_suffix) and name not in seen:
+                candidates.append((name, float(sc))); seen.add(name)
+                if len(candidates) >= 3: break
 
-    live_color = None; des_live = None
-    if is_pill: 
-        h, w = img_crop.shape[:2]
-        center = img_crop[int(h*0.25):int(h*0.75), int(w*0.25):int(w*0.75)]
-        hsv = cv2.cvtColor(center, cv2.COLOR_RGB2HSV) # RGB -> HSV
-        live_color = np.mean(hsv, axis=(0,1))
-    
-    gray = cv2.cvtColor(img_crop, cv2.COLOR_RGB2GRAY)
-    _, des_live = sift.detectAndCompute(gray, None)
+        live_color = None; des_live = None
+        if is_pill: 
+            h, w = img_crop.shape[:2]
+            center = img_crop[int(h*0.25):int(h*0.75), int(w*0.25):int(w*0.75)]
+            hsv = cv2.cvtColor(center, cv2.COLOR_RGB2HSV)
+            live_color = np.mean(hsv, axis=(0,1))
+        
+        gray = cv2.cvtColor(img_crop, cv2.COLOR_RGB2GRAY)
+        _, des_live = sift.detectAndCompute(gray, None)
 
-    best_score = -1; final_name = "Unknown"
-    for name, vec_score in candidates:
-        clean_name = name.replace("_pill", "").replace("_pack", "")
-        sift_score = 0.0
-        if des_live is not None and clean_name in sift_db:
-            max_good = 0
-            for ref_des in sift_db[clean_name]:
-                try:
-                    matches = bf.knnMatch(des_live, ref_des, k=2)
-                    good = [m for m,n in matches if m.distance < 0.75 * n.distance]
-                    if len(good) > max_good: max_good = len(good)
-                except: pass
-            sift_score = min(max_good / 15.0, 1.0)
-            
-        color_score = 0.0
-        if is_pill and name in color_db:
-            diff = np.abs(live_color - color_db[name])
-            diff[0] = min(diff[0], 180 - diff[0]) 
-            norm_diff = diff / np.array([90.0, 255.0, 255.0])
-            dist = np.linalg.norm(norm_diff)
-            color_score = np.clip(np.exp(-3.0 * dist), 0, 1)
-            
-        w_vec, w_sift, w_col = (0.3, 0.1, 0.6) if is_pill else (0.3, 0.7, 0.0)
-        total = (vec_score * w_vec) + (sift_score * w_sift) + (color_score * w_col)
-        if total > best_score: best_score = total; final_name = clean_name
+        best_score = -1; final_name = "Unknown"
+        for name, vec_score in candidates:
+            clean_name = name.replace("_pill", "").replace("_pack", "")
+            sift_score = 0.0
+            if des_live is not None and clean_name in sift_db:
+                max_good = 0
+                for ref_des in sift_db[clean_name]:
+                    try:
+                        matches = bf.knnMatch(des_live, ref_des, k=2)
+                        good = [m for m,n in matches if m.distance < 0.75 * n.distance]
+                        if len(good) > max_good: max_good = len(good)
+                    except: pass
+                sift_score = min(max_good / 15.0, 1.0)
+                
+            color_score = 0.0
+            if is_pill and name in color_db:
+                diff = np.abs(live_color - color_db[name])
+                diff[0] = min(diff[0], 180 - diff[0]) 
+                norm_diff = diff / np.array([90.0, 255.0, 255.0])
+                dist = np.linalg.norm(norm_diff)
+                color_score = np.clip(np.exp(-3.0 * dist), 0, 1)
+                
+            w_vec, w_sift, w_col = (0.3, 0.1, 0.6) if is_pill else (0.3, 0.7, 0.0)
+            total = (vec_score * w_vec) + (sift_score * w_sift) + (color_score * w_col)
+            if total > best_score: best_score = total; final_name = clean_name
 
-    return final_name, best_score
+        return final_name, best_score
+    except Exception as e:
+        print(f"Error in Trinity: {e}")
+        return "Error", 0.0
 
 # ================= 3. AI WORKER (ASYNC) =================
 class AIProcessor:
@@ -266,10 +268,8 @@ class AIProcessor:
         self.stopped = False
         self.lock = threading.Lock()
         
-        # State
         self.current_patient_info = None 
-        self.session_matrix = None
-        self.session_labels = None
+        self.session_matrix = None; self.session_labels = None
         self.is_rx_mode = False
 
     def load_patient(self, patient_data):
@@ -307,7 +307,9 @@ class AIProcessor:
             if frame_to_process is None: 
                 time.sleep(0.01); continue
 
-            # === PROCESSING RGB FRAME DIRECTLY ===
+            # 🔥 Fix Memory Layout for YOLO (Critical for Picamera2)
+            frame_clean = np.ascontiguousarray(frame_to_process)
+
             detections = []
             pill_names_batch = [] 
             pill_coords = []      
@@ -325,33 +327,41 @@ class AIProcessor:
                     if self.is_rx_mode: name = "WRONG"; label_prefix = "!!! "
                 return name, score, label_prefix, color
 
-            # 1. Pills (YOLO takes RGB fine)
-            pill_res = model_pill(frame_to_process, verbose=False, conf=CONF_PILL)
+            # 1. Pills 
+            pill_res = model_pill(frame_clean, verbose=False, conf=CONF_PILL)
             if len(pill_res[0].boxes) > 0:
+                # print(f"DEBUG: Found {len(pill_res[0].boxes)} Pills") # Uncomment to debug
                 for box in pill_res[0].boxes.xyxy.cpu().numpy().astype(int):
                     x1,y1,x2,y2 = box
-                    crop = frame_to_process[y1:y2, x1:x2]
-                    if crop.size > 0:
-                        nm, sc, pf, clr = process_crop(crop, True)
-                        if "WRONG" not in nm and "Unknown" not in nm:
-                            pill_names_batch.append(nm); pill_coords.append((x1,y1,x2,y2))
-                        detections.append({'box':box, 'label':nm, 'full':f"{pf}{nm} {sc:.0%}", 'color':clr, 'type':'pill'})
+                    # Validate crop size
+                    if x2 <= x1 or y2 <= y1: continue
+                    
+                    crop = frame_clean[y1:y2, x1:x2]
+                    if crop.size == 0: continue
+
+                    nm, sc, pf, clr = process_crop(crop, True)
+                    if "WRONG" not in nm and "Unknown" not in nm:
+                        pill_names_batch.append(nm); pill_coords.append((x1,y1,x2,y2))
+                    detections.append({'box':box, 'label':nm, 'full':f"{pf}{nm} {sc:.0%}", 'color':clr, 'type':'pill'})
 
             # 2. Packs
-            pack_res = model_pack(frame_to_process, verbose=False, conf=CONF_PACK, retina_masks=True)
+            pack_res = model_pack(frame_clean, verbose=False, conf=CONF_PACK, retina_masks=True)
             if pack_res[0].masks is not None:
                 masks = pack_res[0].masks.data.cpu().numpy()
                 boxes = pack_res[0].boxes.xyxy.cpu().numpy().astype(int)
                 for i, box in enumerate(boxes):
                     x1,y1,x2,y2 = box
+                    if x2 <= x1 or y2 <= y1: continue
+
                     raw_mask = masks[i]
-                    mask_resized = cv2.resize(raw_mask, (frame_to_process.shape[1], frame_to_process.shape[0]))
+                    mask_resized = cv2.resize(raw_mask, (frame_clean.shape[1], frame_clean.shape[0]))
                     mask_binary = (mask_resized > 0.5).astype(np.uint8)
-                    masked = frame_to_process.copy(); masked[mask_binary == 0] = [128,128,128]
+                    masked = frame_clean.copy(); masked[mask_binary == 0] = [128,128,128]
                     crop = masked[y1:y2, x1:x2]
-                    if crop.size > 0:
-                        nm, sc, pf, clr = process_crop(crop, False)
-                        detections.append({'box':box, 'label':nm, 'full':f"{pf}{nm} {sc:.0%}", 'color':clr, 'type':'pack'})
+                    if crop.size == 0: continue
+
+                    nm, sc, pf, clr = process_crop(crop, False)
+                    detections.append({'box':box, 'label':nm, 'full':f"{pf}{nm} {sc:.0%}", 'color':clr, 'type':'pack'})
 
             # 3. Group Box
             if pill_coords:
@@ -374,7 +384,7 @@ class AIProcessor:
             
     def stop(self): self.stopped = True
 
-# ================= 4. UI DRAWING (USER LOGIC) =================
+# ================= 4. UI DRAWING =================
 def draw_patient_info(frame, patient_data):
     if not patient_data: return
     H, W = frame.shape[:2]
@@ -390,15 +400,21 @@ def draw_patient_info(frame, patient_data):
 
 def draw_summary_box(frame, results):
     H, W = frame.shape[:2]
+    # Filter items, include everything for debugging
     items = [r['label'] for r in results 
              if r['type'] in ['pill', 'pack'] 
              and "Unknown" not in r['label'] and "WRONG" not in r['label']]
-    if not items: return
+    
+    if not items: 
+        # Optional: Show 'Scanning...' if empty
+        return
+
     counts = Counter(items)
     box_w = 300; line_h = 30; padding = 10
     total_lines = len(counts) + 1
     total_h = (total_lines * line_h) + (padding * 2)
     start_x = W - box_w - 20; start_y = H - total_h - 20
+    
     overlay = frame.copy()
     cv2.rectangle(overlay, (start_x, start_y), (W - 20, H - 20), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
@@ -408,17 +424,13 @@ def draw_summary_box(frame, results):
         y_pos = start_y + 25 + ((i + 1) * line_h)
         cv2.putText(frame, f"{name}: {count}", (start_x + 10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
-# ================= 5. MAIN (ASYNC PATTERN) =================
+# ================= 5. MAIN =================
 def main():
     TARGET_HN = "HN-101" 
     
-    # 1. Start Camera
     cam = WebcamStream().start()
-    
-    # 2. Start AI Worker
     ai = AIProcessor().start()
     
-    # 3. Load Patient Data
     his_db = HISLoader.load_database(HIS_FILE_PATH)
     if TARGET_HN in his_db: 
         d = his_db[TARGET_HN]; d['hn'] = TARGET_HN; ai.load_patient(d)
@@ -426,31 +438,26 @@ def main():
     print(" Waiting for camera feed...")
     while cam.read() is None: time.sleep(0.1)
     
-    window_name = "PillTrack - Raspberry Pi"
+    window_name = "PillTrack"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
     print("🎥 RUNNING... Press 'R' to Reload")
-    prev_time = 0
-    fps = 0
+    prev_time = 0; fps = 0
 
     try:
         while True:
-            # Get latest frame (RGB888)
-            frame = cam.read()
-            if frame is None: 
-                time.sleep(0.01); continue
+            frame_rgb = cam.read()
+            if frame_rgb is None: time.sleep(0.01); continue
             
-            # Send to AI
-            ai.update_frame(frame)
-            
-            # Use Frame for Display (Still RGB - Colors might be swapped on screen, as requested)
-            display = frame.copy()
-            
-            # Get AI Results
+            ai.update_frame(frame_rgb)
+            display = frame_rgb.copy()
             results, cur_patient = ai.get_results()
             
-            # Draw UI
+            # Debug Draw: ถ้าผลลัพธ์ว่าง ให้เช็คว่าเกิดอะไรขึ้น
+            # if not results:
+                # cv2.putText(display, "Scanning...", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+
             for det in results:
                 x1,y1,x2,y2 = det['box']
                 color = det['color']
@@ -464,13 +471,11 @@ def main():
             if cur_patient: draw_patient_info(display, cur_patient)
             draw_summary_box(display, results)
             
-            # FPS & Temp
             curr_time = time.time()
             if (curr_time - prev_time) > 0: fps = 1 / (curr_time - prev_time)
             prev_time = curr_time
             temp = get_cpu_temperature()
             
-            # 🔥 DISPLAY DIRECTLY (NO RGB->BGR CONVERSION)
             cv2.putText(display, f"FPS: {fps:.1f} | Temp: {temp}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
             cv2.imshow(window_name, display)
             
