@@ -37,8 +37,8 @@ DISPLAY_W, DISPLAY_H = 1280, 720
 AI_IMG_SIZE = 416 
 
 # Thresholds
-CONF_PILL = 0.15    
-CONF_PACK = 0.7     # ลดลงนิดหน่อยเพื่อให้ Detect เจอกล่องง่ายขึ้น แล้วไปคัดที่ Logic แทน
+CONF_PILL = 0.25    
+CONF_PACK = 0.5     # ลดลงนิดหน่อยเพื่อให้ Detect เจอกล่องง่ายขึ้น แล้วไปคัดที่ Logic แทน
 SCORE_PASS_PILL = 0.18
 SCORE_PASS_PACK = 0.7
 
