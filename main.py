@@ -36,17 +36,17 @@ HIS_FILE_PATH = 'prescription.txt'
 # 📺 Display Resolution
 DISPLAY_W, DISPLAY_H = 1280, 720
 
-# 🚀 AI Resolution (ย่อเพื่อความเร็ว)
+# 🚀 AI Resolution
 AI_IMG_SIZE = 416 
 
 # Thresholds
-CONF_PILL = 0.9    
-CONF_PACK = 0.7    
-SCORE_PASS_PILL = 0.2  
+CONF_PILL = 0.15    
+CONF_PACK = 0.20    
+SCORE_PASS_PILL = 0.10  
 SCORE_PASS_PACK = 0.85  
 
 device = torch.device("cpu")
-print(f"🚀 SYSTEM STARTING ON: {device} (HD Display Mode)")
+print(f"🚀 SYSTEM STARTING ON: {device} (HD Box Mode)")
 
 # ================= UTILS =================
 def get_cpu_temperature():
@@ -68,10 +68,10 @@ class WebcamStream:
         print("[DEBUG] Initializing Picamera2 (720p HD)...")
         try:
             self.picam2 = Picamera2()
-            # 🔥 Config HD 1280x720
+            # 🔥 Config HD 1280x720, Limit 15 FPS
             config = self.picam2.create_preview_configuration(
                 main={"size": (DISPLAY_W, DISPLAY_H), "format": "RGB888"},
-                controls={"FrameDurationLimits": (66666, 66666)} # 15 FPS Limit
+                controls={"FrameDurationLimits": (66666, 66666)} 
             )
             self.picam2.configure(config)
             self.picam2.start()
@@ -250,7 +250,7 @@ def trinity_inference(img_crop, is_pill=True, custom_matrix=None, custom_labels=
         return final_name, best_score
     except: return "Error", 0.0
 
-# ================= 4. AI WORKER (SMART SCALING) =================
+# ================= 4. AI WORKER (WITH BOXES) =================
 class AIProcessor:
     def __init__(self):
         self.latest_frame = None 
@@ -294,12 +294,11 @@ class AIProcessor:
             if frame_HD is None: 
                 time.sleep(0.001); continue
 
-            # 🔥 1. Resize for YOLO (Speed!)
-            # Original: 1280x720 -> YOLO: 416x416
+            # Resize for YOLO
             frame_yolo = cv2.resize(frame_HD, (AI_IMG_SIZE, AI_IMG_SIZE))
             frame_yolo_clean = np.ascontiguousarray(frame_yolo)
             
-            # Calculate Scale Factor (เพื่อแปลงพิกัดกลับไปภาพ HD)
+            # Scale Factors
             scale_x = DISPLAY_W / AI_IMG_SIZE
             scale_y = DISPLAY_H / AI_IMG_SIZE
 
@@ -317,22 +316,18 @@ class AIProcessor:
                 # 1. Pills 
                 pill_res = model_pill(frame_yolo_clean, verbose=False, conf=CONF_PILL, imgsz=AI_IMG_SIZE, max_det=10, agnostic_nms=True)
                 for box in pill_res[0].boxes.xyxy.cpu().numpy().astype(int):
-                    # Coordinates on 416x416
                     x1_s, y1_s, x2_s, y2_s = box
-                    
-                    # 🔥 Scale UP to 1280x720
+                    # Scale to HD
                     x1 = int(x1_s * scale_x); y1 = int(y1_s * scale_y)
                     x2 = int(x2_s * scale_x); y2 = int(y2_s * scale_y)
                     
-                    # Filter Noise (ถ้าเล็กเกินไปในภาพจริง ไม่ต้องทำ)
                     if (x2-x1) < 30 or (y2-y1) < 30: continue 
-
-                    # 🔥 Crop from HD Frame (High Accuracy for Trinity)
                     crop = frame_HD[y1:y2, x1:x2]
                     if crop.size == 0: continue
 
                     nm, sc = process_crop(crop, True)
-                    detections.append({'label':nm, 'score':sc, 'type':'pill'})
+                    # 🔥 เก็บพิกัดกรอบด้วย (HD Box)
+                    detections.append({'label':nm, 'score':sc, 'type':'pill', 'box':(x1,y1,x2,y2)})
 
                 # 2. Packs
                 pack_res = model_pack(frame_yolo_clean, verbose=False, conf=CONF_PACK, imgsz=AI_IMG_SIZE, max_det=5, agnostic_nms=True)
@@ -342,12 +337,12 @@ class AIProcessor:
                     x2 = int(x2_s * scale_x); y2 = int(y2_s * scale_y)
                     
                     if (x2-x1) < 50 or (y2-y1) < 50: continue
-                    
                     crop = frame_HD[y1:y2, x1:x2]
                     if crop.size == 0: continue
 
                     nm, sc = process_crop(crop, False)
-                    detections.append({'label':nm, 'score':sc, 'type':'pack'})
+                    # 🔥 เก็บพิกัดกรอบด้วย (HD Box)
+                    detections.append({'label':nm, 'score':sc, 'type':'pack', 'box':(x1,y1,x2,y2)})
 
                 with self.lock: self.results = detections
             
@@ -356,32 +351,25 @@ class AIProcessor:
             
     def stop(self): self.stopped = True
 
-# ================= 5. UI DRAWING (FULLSCREEN HD) =================
+# ================= 5. UI DRAWING =================
 def draw_patient_info(frame, patient_data):
     if not patient_data: return
-    # Adjust for HD 1280x720
     H, W = frame.shape[:2]
     box_w = 400; start_x = W - box_w
-    
     lines = [f"HN: {patient_data.get('hn', 'N/A')}",
              f"Name: {patient_data.get('name', 'N/A')}", "--- Rx List ---"]
     for d in patient_data.get('drugs', [])[:5]: lines.append(f"- {d}")
-    
     line_h = 40
     box_h = (len(lines) * line_h) + 20
-    
     cv2.rectangle(frame, (start_x, 0), (W, box_h), (50,50,50), -1)
     cv2.rectangle(frame, (start_x, 0), (W, box_h), (0,255,255), 2)
-    
     for i, line in enumerate(lines):
         y = 35 + (i * line_h)
         cv2.putText(frame, line, (start_x+15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
 
 def draw_summary_box(frame, results):
     H, W = frame.shape[:2]
-    
     if not results:
-        # Centered "Scanning" text
         text = "Analyzing..."
         font = cv2.FONT_HERSHEY_SIMPLEX
         scale = 2.0
@@ -396,41 +384,48 @@ def draw_summary_box(frame, results):
         if name not in summary: summary[name] = []
         summary[name].append(score)
 
-    box_w = 550
-    line_h = 55
-    padding = 25
+    box_w = 550; line_h = 55; padding = 25
     total_lines = len(summary) + 1
     total_h = (total_lines * line_h) + (padding * 2)
-    
-    start_x = W - box_w - 20
-    start_y = H - total_h - 20
+    start_x = W - box_w - 20; start_y = H - total_h - 20
     
     overlay = frame.copy()
     cv2.rectangle(overlay, (start_x, start_y), (W-20, H-20), (0,0,0), -1)
     cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
     cv2.rectangle(frame, (start_x, start_y), (W-20, H-20), (255,255,255), 2)
-    
-    cv2.putText(frame, "DETECTED ITEMS", (start_x+25, start_y+45), 
-                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,255,255), 3)
+    cv2.putText(frame, "DETECTED ITEMS", (start_x+25, start_y+45), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,255,255), 3)
     cv2.line(frame, (start_x+25, start_y+60), (W-45, start_y+60), (200,200,200), 2)
 
     for i, (name, scores) in enumerate(summary.items()):
         count = len(scores)
         avg = sum(scores)/count
-        
-        color = (0, 255, 0)
-        display_name = name
-        
-        if avg < SCORE_PASS_PILL: # Use generic warning logic
-             color = (255, 255, 0); display_name = f"{name} (?)"
-        if "Unknown" in name: 
-             color = (100, 100, 255); display_name = "Unknown"
-
+        color = (0, 255, 0); display_name = name
+        if avg < SCORE_PASS_PILL: color = (255, 255, 0); display_name = f"{name} (?)"
+        if "Unknown" in name: color = (100, 100, 255); display_name = "Unknown"
         y = start_y + 110 + (i * line_h)
         text = f"{display_name} : {count} ({avg:.0%})"
+        cv2.putText(frame, text, (start_x+25, y), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+
+# 🔥 New Function: Draw Bounding Boxes
+def draw_boxes_on_items(frame, results):
+    for r in results:
+        x1, y1, x2, y2 = r['box']
+        label = r['label']
+        score = r['score']
+        is_pill = r['type'] == 'pill'
         
-        cv2.putText(frame, text, (start_x+25, y), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+        # Determine Color based on confidence
+        threshold = SCORE_PASS_PILL if is_pill else SCORE_PASS_PACK
+        color = (0, 255, 0) # Green (Confident)
+        if score < threshold or "?" in label:
+             color = (0, 0, 255) # Red (Unsure)
+             
+        # Draw Box
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+        
+        # Draw Mini Label above box
+        label_text = f"{label.replace('?','')} {score:.0%}"
+        cv2.putText(frame, label_text, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
 # ================= 6. MAIN =================
 def main():
@@ -444,12 +439,11 @@ def main():
     while cam.read() is None: time.sleep(0.1)
     
     window_name = "PillTrack"
-    # 🔥 FULLSCREEN HD SETUP
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, DISPLAY_W, DISPLAY_H) 
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    print(f"🎥 RUNNING... (HD Mode {DISPLAY_W}x{DISPLAY_H})")
+    print(f"🎥 RUNNING... (HD Mode {DISPLAY_W}x{DISPLAY_H} with Boxes)")
     fps = 0; prev_time = 0
     TARGET_FPS = 15
     FRAME_TIME = 1.0 / TARGET_FPS
@@ -460,10 +454,13 @@ def main():
             frame_rgb = cam.read()
             if frame_rgb is None: time.sleep(0.01); continue
             
-            ai.update_frame(frame_rgb) # Send HD frame
+            ai.update_frame(frame_rgb)
             display = frame_rgb.copy()
             results, cur_patient = ai.get_results()
             
+            # 🔥 Draw Boxes First
+            draw_boxes_on_items(display, results)
+            # Then Draw Summaries
             draw_summary_box(display, results)
             if cur_patient: draw_patient_info(display, cur_patient)
             
@@ -472,8 +469,7 @@ def main():
             prev_time = curr_time
             temp = get_cpu_temperature()
             
-            cv2.putText(display, f"FPS: {fps:.1f} | {temp}", (30, 50), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,255,0), 3)
+            cv2.putText(display, f"FPS: {fps:.1f} | {temp}", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,255,0), 3)
             cv2.imshow(window_name, display)
             
             if cv2.waitKey(1) & 0xFF == ord('q'): break
