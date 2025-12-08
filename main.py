@@ -40,11 +40,11 @@ DISPLAY_W, DISPLAY_H = 1280, 720
 AI_IMG_SIZE = 416 
 
 # Thresholds
-CONF_PILL = 0.15    
-CONF_PACK = 0.20    
+CONF_PILL = 0.5    
+CONF_PACK = 0.75    
 
 # Accuracy Thresholds (แยกกัน)
-SCORE_PASS_PILL = 0.10  # ยาเม็ด: 10% เอาหมด
+SCORE_PASS_PILL = 0.2  # ยาเม็ด: 10% เอาหมด
 SCORE_PASS_PACK = 0.85  # กล่อง: ต้อง 85% (แต่ถ้ามีเม็ดอยู่ข้างใน จะถูก override)
 
 device = torch.device("cpu")
