@@ -364,11 +364,15 @@ def trinity_inference(img_crop, is_pill=True,
         return "Error", 0.0
 
 # ================= 4. AI WORKER (AUTO-CHECK LOGIC) =================
+# ================= CONFIGURATION FOR STABILITY =================
+CONSISTENCY_THRESHOLD = 4  # ต้องเจอ High Score ติดกัน 4 เฟรม (ประมาณ 0.4 วิ) ถึงจะตัดยอด
+
+# ================= 4. AI WORKER (AUTO-CHECK LOGIC) =================
 class AIProcessor:
     __slots__ = ('latest_frame', 'results', 'stopped', 'lock', 'is_rx_mode', 
                  'current_patient_info', 'sess_mat_pills', 'sess_lbl_pills',
                  'sess_mat_packs', 'sess_lbl_packs', 'scale_x', 'scale_y',
-                 'resize_interpolation')
+                 'resize_interpolation', 'consistency_counter')
     
     def __init__(self):
         self.latest_frame = None 
@@ -384,6 +388,9 @@ class AIProcessor:
         self.scale_x = DISPLAY_W / AI_IMG_SIZE
         self.scale_y = DISPLAY_H / AI_IMG_SIZE
         self.resize_interpolation = cv2.INTER_LINEAR
+        
+        # [NEW] Dictionary เก็บ state ความต่อเนื่องของวัตถุ { 'drug_name': count }
+        self.consistency_counter = {}
 
     def load_patient(self, patient_data):
         with self.lock:
@@ -395,6 +402,7 @@ class AIProcessor:
                 self.sess_mat_packs = None
                 self.sess_lbl_packs = None
                 prescription_state.load_drugs([])
+                self.consistency_counter.clear() # Reset counter เมื่อเปลี่ยนคน
             else:
                 self.is_rx_mode = True
                 self.current_patient_info = patient_data
@@ -404,6 +412,7 @@ class AIProcessor:
                     drugs, pills_vecs, pills_lbls)
                 self.sess_mat_packs, self.sess_lbl_packs = PrescriptionManager.filter_db(
                     drugs, packs_vecs, packs_lbls)
+                self.consistency_counter.clear() # Reset counter สำหรับคนไข้ใหม่
                 print(f"🏥 Loaded: {patient_data['name']}")
     
     def update_remaining_drugs(self):
@@ -416,6 +425,7 @@ class AIProcessor:
                     self.sess_mat_packs, self.sess_lbl_packs = PrescriptionManager.filter_db(
                         remaining, packs_vecs, packs_lbls)
                 else:
+                    # ถ้าครบแล้ว ให้กลับไปโหลด DB เต็มเผื่อหมอเช็คซ้ำ
                     self.sess_mat_pills = matrix_pills
                     self.sess_lbl_pills = pills_lbls
                     self.sess_mat_packs = matrix_packs
@@ -434,7 +444,7 @@ class AIProcessor:
             return self.results, self.current_patient_info
 
     def run(self):
-        print("[DEBUG] AI Worker Loop Started.")
+        print("[DEBUG] AI Worker Loop Started (with Stability Logic).")
         
         while not self.stopped:
             with self.lock:
@@ -450,14 +460,16 @@ class AIProcessor:
             
             final_detections = []
             detected_pills_raw = [] 
-            valid_pills = [] # Pills that are good enough to verify packs
+            valid_pills = []
+            
+            # [NEW] Set เพื่อจดจำว่าเฟรมนี้เจอตัวไหนบ้าง (ใช้สำหรับ Reset ตัวที่ไม่เจอ)
+            found_in_this_frame = set()
 
             try:
                 # --- 1. DETECT PILLS ---
                 pill_res = model_pill(frame_yolo, verbose=False, conf=CONF_PILL, 
                                      imgsz=AI_IMG_SIZE, max_det=10, agnostic_nms=True)
                 
-                # Assumption Logic Helper
                 best_pill_score = -1
                 best_pill_name = None
 
@@ -478,7 +490,6 @@ class AIProcessor:
                     
                     cx, cy = (x1+x2)>>1, (y1+y2)>>1
                     
-                    # Store for assumption
                     if "?" not in nm and "Unknown" not in nm and sc > best_pill_score:
                         best_pill_score = sc
                         best_pill_name = nm
@@ -495,16 +506,22 @@ class AIProcessor:
                     if best_pill_name and ("?" in nm or "Unknown" in nm or sc < SCORE_PASS_PILL):
                         nm, sc = best_pill_name, best_pill_score
                     
-                    # --- LOGIC #1: Auto-Tick Pill ---
+                    clean_name = nm.lower()
+                    
+                    # --- LOGIC #1: Auto-Tick Pill (STABILIZED) ---
                     if "?" not in nm and "Unknown" not in nm and sc >= SCORE_PASS_PILL:
-                        prescription_state.verify_drug(nm.lower())
-                        self.update_remaining_drugs()
+                        # [NEW] Increment Counter
+                        self.consistency_counter[clean_name] = self.consistency_counter.get(clean_name, 0) + 1
+                        found_in_this_frame.add(clean_name)
+                        
+                        # [NEW] Check Threshold
+                        if self.consistency_counter[clean_name] >= CONSISTENCY_THRESHOLD:
+                            prescription_state.verify_drug(clean_name)
+                            self.update_remaining_drugs()
 
-                    # Check verification status
-                    is_verified = prescription_state.is_verified(nm.lower())
+                    is_verified = prescription_state.is_verified(clean_name)
                     
                     if "?" not in nm and "Unknown" not in nm:
-                        # Add to valid list for Pack checking
                         valid_pills.append({
                             'name': nm, 'center': pill['center'], 'verified': is_verified, 'score': sc
                         })
@@ -533,26 +550,36 @@ class AIProcessor:
                                               session_packs=self.sess_mat_packs,
                                               session_packs_lbl=self.sess_lbl_packs)
                     
-                    # --- LOGIC #2: Auto-Tick Pack (Native) ---
                     clean_name = nm.replace("_pack", "").lower()
+                    
+                    # --- LOGIC #2: Auto-Tick Pack (STABILIZED) ---
                     if "?" not in nm and "Unknown" not in nm and sc >= SCORE_PASS_PACK:
-                        prescription_state.verify_drug(clean_name)
-                        self.update_remaining_drugs()
+                        # [NEW] Increment Counter
+                        self.consistency_counter[clean_name] = self.consistency_counter.get(clean_name, 0) + 1
+                        found_in_this_frame.add(clean_name)
+                        
+                        if self.consistency_counter[clean_name] >= CONSISTENCY_THRESHOLD:
+                            prescription_state.verify_drug(clean_name)
+                            self.update_remaining_drugs()
                     
                     # --- LOGIC #3: Check for Inner Pill (Inheritance) ---
                     pack_verified = prescription_state.is_verified(clean_name)
                     
                     for pill in valid_pills:
                         if is_point_in_box(pill['center'], (x1, y1, x2, y2)):
-                            # Found a pill inside this pack
                             if pill['score'] >= SCORE_PASS_PILL or pill['verified']:
                                 # TRUST THE PILL -> Force Verify Pack
                                 pack_verified = True
-                                nm = pill['name'] # Override Name
-                                sc = max(sc, pill['score']) # Boost Score
+                                nm = pill['name']
+                                sc = max(sc, pill['score'])
+                                clean_name_pill = nm.lower()
                                 
-                                # Auto-tick based on inner pill
-                                prescription_state.verify_drug(nm.lower())
+                                # [NEW] Force Stability for Inheritance
+                                # ถ้าเจอยาข้างในชัดเจน ให้ถือว่า Pack นั้นเสถียรทันที
+                                self.consistency_counter[clean_name_pill] = CONSISTENCY_THRESHOLD + 1
+                                found_in_this_frame.add(clean_name_pill)
+                                
+                                prescription_state.verify_drug(clean_name_pill)
                                 self.update_remaining_drugs()
                                 break
                     
@@ -561,6 +588,13 @@ class AIProcessor:
                         'verified': pack_verified,
                         'box': (x1, y1, x2, y2)
                     })
+
+                # [NEW] CLEANUP: Reset counters for items not seen in this frame
+                # ถ้าเฟรมนี้หายไป ให้ reset counter เป็น 0 ทันที (หรือลดลงทีละนิดก็ได้ถ้าต้องการ decaying)
+                all_tracked = list(self.consistency_counter.keys())
+                for k in all_tracked:
+                    if k not in found_in_this_frame:
+                        self.consistency_counter[k] = 0
 
                 with self.lock: 
                     self.results = final_detections
