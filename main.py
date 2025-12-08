@@ -251,7 +251,7 @@ def trinity_inference(img_crop, is_pill=True, custom_matrix=None, custom_labels=
                 dist = np.linalg.norm(norm_diff)
                 color_score = np.clip(np.exp(-3.0 * dist), 0, 1)
                 
-            w_vec, w_sift, w_col = (0.3, 0.1, 0.6) if is_pill else (0.3, 0.7, 0.0)
+            w_vec, w_sift, w_col = (0.3, 0.1, 0.6) if is_pill else (0.0, 1.0, 0.0)
             total = (vec_score * w_vec) + (sift_score * w_sift) + (color_score * w_col)
             if total > best_score: best_score = total; final_name = clean_name
 
@@ -398,51 +398,6 @@ def draw_patient_info(frame, patient_data):
         y = 35 + (i * line_h)
         cv2.putText(frame, line, (start_x+15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
 
-def draw_summary_box(frame, results):
-    H, W = frame.shape[:2]
-    if not results:
-        text = "Analyzing..."
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        scale = 2.0
-        (tw, th), _ = cv2.getTextSize(text, font, scale, 3)
-        cv2.putText(frame, text, ((W-tw)//2, H-50), font, scale, (200,200,200), 3)
-        return
-
-    summary = {}
-    for r in results:
-        name = r['label'].replace("?", "")
-        score = r['score']
-        if name not in summary: summary[name] = []
-        summary[name].append(score)
-
-    box_w = 550; line_h = 55; padding = 25
-    total_lines = len(summary) + 1
-    total_h = (total_lines * line_h) + (padding * 2)
-    start_x = W - box_w - 20; start_y = H - total_h - 20
-    
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (start_x, start_y), (W-20, H-20), (0,0,0), -1)
-    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
-    cv2.rectangle(frame, (start_x, start_y), (W-20, H-20), (255,255,255), 2)
-    cv2.putText(frame, "DETECTED ITEMS", (start_x+25, start_y+45), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,255,255), 3)
-    cv2.line(frame, (start_x+25, start_y+60), (W-45, start_y+60), (200,200,200), 2)
-
-    for i, (name, scores) in enumerate(summary.items()):
-        count = len(scores)
-        avg = sum(scores)/count
-        color = (0, 255, 0)
-        display_name = name
-        
-        # Logic การแสดงผลสรุป
-        if avg < SCORE_PASS_PILL: # ใช้เกณฑ์ต่ำสุดเป็นตัวเตือน
-             color = (255, 255, 0); display_name = f"{name} (?)"
-        if "Unknown" in name: 
-             color = (100, 100, 255); display_name = "Unknown"
-
-        y = start_y + 110 + (i * line_h)
-        text = f"{display_name} : {count} ({avg:.0%})"
-        cv2.putText(frame, text, (start_x+25, y), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
-
 def draw_boxes_on_items(frame, results):
     for r in results:
         x1, y1, x2, y2 = r['box']
@@ -490,7 +445,6 @@ def main():
             results, cur_patient = ai.get_results()
             
             draw_boxes_on_items(display, results)
-            draw_summary_box(display, results)
             if cur_patient: draw_patient_info(display, cur_patient)
             
             curr_time = time.time()
