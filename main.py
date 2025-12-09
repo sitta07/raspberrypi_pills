@@ -22,7 +22,7 @@ except ImportError:
 
 # ================= CONFIGURATION =================
 # Paths
-MODEL_PILL_PATH = 'models/pills_box.pt'          
+MODEL_PILL_PATH = 'models/pills_seg.pt'          
 MODEL_PACK_PATH = 'models/seg_best_process.pt'
 DB_FILES = {
     'pills': {'vec': 'database/db_seg_pills/db_pills.pkl', 'col': 'database/db_seg_pills/colors_pills.pkl'},
@@ -36,10 +36,10 @@ DISPLAY_W, DISPLAY_H = 1280, 720
 AI_IMG_SIZE = 416 
 
 # Thresholds
-CONF_PILL = 0.1    
-CONF_PACK = 1   #0.5  
+CONF_PILL = 0.25    
+CONF_PACK = 0.5     
 SCORE_PASS_PILL = 0.2
-SCORE_PASS_PACK = 1 #0.5
+SCORE_PASS_PACK = 0.6
 
 # --- SENIOR UPGRADES ---
 CONSISTENCY_THRESHOLD = 3   # ลดลงเหลือ 3 เพื่อให้ตัดเร็วขึ้น (Responsiveness)
