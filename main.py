@@ -25,8 +25,8 @@ except ImportError:
 MODEL_PILL_PATH = 'models/pills_box.pt'          
 MODEL_PACK_PATH = 'models/seg_best_process.pt'
 DB_FILES = {
-    'pills': {'vec': 'database/db_seg_pills/db_pills.pkl', 'col': 'database/db_seg_pills/colors_pills.pkl'},
-    'packs': {'vec': 'database/db_seg_pills/db_packs.pkl', 'col': 'database/db_seg_pills/colors_packs.pkl'}
+    'pills': {'vec': 'database/model_register/db_pills.pkl', 'col': 'database/model_register/colors_pills.pkl'},
+    'packs': {'vec': 'database/model_register/db_packs.pkl', 'col': 'database/model_register/colors_packs.pkl'}
 }
 
 IMG_DB_FOLDER = 'database_images'
