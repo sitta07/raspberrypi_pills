@@ -222,7 +222,8 @@ class TrinityEngine:
     def _load_color_db(self):
         db = {}
         for k in ['pills', 'packs']:
-            try: with open(self.cfg.DB_FILES[k]['col'], 'rb') as f: db.update(pickle.load(f))
+            try: 
+                with open(self.cfg.DB_FILES[k]['col'], 'rb') as f: db.update(pickle.load(f))
             except: pass
         return db
 
