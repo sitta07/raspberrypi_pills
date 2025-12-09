@@ -5,7 +5,7 @@ import threading
 import pickle
 import logging
 from dataclasses import dataclass, field
-from typing import List, Tuple, Dict, Set, Optional, Any, Union
+from typing import List, Tuple, Dict, Set, Optional
 
 import cv2
 import numpy as np
@@ -14,23 +14,22 @@ from torchvision import models, transforms
 from PIL import Image
 from ultralytics import YOLO
 
-# SAHI IMPORTS
-try:
-    from sahi import AutoDetectionModel
-    from sahi.predict import get_sliced_prediction
-    from sahi.prediction import ObjectPrediction
-    HAS_SAHI = True
-except ImportError:
-    HAS_SAHI = False
-    print("⚠️ Warning: SAHI not installed. Running in standard YOLO mode.")
-
 # ================= ENVIRONMENT SETUP =================
+# Optimizations for Raspberry Pi 5
 os.environ["QT_QPA_PLATFORM"] = "xcb"
 os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
-os.environ["OMP_NUM_THREADS"] = "3"
+os.environ["OMP_NUM_THREADS"] = "3" # Limit threads to prevent freezing
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
+
+# Try importing Picamera2
+try:
+    from picamera2 import Picamera2
+    HAS_PICAM2 = True
+except ImportError:
+    HAS_PICAM2 = False
+    logger.warning("Picamera2 not found. Using Standard OpenCV.")
 
 # ================= CONFIGURATION =================
 @dataclass
@@ -38,23 +37,20 @@ class AppConfig:
     # Hardware / Display
     DISPLAY_W: int = 1280
     DISPLAY_H: int = 720
-    AI_IMG_SIZE: int = 416 # Size for Standard YOLO
+    AI_IMG_SIZE: int = 416 # Standard YOLO size for speed
     DEVICE: str = "cpu"
     
-    # SAHI Configuration (Optimized for Pi 5)
-    USE_SAHI: bool = True     # Toggle SAHI on/off
-    SAHI_SLICE_H: int = 320   # เล็กลงเพื่อความเร็ว (Standard 512)
-    SAHI_SLICE_W: int = 320
-    SAHI_OVERLAP_H: float = 0.1 # ลด Overlap เพื่อลดจำนวน Inference
-    SAHI_OVERLAP_W: float = 0.1
-    
     # Thresholds
-    CONF_PILL: float = 0.25   # SAHI แม่นขึ้น อาจต้องเพิ่ม Conf นิดหน่อย
-    CONF_PACK: float = 0.85
-    SCORE_PASS_PILL: float = 0.2
-    SCORE_PASS_PACK: float = 0.2
+    CONF_PILL: float = 0.25 # Lower slightly, let verification filter it
+    CONF_PACK: float = 0.80
+    SCORE_PASS_PILL: float = 0.35 # Trinity needs to be sure
+    SCORE_PASS_PACK: float = 0.25
     MAX_OBJ_AREA_RATIO: float = 0.40
-    CONSISTENCY_THRESHOLD: int = 2
+    CONSISTENCY_THRESHOLD: int = 2 
+    
+    # Image Enhancement (God-Tier Tech)
+    USE_CLAHE: bool = True       # Turn on smart contrast
+    USE_SHARPEN: bool = True     # Turn on edge sharpening
     
     # Paths
     MODEL_PILL_PATH: str = 'models/pills_seg.pt'
@@ -67,7 +63,7 @@ class AppConfig:
         'packs': {'vec': 'database/model_register/db_packs.pkl', 'col': 'database/model_register/colors_packs.pkl'}
     })
 
-    WEIGHTS_PILL: Tuple[float, float, float] = (0.5, 0.4, 0.1)
+    WEIGHTS_PILL: Tuple[float, float, float] = (0.5, 0.4, 0.1) # Vec, SIFT, Color
     WEIGHTS_PACK: Tuple[float, float, float] = (0.2, 0.8, 0.0)
 
 # ================= DATA STRUCTURES =================
@@ -81,7 +77,7 @@ class DetectionResult:
     is_wrong: bool = False
     clean_name: str = ""
 
-# ================= CAMERA & UTILS (Same as before) =================
+# ================= 1. SYSTEM UTILS =================
 class SystemMonitor:
     @staticmethod
     def get_cpu_temperature() -> str:
@@ -91,6 +87,42 @@ class SystemMonitor:
         except FileNotFoundError:
             return "N/A"
 
+# ================= 2. IMAGE ENHANCER (THE GOD TIER) =================
+class ImageEnhancer:
+    """Techniques to make pills pop out from the background"""
+    
+    def __init__(self):
+        # CLAHE: Contrast Limited Adaptive Histogram Equalization
+        self.clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8,8))
+        
+        # Sharpening Kernel
+        self.sharpen_kernel = np.array([[-1, -1, -1],
+                                        [-1,  9, -1],
+                                        [-1, -1, -1]])
+
+    def enhance(self, bgr_image):
+        """Apply enhancement pipeline"""
+        # 1. Sharpening (Edges pop)
+        sharp = cv2.filter2D(bgr_image, -1, self.sharpen_kernel)
+        
+        # 2. LAB Color Space for CLAHE (Lighting balance)
+        lab = cv2.cvtColor(sharp, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        l2 = self.clahe.apply(l) # Apply only to Lightness channel
+        lab = cv2.merge((l2, a, b))
+        enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+        
+        return enhanced
+
+    def crop_enhance(self, crop):
+        """Specific enhancer for small crops (Stronger)"""
+        # Denoise slightly first
+        clean = cv2.fastNlMeansDenoisingColored(crop, None, 3, 3, 7, 21)
+        # Add Detail
+        detail = cv2.detailEnhance(clean, sigma_s=10, sigma_r=0.15)
+        return detail
+
+# ================= 3. CAMERA MODULE (STABLE) =================
 class CameraStream:
     def __init__(self, width: int, height: int):
         self.width = width
@@ -99,34 +131,76 @@ class CameraStream:
         self.frame = None
         self.grabbed = False
         self.lock = threading.Lock()
-        self.cam = cv2.VideoCapture(0)
-        self.cam.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        self.cam.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        self.picam2 = None
+        self.cam = None
 
     def start(self):
+        logger.info("Initializing Camera...")
+        
+        # Priority 1: Picamera2 (Direct MIPI - Fast)
+        if HAS_PICAM2:
+            try:
+                self.picam2 = Picamera2()
+                config = self.picam2.create_preview_configuration(
+                    main={"size": (self.width, self.height), "format": "RGB888"},
+                    controls={"FrameDurationLimits": (33333, 33333)} # Target 30fps
+                )
+                self.picam2.configure(config)
+                self.picam2.start()
+                time.sleep(1.0) # Warmup
+                logger.info("✅ Picamera2 Started.")
+            except Exception as e:
+                logger.error(f"Picamera2 Failed: {e}. Switching to OpenCV.")
+                self._init_opencv()
+        else:
+            self._init_opencv()
+
         threading.Thread(target=self.update, daemon=True).start()
         return self
 
+    def _init_opencv(self):
+        # Priority 2: OpenCV (USB / Legacy)
+        self.cam = cv2.VideoCapture(0)
+        self.cam.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        self.cam.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        self.cam.set(cv2.CAP_PROP_FPS, 30)
+
     def update(self):
         while not self.stopped:
-            ret, frame = self.cam.read()
-            if ret:
-                with self.lock:
-                    self.frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    self.grabbed = True
-            else:
+            try:
+                if self.picam2:
+                    frame = self.picam2.capture_array()
+                    if frame is not None:
+                        with self.lock:
+                            self.frame = frame # Already RGB
+                            self.grabbed = True
+                    else:
+                        self.stopped = True
+                elif self.cam:
+                    ret, frame = self.cam.read()
+                    if ret:
+                        with self.lock:
+                            self.frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            self.grabbed = True
+            except:
                 self.stopped = True
+                break
 
     def read(self) -> Optional[np.ndarray]:
         with self.lock:
-            return self.frame if self.grabbed else None
+            return self.frame.copy() if self.grabbed else None # Return copy to be safe
 
     def stop(self):
         self.stopped = True
-        self.cam.release()
+        if self.picam2:
+            self.picam2.stop()
+            self.picam2.close()
+        if self.cam:
+            self.cam.release()
 
-# ================= LOGIC MODULES (Patient & Trinity) =================
+# ================= 4. LOGIC MODULES =================
 class PatientManager:
+    """Handles Prescription Logic"""
     def __init__(self, his_path: str):
         self.his_path = his_path
         self.current_patient: Optional[Dict] = None
@@ -172,40 +246,54 @@ class PatientManager:
     def verify_drug(self, drug_name: str):
         with self.lock:
             if drug_name in self.verified_drugs: return
-            for target in self.all_drugs:
-                if target == drug_name:
-                    self.verified_drugs.add(target)
-                    return
+            # Try exact match first
+            if drug_name in self.all_drugs:
+                self.verified_drugs.add(drug_name)
+                return
+            # Allow verification of detected name
             self.verified_drugs.add(drug_name)
 
     def is_verified(self, drug_name: str) -> bool:
         with self.lock: return drug_name in self.verified_drugs
 
 class TrinityEngine:
+    """Identification Engine"""
     def __init__(self, config: AppConfig):
         self.cfg = config
         self.device = torch.device(config.DEVICE)
+        
+        # Load DBs
         self.pills_vecs, self.pills_lbls = self._load_pkl_db(config.DB_FILES['pills']['vec'])
         self.packs_vecs, self.packs_lbls = self._load_pkl_db(config.DB_FILES['packs']['vec'])
         self.color_db = self._load_color_db()
+        
+        # Tensors
         self.matrix_pills = self._prep_tensor(self.pills_vecs)
         self.matrix_packs = self._prep_tensor(self.packs_vecs)
+        
+        # SIFT
         self.sift = cv2.SIFT_create(nfeatures=100)
         self.bf = cv2.BFMatcher(crossCheck=False)
         self.sift_db = self._load_sift_db()
+
+        # Models
         self._init_models()
 
     def _init_models(self):
-        weights = models.ResNet50_Weights.DEFAULT
-        base_model = models.resnet50(weights=weights)
-        self.embedder = torch.nn.Sequential(*list(base_model.children())[:-1])
-        self.embedder.eval().to(self.device)
-        self.preprocess = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
-        torch.set_grad_enabled(False)
+        try:
+            weights = models.ResNet50_Weights.DEFAULT
+            base_model = models.resnet50(weights=weights)
+            self.embedder = torch.nn.Sequential(*list(base_model.children())[:-1])
+            self.embedder.eval().to(self.device)
+            self.preprocess = transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+            torch.set_grad_enabled(False)
+        except Exception as e:
+            logger.critical(f"Model Init Error: {e}")
+            sys.exit(1)
 
     def _load_pkl_db(self, filepath):
         if not os.path.exists(filepath): return [], []
@@ -222,8 +310,7 @@ class TrinityEngine:
     def _load_color_db(self):
         db = {}
         for k in ['pills', 'packs']:
-            try: 
-                with open(self.cfg.DB_FILES[k]['col'], 'rb') as f: db.update(pickle.load(f))
+            try: with open(self.cfg.DB_FILES[k]['col'], 'rb') as f: db.update(pickle.load(f))
             except: pass
         return db
 
@@ -256,6 +343,7 @@ class TrinityEngine:
         if target_matrix is None: return "DB Error", 0.0
 
         try:
+            # 1. Vector Embeddings
             if is_pill: pil_img = Image.fromarray(img_crop)
             else:
                 gray = cv2.cvtColor(img_crop, cv2.COLOR_RGB2GRAY)
@@ -272,6 +360,8 @@ class TrinityEngine:
             top_k_val, top_k_idx = torch.topk(scores, k=k_val)
             candidates = []
             seen = set()
+            
+            # --- IMPORTANT: detach() used here for stability ---
             for idx, sc in zip(top_k_idx.detach().cpu().numpy(), top_k_val.detach().cpu().numpy()):
                 name = target_labels[idx]
                 if name not in seen:
@@ -279,13 +369,16 @@ class TrinityEngine:
                     seen.add(name)
                     if len(candidates) >= 3: break
 
+            # 2. SIFT & Color
             live_color = None
             gray = cv2.cvtColor(img_crop, cv2.COLOR_RGB2GRAY)
             _, des_live = self.sift.detectAndCompute(gray, None)
+            
             if is_pill:
                 h, w = img_crop.shape[:2]
                 center = img_crop[int(h*0.25):int(h*0.75), int(w*0.25):int(w*0.75)]
-                if center.size > 0: live_color = np.mean(cv2.cvtColor(center, cv2.COLOR_RGB2HSV), axis=(0,1))
+                if center.size > 0: 
+                    live_color = np.mean(cv2.cvtColor(center, cv2.COLOR_RGB2HSV), axis=(0,1))
 
             best_score = -1.0
             final_name = "Unknown"
@@ -293,6 +386,7 @@ class TrinityEngine:
 
             for name, vec_score in candidates:
                 clean = name.replace("_pill", "").replace("_pack", "")
+                
                 sift_score = 0.0
                 if des_live is not None and clean in self.sift_db:
                     max_good = 0
@@ -313,38 +407,27 @@ class TrinityEngine:
 
                 w_vec, w_sift, w_col = self.cfg.WEIGHTS_PILL if is_pill else self.cfg.WEIGHTS_PACK
                 total = vec_score * w_vec + sift_score * w_sift + col_score * w_col
-                if total > best_score: best_score, final_name = total, clean
+                
+                if total > best_score: 
+                    best_score = total
+                    final_name = clean
 
             return final_name, best_score
-        except: return "Error", 0.0
+        except Exception as e: 
+            logger.error(f"Trinity Error: {e}")
+            return "Error", 0.0
 
-# ================= 4. AI WORKER (UPDATED FOR SAHI) =================
+# ================= 5. AI WORKER (SMART ENHANCED) =================
 class AIProcessor:
     def __init__(self, config: AppConfig, patient_mgr: PatientManager, trinity: TrinityEngine):
         self.cfg = config
         self.patient_mgr = patient_mgr
         self.trinity = trinity
+        self.enhancer = ImageEnhancer() # Load Enhancer
         
-        logger.info("Loading Models...")
-        # 1. Standard YOLO for Packs (Always fast)
+        logger.info("Loading YOLO Models...")
+        self.model_pill = YOLO(config.MODEL_PILL_PATH, task='detect')
         self.model_pack = YOLO(config.MODEL_PACK_PATH, task='detect')
-        
-        # 2. Pill Model: Choose between SAHI or Standard
-        self.sahi_model = None
-        self.model_pill = None
-        
-        if HAS_SAHI and config.USE_SAHI:
-            logger.info("⚡ SAHI Enabled for Pills (Slicing Mode)")
-            # Load into SAHI Wrapper
-            self.sahi_model = AutoDetectionModel.from_pretrained(
-                model_type='yolov8',
-                model_path=config.MODEL_PILL_PATH,
-                confidence_threshold=config.CONF_PILL,
-                device=config.DEVICE # Important for Pi
-            )
-        else:
-            logger.info("⚡ Standard YOLO Enabled for Pills")
-            self.model_pill = YOLO(config.MODEL_PILL_PATH, task='detect')
         
         self.latest_frame = None
         self.results: List[DetectionResult] = []
@@ -371,12 +454,19 @@ class AIProcessor:
         return (area / total_area) <= self.cfg.MAX_OBJ_AREA_RATIO
 
     def _process_item(self, box, crop, is_pill: bool) -> DetectionResult:
+        # TECHNIQUE: ENHANCE CROP BEFORE IDENTIFYING
+        if is_pill and self.cfg.USE_SHARPEN:
+            crop = self.enhancer.crop_enhance(crop)
+
         raw_name, score = self.trinity.identify(crop, is_pill=is_pill)
         final_name, is_wrong = self.patient_mgr.check_rx_compliance(raw_name)
         clean_name = final_name.replace("WRONG: ", "").lower()
         verified = self.patient_mgr.is_verified(clean_name)
-        return DetectionResult(label=final_name, score=score, type='pill' if is_pill else 'pack',
-                               box=box, verified=verified, is_wrong=is_wrong, clean_name=clean_name)
+        
+        return DetectionResult(
+            label=final_name, score=score, type='pill' if is_pill else 'pack',
+            box=box, verified=verified, is_wrong=is_wrong, clean_name=clean_name
+        )
 
     def _run(self):
         logger.info(f"AI Loop Started on {self.cfg.DEVICE}")
@@ -390,15 +480,23 @@ class AIProcessor:
                 time.sleep(0.005)
                 continue
 
+            # TECHNIQUE: CLAHE ENHANCEMENT ON FRAME FOR YOLO
+            # This makes pills pop out from background for better detection
+            if self.cfg.USE_CLAHE:
+                frame_to_detect = self.enhancer.enhance(cv2.cvtColor(frame_hd, cv2.COLOR_RGB2BGR))
+                frame_to_detect = cv2.cvtColor(frame_to_detect, cv2.COLOR_BGR2RGB)
+            else:
+                frame_to_detect = frame_hd
+
+            frame_ai = cv2.resize(frame_to_detect, (self.cfg.AI_IMG_SIZE, self.cfg.AI_IMG_SIZE))
+            
             active_packs: List[DetectionResult] = []
             final_detections: List[DetectionResult] = []
             frame_found_names = set()
 
             try:
-                # --- PHASE 1: PACKS (Standard YOLO) ---
-                # Packs are large, SAHI is unnecessary overkill
-                frame_ai_pack = cv2.resize(frame_hd, (self.cfg.AI_IMG_SIZE, self.cfg.AI_IMG_SIZE))
-                res_pack = self.model_pack(frame_ai_pack, verbose=False, conf=self.cfg.CONF_PACK, 
+                # --- 1. PACKS ---
+                res_pack = self.model_pack(frame_ai, verbose=False, conf=self.cfg.CONF_PACK, 
                                            imgsz=self.cfg.AI_IMG_SIZE, agnostic_nms=True)[0]
                 
                 for box_data in res_pack.boxes.xyxy.detach().cpu().numpy().astype(int):
@@ -419,41 +517,16 @@ class AIProcessor:
                     active_packs.append(result)
                     final_detections.append(result)
 
-                # --- PHASE 2: PILLS (SAHI vs Standard) ---
-                pill_boxes = []
-                
-                if HAS_SAHI and self.cfg.USE_SAHI:
-                    # SAHI Inference on Full HD Frame (No Resize Needed)
-                    sahi_result = get_sliced_prediction(
-                        frame_hd, # Send original high-res frame
-                        self.sahi_model,
-                        slice_height=self.cfg.SAHI_SLICE_H,
-                        slice_width=self.cfg.SAHI_SLICE_W,
-                        overlap_height_ratio=self.cfg.SAHI_OVERLAP_H,
-                        overlap_width_ratio=self.cfg.SAHI_OVERLAP_W,
-                        verbose=0
-                    )
-                    
-                    # Convert SAHI results to list of [x1, y1, x2, y2]
-                    for prediction in sahi_result.object_prediction_list:
-                        # prediction.bbox is a BoundingBox object
-                        bbox = prediction.bbox.to_xyxy() # returns [x1, y1, x2, y2]
-                        x1, y1, x2, y2 = map(int, bbox)
-                        pill_boxes.append((x1, y1, x2, y2))
-                else:
-                    # Standard YOLO
-                    frame_ai_pill = cv2.resize(frame_hd, (self.cfg.AI_IMG_SIZE, self.cfg.AI_IMG_SIZE))
-                    res_pill = self.model_pill(frame_ai_pill, verbose=False, conf=self.cfg.CONF_PILL,
-                                               imgsz=self.cfg.AI_IMG_SIZE, max_det=30, agnostic_nms=True)[0]
-                    for box_data in res_pill.boxes.xyxy.detach().cpu().numpy().astype(int):
-                        x1, y1 = int(box_data[0] * self.scale_x), int(box_data[1] * self.scale_y)
-                        x2, y2 = int(box_data[2] * self.scale_x), int(box_data[3] * self.scale_y)
-                        pill_boxes.append((x1, y1, x2, y2))
+                # --- 2. PILLS ---
+                res_pill = self.model_pill(frame_ai, verbose=False, conf=self.cfg.CONF_PILL,
+                                           imgsz=self.cfg.AI_IMG_SIZE, max_det=30, agnostic_nms=True)[0]
 
-                # Process Pill Boxes
-                for (x1, y1, x2, y2) in pill_boxes:
+                for box_data in res_pill.boxes.xyxy.detach().cpu().numpy().astype(int):
+                    x1, y1 = int(box_data[0] * self.scale_x), int(box_data[1] * self.scale_y)
+                    x2, y2 = int(box_data[2] * self.scale_x), int(box_data[3] * self.scale_y)
+                    
                     if not self._is_valid_box((x1, y1, x2, y2)): continue
-                    if (x2-x1) < 20 or (y2-y1) < 20: continue # Skip noise
+                    if (x2-x1) < 20 or (y2-y1) < 20: continue
                     
                     cx, cy = (x1+x2)>>1, (y1+y2)>>1
                     parent_pack = next((p for p in active_packs if p.box[0] < cx < p.box[2] and p.box[1] < cy < p.box[3]), None)
@@ -470,16 +543,19 @@ class AIProcessor:
                     else:
                         crop = frame_hd[y1:y2, x1:x2]
                         if crop.size == 0: continue
+                        
+                        # Use Enhanced Crop Process
                         result = self._process_item((x1, y1, x2, y2), crop, is_pill=True)
+                        
                         if not result.is_wrong and result.score > self.cfg.SCORE_PASS_PILL and "Unknown" not in result.label:
                             frame_found_names.add(result.clean_name)
                             self.consistency_counter[result.clean_name] = self.consistency_counter.get(result.clean_name, 0) + 1
                             if self.consistency_counter[result.clean_name] >= self.cfg.CONSISTENCY_THRESHOLD:
                                 self.patient_mgr.verify_drug(result.clean_name)
                                 result.verified = True
+                    
                     final_detections.append(result)
 
-                # Reset consistency for missing items
                 for k in list(self.consistency_counter.keys()):
                     if k not in frame_found_names: self.consistency_counter[k] = 0
 
@@ -490,7 +566,7 @@ class AIProcessor:
 
     def stop(self): self.stopped = True
 
-# ================= 5. MAIN APP =================
+# ================= 6. MAIN APP =================
 class PillTrackApp:
     def __init__(self):
         self.cfg = AppConfig()
@@ -498,7 +574,7 @@ class PillTrackApp:
         self.patient_mgr = PatientManager(self.cfg.HIS_FILE_PATH)
         self.trinity = TrinityEngine(self.cfg)
         self.ai = AIProcessor(self.cfg, self.patient_mgr, self.trinity)
-        self.window_name = "PillTrack Senior + SAHI"
+        self.window_name = "PillTrack Senior (Enhanced)"
         self.target_hn = "HN-101"
 
     def draw_ui(self, frame, results):
@@ -509,17 +585,29 @@ class PillTrackApp:
             elif r.verified: color, text = (0, 255, 0), f"OK {r.label}"
             elif r.type == 'pack' and r.score >= self.cfg.SCORE_PASS_PACK: color = (0, 255, 0)
             elif "Unknown" in r.label: color = (50, 50, 50)
+            
+            # Fancy Box with transparency effect optional
             cv2.rectangle(frame, (r.box[0], r.box[1]), (r.box[2], r.box[3]), color, 2)
-            cv2.putText(frame, f"{text} {r.score:.0%}", (r.box[0], r.box[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        cv2.putText(frame, f"Temp: {SystemMonitor.get_cpu_temperature()}", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+            cv2.putText(frame, f"{text} {r.score:.0%}", (r.box[0], r.box[1]-10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        
+        # UI Info
+        temp = SystemMonitor.get_cpu_temperature()
+        cv2.putText(frame, f"Temp: {temp} | Enhancements: ON", (30, 50), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
     def run(self):
         self.camera.start()
+        # Warmup delay to prevent race conditions
+        time.sleep(1.0)
         self.ai.start()
+        
         db = self.patient_mgr.load_his_database()
         if self.target_hn in db: self.patient_mgr.set_patient(db[self.target_hn])
         
+        logger.info("⏳ Waiting for camera feed...")
         while self.camera.read() is None: time.sleep(0.1)
+        
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(self.window_name, self.cfg.DISPLAY_W, self.cfg.DISPLAY_H)
         
@@ -528,6 +616,7 @@ class PillTrackApp:
             while True:
                 frame = self.camera.read()
                 if frame is None: time.sleep(0.01); continue
+                
                 self.ai.update_frame(frame.copy())
                 results, _ = self.ai.get_results()
                 self.draw_ui(frame, results)
@@ -535,7 +624,7 @@ class PillTrackApp:
                 curr_time = time.time()
                 fps = 1 / (curr_time - prev_time) if (curr_time - prev_time) > 0 else 0
                 prev_time = curr_time
-                cv2.putText(frame, f"FPS: {fps:.1f}", (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                cv2.putText(frame, f"FPS: {fps:.1f}", (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 
                 cv2.imshow(self.window_name, frame)
                 key = cv2.waitKey(1) & 0xFF
@@ -543,10 +632,12 @@ class PillTrackApp:
                 if key == ord('r'):
                     db = self.patient_mgr.load_his_database()
                     self.patient_mgr.set_patient(db.get(self.target_hn))
+                    logger.info("Reloaded Prescription")
         finally:
             self.camera.stop()
             self.ai.stop()
             cv2.destroyAllWindows()
+            logger.info("System Shutdown.")
 
 if __name__ == "__main__":
     PillTrackApp().run()
