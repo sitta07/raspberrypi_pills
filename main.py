@@ -350,7 +350,7 @@ class TrinityEngine:
             
             candidates = []
             seen = set()
-            for idx, sc in zip(top_k_idx.cpu().numpy(), top_k_val.cpu().numpy()):
+            for idx, sc in zip(top_k_idx.detach().cpu().numpy(), top_k_val.detach().cpu().numpy()):
                 name = target_labels[idx]
                 if name not in seen:
                     candidates.append((name, float(sc)))
@@ -487,7 +487,7 @@ class AIProcessor:
                 res_pack = self.model_pack(frame_ai, verbose=False, conf=self.cfg.CONF_PACK, 
                                            imgsz=self.cfg.AI_IMG_SIZE, agnostic_nms=True)[0]
                 
-                for box_data in res_pack.boxes.xyxy.cpu().numpy().astype(int):
+                for box_data in res_pack.boxes.xyxy.detach().cpu().numpy().astype(int):
                     x1, y1 = int(box_data[0] * self.scale_x), int(box_data[1] * self.scale_y)
                     x2, y2 = int(box_data[2] * self.scale_x), int(box_data[3] * self.scale_y)
                     
