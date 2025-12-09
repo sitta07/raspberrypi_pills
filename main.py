@@ -18,7 +18,7 @@ os.environ["OMP_NUM_THREADS"] = "3"
 try:
     from picamera2 import Picamera2
 except ImportError:
-    print("⚠️ Warning: Picamera2 not found.")
+    print("⚠️ Warning: Picamera2 not found. Will use OpenCV standard capture.")
 
 # ================= CONFIGURATION =================
 # Paths
@@ -40,10 +40,10 @@ AI_IMG_SIZE = 416
 CONF_PILL = 0.25    
 CONF_PACK = 0.5     
 SCORE_PASS_PILL = 0.2
-SCORE_PASS_PACK = 0.6
+SCORE_PASS_PACK = 0.6  # คะแนนกล่องต้องเกินค่านี้ถึงจะเชื่อ
 
 # --- SENIOR UPGRADES ---
-CONSISTENCY_THRESHOLD = 3   # ลดลงเหลือ 3 เพื่อให้ตัดเร็วขึ้น (Responsiveness)
+CONSISTENCY_THRESHOLD = 3   
 MAX_OBJ_AREA_RATIO = 0.40   
 
 device = torch.device("cpu")
@@ -171,12 +171,12 @@ class PrescriptionState:
 
     def verify_drug(self, drug_name):
         with self.lock:
-            # ตรวจสอบแบบ Loose Match อีกครั้งตอน verify
+            # Check existing
             for verified in list(self.verified_drugs):
                 if verified == drug_name: return
 
             if drug_name not in self.verified_drugs:
-                # ลองหาว่าชื่อนี้ไป match กับตัวไหนใน list จริงๆ หรือไม่
+                # Direct match check
                 found = False
                 for target in self.all_drugs:
                     if target == drug_name:
@@ -413,11 +413,11 @@ class AIProcessor:
         return True
 
     def run(self):
-        print("[DEBUG] AI Worker Loop Started (RGB Mode) - Priority Pack > Pill")
+        print("[DEBUG] AI Worker Loop Started (Priority: High Conf Pack > Pill)")
         
         while not self.stopped:
             with self.lock:
-                frame_HD = self.latest_frame # RGB Frame
+                frame_HD = self.latest_frame 
                 self.latest_frame = None
             
             if frame_HD is None: 
@@ -460,17 +460,16 @@ class AIProcessor:
                     final_score = real_score
                     is_wrong_drug = False
                     
-                    # 2. RX Check for Pack (BIDIRECTIONAL CHECK)
+                    # RX Check for Pack
                     if self.is_rx_mode:
                         clean_real = real_name.replace("_pack", "").lower().strip()
                         allowed_drugs = [d.lower() for d in prescription_state.get_all_drugs()]
                         match_found = False
                         
                         for allowed in allowed_drugs:
-                            # แก้ไขตรงนี้: เช็ค 2 ทาง (AI อยู่ใน List หรือ List อยู่ใน AI)
                             if allowed in clean_real or clean_real in allowed:
                                 match_found = True
-                                final_name = allowed # ใช้ชื่อจาก List ทันที
+                                final_name = allowed 
                                 break
                         
                         if not match_found and "?" not in real_name and "Unknown" not in real_name:
@@ -480,7 +479,7 @@ class AIProcessor:
 
                     clean_name = final_name.replace("_pack", "").lower()
 
-                    # 3. Register Valid Pack
+                    # Register Valid Pack
                     if not is_wrong_drug and "?" not in final_name and "Unknown" not in final_name and final_score >= SCORE_PASS_PACK:
                         self.consistency_counter[clean_name] = self.consistency_counter.get(clean_name, 0) + 1
                         found_in_this_frame.add(clean_name)
@@ -499,7 +498,7 @@ class AIProcessor:
                     final_detections.append(pack_data)
 
                 # ==========================================
-                # PHASE 2: DETECT PILLS
+                # PHASE 2: DETECT PILLS (CONDITIONAL TRUST LOGIC)
                 # ==========================================
                 pill_res = model_pill(frame_yolo, verbose=False, conf=CONF_PILL, 
                                      imgsz=AI_IMG_SIZE, max_det=20, agnostic_nms=True)
@@ -526,7 +525,9 @@ class AIProcessor:
                     is_wrong_drug = False
                     is_verified = False
 
-                    if parent_pack:
+                    # >>> LOGIC UPDATED HERE <<<
+                    # Only trust the pack if its score is HIGH enough
+                    if parent_pack and parent_pack['score'] >= SCORE_PASS_PACK:
                         # TRUST PACK
                         final_name = parent_pack['label'] 
                         final_score = parent_pack['score'] 
@@ -539,7 +540,7 @@ class AIProcessor:
                              found_in_this_frame.add(clean_name)
 
                     else:
-                        # TRINITY FALLBACK
+                        # TRUST PILL (TRINITY FALLBACK)
                         crop = frame_HD[y1:y2, x1:x2]
                         if crop.size > 0:
                             real_name, real_score = trinity_inference(crop, is_pill=True,
@@ -550,13 +551,12 @@ class AIProcessor:
                             final_name = real_name
                             final_score = real_score
 
-                            # RX CHECK FOR LOOSE PILL (BIDIRECTIONAL)
+                            # RX CHECK FOR PILL
                             if self.is_rx_mode:
                                 clean_real = real_name.lower().strip()
                                 allowed_drugs = [d.lower() for d in prescription_state.get_all_drugs()]
                                 match_found = False
                                 for allowed in allowed_drugs:
-                                    # แก้ไขตรงนี้: เช็ค 2 ทาง
                                     if allowed in clean_real or clean_real in allowed: 
                                         match_found = True
                                         final_name = allowed 
@@ -736,6 +736,7 @@ def main():
     window_name = "PillTrack Senior Edition (RGB888)"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, DISPLAY_W, DISPLAY_H) 
+    # cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN) # Uncomment for Fullscreen
 
     print(f"🎥 RUNNING... (RGB888 STRICT)")
     
@@ -758,6 +759,7 @@ def main():
             results, cur_patient = ai.get_results()
             draw_boxes_on_items(frame_rgb, results)
             
+            # Uncomment to show Patient Info Box
             # if cur_patient: 
             #     clickable_areas = draw_patient_info(frame_rgb, cur_patient)
             #     cv2.setMouseCallback(window_name, mouse_callback, (clickable_areas, ai))
