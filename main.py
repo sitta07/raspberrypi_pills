@@ -13,18 +13,20 @@ from PIL import Image
 # ================= FIX RASPBERRY PI ENVIRONMENT =================
 os.environ["QT_QPA_PLATFORM"] = "xcb"
 os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
-os.environ["OMP_NUM_THREADS"] = "2"    
+os.environ["OMP_NUM_THREADS"] = "3"    
 
 try:
     from picamera2 import Picamera2
 except ImportError:
-    print("⚠️ Warning: Picamera2 not found.")
+    print("⚠️ Warning: Picamera2 not found. Using OpenCV Fallback.")
 
 # ================= CONFIGURATION =================
 # Paths
 MODEL_PILL_PATH = 'models/pills_seg.pt'          
+MODEL_PACK_PATH = 'models/seg_best_process.pt'
 DB_FILES = {
-    'pills': {'vec': 'database/model_register/db_pills.pkl', 'col': 'database/model_register/colors_pills.pkl'}
+    'pills': {'vec': 'database/model_register/db_pills.pkl', 'col': 'database/model_register/colors_pills.pkl'},
+    'packs': {'vec': 'database/model_register/db_packs.pkl', 'col': 'database/model_register/colors_packs.pkl'}
 }
 
 IMG_DB_FOLDER = 'database_images'
@@ -32,18 +34,24 @@ HIS_FILE_PATH = 'prescription.txt'
 
 # Display & AI Resolution
 DISPLAY_W, DISPLAY_H = 1280, 720
-AI_IMG_SIZE = 384  # ลดขนาดเพื่อประสิทธิภาพบน RPi
+AI_IMG_SIZE = 416  # Keep small for RPi Speed
 
 # Thresholds
-CONF_PILL = 0.20    # เพิ่มเล็กน้อยเพื่อลด false positives
-SCORE_PASS_PILL = 0.25
+CONF_PILL = 0.15    # ต่ำไว้ก่อน เพื่อให้ detect เจอก่อน แล้วค่อยไปคัดด้วย score
+CONF_PACK = 0.60    # ปรับลงนิดหน่อยให้จับง่ายขึ้น
+SCORE_PASS_PILL = 0.2
+SCORE_PASS_PACK = 0.2
+
+# Limits
+MAX_DET_PILLS = 100 # เพิ่มเป็น 100 เพื่อให้โชว์ทุกเม็ดที่เจอ
+MAX_DET_PACKS = 10
 
 # --- SENIOR UPGRADES ---
 CONSISTENCY_THRESHOLD = 2   
-MAX_OBJ_AREA_RATIO = 0.40   
+MAX_OBJ_AREA_RATIO = 0.60   # เพิ่มให้รองรับกล่องใหญ่ขึ้น
 
 device = torch.device("cpu")
-print(f"🚀 SYSTEM STARTING ON: {device} (PILLS ONLY MODE)")
+print(f"🚀 SYSTEM STARTING ON: {device} (RGB888 STRICT MODE)")
 
 # ================= UTILS =================
 def get_cpu_temperature():
@@ -52,6 +60,11 @@ def get_cpu_temperature():
             return f"{float(f.read()) / 1000.0:.1f}C"
     except: 
         return "N/A"
+
+def is_point_in_box(point, box):
+    px, py = point
+    x1, y1, x2, y2 = box
+    return x1 < px < x2 and y1 < py < y2
 
 # ================= 1. WEBCAM STREAM (RGB888 ONLY) =================
 class WebcamStream:
@@ -95,8 +108,7 @@ class WebcamStream:
                         with self.lock:
                             self.frame = frame
                             self.grabbed = True
-                    else: 
-                        self.stopped = True
+                    else: self.stopped = True
                 else:
                     ret, frame = self.cam.read() 
                     if ret:
@@ -136,8 +148,7 @@ class HISLoader:
                     drugs = [d.strip().lower().replace('\ufeff', '') for d in parts[2].split(',') if d.strip()]
                     db[hn] = {'name': name, 'drugs': drugs}
             return db
-        except: 
-            return {}
+        except: return {}
 
 class PrescriptionState:
     def __init__(self):
@@ -163,10 +174,12 @@ class PrescriptionState:
 
     def verify_drug(self, drug_name):
         with self.lock:
+            # Check already verified
             for verified in list(self.verified_drugs):
                 if verified == drug_name: return
 
             if drug_name not in self.verified_drugs:
+                # Fuzzy/Direct Match Logic
                 found = False
                 for target in self.all_drugs:
                     if target == drug_name:
@@ -199,25 +212,26 @@ def load_pkl_to_list(filepath):
                 vecs, lbls = zip(*items)
                 return list(vecs), list(lbls)
             return [], []
-    except: 
-        return [], []
+    except: return [], []
 
 # Load Global DB
 pills_vecs, pills_lbls = load_pkl_to_list(DB_FILES['pills']['vec'])
+packs_vecs, packs_lbls = load_pkl_to_list(DB_FILES['packs']['vec'])
 
 matrix_pills = torch.tensor(np.array(pills_vecs), device=device, dtype=torch.float32) if pills_vecs else None
+matrix_packs = torch.tensor(np.array(packs_vecs), device=device, dtype=torch.float32) if packs_vecs else None
 
-if matrix_pills is not None: 
-    matrix_pills = matrix_pills / matrix_pills.norm(dim=1, keepdim=True)
+if matrix_pills is not None: matrix_pills = matrix_pills / matrix_pills.norm(dim=1, keepdim=True)
+if matrix_packs is not None: matrix_packs = matrix_packs / matrix_packs.norm(dim=1, keepdim=True)
 
 color_db = {}
-try:
-    with open(DB_FILES['pills']['col'], 'rb') as f: 
-        color_db.update(pickle.load(f))
-except: 
-    pass
+for db_type in ['pills', 'packs']:
+    try:
+        with open(DB_FILES[db_type]['col'], 'rb') as f: 
+            color_db.update(pickle.load(f))
+    except: pass
 
-sift = cv2.SIFT_create(nfeatures=80)  # ลดจาก 100 เพื่อประสิทธิภาพ
+sift = cv2.SIFT_create(nfeatures=100)
 bf = cv2.BFMatcher(crossCheck=False)
 sift_db = {}
 
@@ -226,26 +240,25 @@ if os.path.exists(IMG_DB_FOLDER):
         path = os.path.join(IMG_DB_FOLDER, folder)
         if not os.path.isdir(path): continue
         des_list = []
-        image_files = [x for x in os.listdir(path) if x.lower().endswith(('jpg', 'png', 'jpeg'))][:2]  # ลดจาก 3
+        image_files = [x for x in os.listdir(path) if x.lower().endswith(('jpg', 'png', 'jpeg'))][:3]
         for img_file in image_files:
             img = cv2.imread(os.path.join(path, img_file), cv2.IMREAD_GRAYSCALE)
             if img is not None:
-                if max(img.shape) > 400:  # ลดขนาดมากขึ้น
-                    scale = 400 / max(img.shape)
+                if max(img.shape) > 512:
+                    scale = 512 / max(img.shape)
                     img = cv2.resize(img, None, fx=scale, fy=scale)
                 _, des = sift.detectAndCompute(img, None)
-                if des is not None: 
-                    des_list.append(des)
+                if des is not None: des_list.append(des)
         if des_list:
             sift_db[folder] = des_list
 
 try:
-    model_pill = YOLO(MODEL_PILL_PATH, task='segment')  # เปลี่ยนเป็น segment
-    model_pill.overrides['imgsz'] = AI_IMG_SIZE
+    # --- CHANGE TASK TO SEGMENT BUT OPTIMIZE ---
+    model_pill = YOLO(MODEL_PILL_PATH, task='segment') 
+    model_pack = YOLO(MODEL_PACK_PATH, task='segment')
     
-    # ใช้ MobileNetV2 แทน ResNet50 เพื่อประสิทธิภาพบน RPi
-    weights = models.MobileNet_V2_Weights.DEFAULT
-    base_model = models.mobilenet_v2(weights=weights)
+    weights = models.ResNet50_Weights.DEFAULT
+    base_model = models.resnet50(weights=weights)
     embedder = torch.nn.Sequential(*list(base_model.children())[:-1])
     embedder.eval().to(device)
     del base_model
@@ -256,7 +269,6 @@ try:
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
     torch.set_grad_enabled(False)
-    print("✅ Models loaded successfully (Pills Segmentation Mode)")
 except Exception as e: 
     print(f"[CRITICAL] Model Error: {e}")
     sys.exit(1)
@@ -264,20 +276,33 @@ except Exception as e:
 # ================= 3. TRINITY ENGINE (RGB LOGIC) =================
 COLOR_NORM = np.array([90.0, 255.0, 255.0])
 SIFT_RATIO = 0.75
-SIFT_MAX_MATCHES = 12.0  # ลดลง
+SIFT_MAX_MATCHES = 15.0
 
-def trinity_inference(img_crop):
-    if matrix_pills is None: 
-        return "DB Error", 0.0
+def trinity_inference(img_crop, is_pill=True, 
+                      session_pills=None, session_pills_lbl=None,
+                      session_packs=None, session_packs_lbl=None):
+    
+    target_matrix = (session_pills if session_pills is not None else matrix_pills) if is_pill else \
+                    (session_packs if session_packs is not None else matrix_packs)
+    target_labels = (session_pills_lbl if session_pills_lbl is not None else pills_lbls) if is_pill else \
+                    (session_packs_lbl if session_packs_lbl is not None else packs_lbls)
+
+    if target_matrix is None: return "DB Error", 0.0
 
     try:
-        pil_img = Image.fromarray(img_crop) 
+        if is_pill: 
+            pil_img = Image.fromarray(img_crop) 
+        else:
+            gray_crop = cv2.cvtColor(img_crop, cv2.COLOR_RGB2GRAY)
+            crop_3ch_gray = cv2.merge([gray_crop, gray_crop, gray_crop])
+            pil_img = Image.fromarray(crop_3ch_gray)
+
         input_tensor = preprocess(pil_img).unsqueeze(0).to(device)
         live_vec = embedder(input_tensor).flatten()
         live_vec = live_vec / live_vec.norm()
         
-        scores = torch.matmul(live_vec, matrix_pills.T).squeeze(0)
-        k_val = min(8, len(pills_lbls))  # ลดจาก 10
+        scores = torch.matmul(live_vec, target_matrix.T).squeeze(0)
+        k_val = min(10, len(target_labels))
         if k_val == 0: return "Unknown", 0.0
         
         top_k_val, top_k_idx = torch.topk(scores, k=k_val)
@@ -285,28 +310,28 @@ def trinity_inference(img_crop):
         seen = set()
         
         for idx, sc in zip(top_k_idx.detach().cpu().numpy(), top_k_val.detach().cpu().numpy()):
-            name = pills_lbls[idx]
+            name = target_labels[idx]
             if name not in seen:
                 candidates.append((name, float(sc)))
                 seen.add(name)
-                if len(candidates) >= 3: 
-                    break
+                if len(candidates) >= 3: break
 
         live_color = None
         gray = cv2.cvtColor(img_crop, cv2.COLOR_RGB2GRAY)
         _, des_live = sift.detectAndCompute(gray, None)
         
-        h, w = img_crop.shape[:2]
-        center = img_crop[int(h*0.25):int(h*0.75), int(w*0.25):int(w*0.75)]
-        if center.size > 0:
-            hsv = cv2.cvtColor(center, cv2.COLOR_RGB2HSV)
-            live_color = np.mean(hsv, axis=(0,1))
+        if is_pill: 
+            h, w = img_crop.shape[:2]
+            center = img_crop[int(h*0.25):int(h*0.75), int(w*0.25):int(w*0.75)]
+            if center.size > 0:
+                hsv = cv2.cvtColor(center, cv2.COLOR_RGB2HSV)
+                live_color = np.mean(hsv, axis=(0,1))
 
         best_score = -1
         final_name = "Unknown"
         
         for name, vec_score in candidates:
-            clean_name = name.replace("_pill", "")
+            clean_name = name.replace("_pill", "").replace("_pack", "")
             
             sift_score = 0.0
             if des_live is not None and clean_name in sift_db:
@@ -316,19 +341,18 @@ def trinity_inference(img_crop):
                         matches = bf.knnMatch(des_live, ref_des, k=2)
                         good = sum(1 for m, n in matches if len([m, n]) == 2 and m.distance < SIFT_RATIO * n.distance)
                         max_good = max(max_good, good)
-                    except: 
-                        pass
+                    except: pass
                 sift_score = min(max_good / SIFT_MAX_MATCHES, 1.0)
                 
             color_score = 0.0
-            if live_color is not None and name in color_db:
+            if is_pill and live_color is not None and name in color_db:
                 diff = np.abs(live_color - color_db[name])
                 diff[0] = min(diff[0], 180 - diff[0]) 
                 norm_diff = diff / COLOR_NORM
                 dist = np.linalg.norm(norm_diff)
                 color_score = np.clip(np.exp(-3.0 * dist), 0, 1)
                 
-            w_vec, w_sift, w_col = 0.5, 0.4, 0.1
+            w_vec, w_sift, w_col = (0.5, 0.4, 0.1) if is_pill else (0.2, 0.8, 0.0)
             total = vec_score * w_vec + sift_score * w_sift + color_score * w_col
             
             if total > best_score: 
@@ -340,7 +364,7 @@ def trinity_inference(img_crop):
         print(f"[Trinity Error] {e}")
         return "Error", 0.0
 
-# ================= 4. AI WORKER (PILLS ONLY) =================
+# ================= 4. AI WORKER (SMART LOGIC) =================
 class AIProcessor:
     __slots__ = ('latest_frame', 'results', 'stopped', 'lock', 'is_rx_mode', 
                  'current_patient_info', 'scale_x', 'scale_y',
@@ -372,7 +396,6 @@ class AIProcessor:
                 prescription_state.load_drugs(drugs)
                 self.consistency_counter.clear()
                 print(f"🏥 Loaded: {patient_data['name']}")
-                print(f"📋 Prescription: {', '.join(drugs)}")
     
     def start(self): 
         threading.Thread(target=self.run, daemon=True).start()
@@ -395,11 +418,11 @@ class AIProcessor:
         return True
 
     def run(self):
-        print("[DEBUG] AI Worker Loop Started (PILLS ONLY MODE)")
+        print("[DEBUG] AI Worker Loop Started (Segmentation Models - Box Only Mode)")
         
         while not self.stopped:
             with self.lock:
-                frame_HD = self.latest_frame
+                frame_HD = self.latest_frame 
                 self.latest_frame = None
             
             if frame_HD is None: 
@@ -410,81 +433,172 @@ class AIProcessor:
                                    interpolation=self.resize_interpolation)
             
             final_detections = []
+            active_packs = [] 
             found_in_this_frame = set()
 
             try:
                 # ==========================================
-                # DETECT PILLS ONLY (SEGMENTATION)
+                # PHASE 1: DETECT PACKS
                 # ==========================================
-                pill_res = model_pill(frame_yolo, verbose=False, conf=CONF_PILL, 
-                                     imgsz=AI_IMG_SIZE, max_det=30, agnostic_nms=True)
+                # Optimization: retina_masks=False to save CPU
+                pack_res = model_pack(frame_yolo, verbose=False, conf=CONF_PACK, 
+                                     imgsz=AI_IMG_SIZE, max_det=MAX_DET_PACKS, 
+                                     agnostic_nms=True, retina_masks=False)
                 
-                # แสดงจำนวนที่เจอ
-                num_detected = len(pill_res[0].boxes) if pill_res[0].boxes is not None else 0
-                if num_detected > 0:
-                    print(f"🔍 Detected {num_detected} pills in frame")
-                
-                for i, box in enumerate(pill_res[0].boxes.xyxy.detach().cpu().numpy().astype(int)):
-                    x1_s, y1_s, x2_s, y2_s = box
-                    x1, y1 = int(x1_s * self.scale_x), int(y1_s * self.scale_y)
-                    x2, y2 = int(x2_s * self.scale_x), int(y2_s * self.scale_y)
-                    
-                    if not self.is_valid_detection((x1, y1, x2, y2), DISPLAY_W, DISPLAY_H):
-                        continue
-                    
-                    if (x2-x1) < 30 or (y2-y1) < 30: 
-                        continue
-                    
-                    crop = frame_HD[y1:y2, x1:x2]
-                    if crop.size == 0: 
-                        continue
-                    
-                    # Trinity Inference
-                    real_name, real_score = trinity_inference(crop)
-                    
-                    final_name = real_name
-                    final_score = real_score
-                    is_wrong_drug = False
-                    
-                    # RX Check (ถ้าอยู่ใน prescription mode)
-                    if self.is_rx_mode:
-                        clean_real = real_name.lower().strip()
-                        allowed_drugs = [d.lower() for d in prescription_state.get_all_drugs()]
-                        match_found = False
+                # Check if detected anything
+                if pack_res and len(pack_res[0].boxes) > 0:
+                    for box in pack_res[0].boxes.xyxy.detach().cpu().numpy().astype(int):
+                        x1_s, y1_s, x2_s, y2_s = box
+                        x1, y1 = int(x1_s * self.scale_x), int(y1_s * self.scale_y)
+                        x2, y2 = int(x2_s * self.scale_x), int(y2_s * self.scale_y)
                         
-                        for allowed in allowed_drugs:
-                            if allowed in clean_real or clean_real in allowed:
-                                match_found = True
-                                final_name = allowed
+                        # Filter out things that are too big (Screen Glare / Table)
+                        if not self.is_valid_detection((x1, y1, x2, y2), DISPLAY_W, DISPLAY_H):
+                            continue
+
+                        # Filter out things too small to be a pack
+                        if (x2-x1) < 50 or (y2-y1) < 50: continue
+
+                        crop = frame_HD[y1:y2, x1:x2]
+                        if crop.size == 0: continue
+                        
+                        real_name, real_score = trinity_inference(crop, is_pill=False,
+                                                  session_pills=matrix_pills, 
+                                                  session_pills_lbl=pills_lbls,
+                                                  session_packs=matrix_packs,
+                                                  session_packs_lbl=packs_lbls)
+                        
+                        # --- PRESCRIPTION FILTERING LOGIC ---
+                        # ถ้า detected class ชื่ออะไรที่สื่อถึง 'prescription' ให้ข้ามไปเลย 
+                        # ตรงนี้ assume ว่าถ้ามัน detect แล้วชื่อมันแปลกๆ หรือไม่ใช่ยา ให้ข้าม
+                        if "prescription" in real_name.lower() or "paper" in real_name.lower():
+                            continue 
+
+                        final_name = real_name
+                        final_score = real_score
+                        is_wrong_drug = False
+                        
+                        # RX Check
+                        if self.is_rx_mode:
+                            clean_real = real_name.replace("_pack", "").lower().strip()
+                            allowed_drugs = [d.lower() for d in prescription_state.get_all_drugs()]
+                            match_found = False
+                            
+                            for allowed in allowed_drugs:
+                                if allowed in clean_real or clean_real in allowed:
+                                    match_found = True
+                                    final_name = allowed 
+                                    break
+                            
+                            if not match_found and "?" not in real_name and "Unknown" not in real_name:
+                                final_name = f"WRONG: {real_name}"
+                                final_score = 0.0
+                                is_wrong_drug = True
+
+                        clean_name = final_name.replace("_pack", "").lower()
+
+                        if not is_wrong_drug and "?" not in final_name and "Unknown" not in final_name and final_score >= SCORE_PASS_PACK:
+                            self.consistency_counter[clean_name] = self.consistency_counter.get(clean_name, 0) + 1
+                            found_in_this_frame.add(clean_name)
+                            
+                            if self.consistency_counter[clean_name] >= CONSISTENCY_THRESHOLD:
+                                prescription_state.verify_drug(clean_name)
+                        
+                        pack_verified = prescription_state.is_verified(clean_name)
+                        
+                        pack_data = {
+                            'label': final_name, 'score': final_score, 'type': 'pack',
+                            'verified': pack_verified, 'box': (x1, y1, x2, y2), 'is_wrong': is_wrong_drug,
+                            'clean_name': clean_name
+                        }
+                        active_packs.append(pack_data)
+                        final_detections.append(pack_data)
+
+                # ==========================================
+                # PHASE 2: DETECT PILLS
+                # ==========================================
+                # Max det updated to MAX_DET_PILLS (100)
+                pill_res = model_pill(frame_yolo, verbose=False, conf=CONF_PILL, 
+                                     imgsz=AI_IMG_SIZE, max_det=MAX_DET_PILLS, 
+                                     agnostic_nms=True, retina_masks=False)
+                
+                if pill_res and len(pill_res[0].boxes) > 0:
+                    for box in pill_res[0].boxes.xyxy.detach().cpu().numpy().astype(int):
+                        x1_s, y1_s, x2_s, y2_s = box
+                        x1, y1 = int(x1_s * self.scale_x), int(y1_s * self.scale_y)
+                        x2, y2 = int(x2_s * self.scale_x), int(y2_s * self.scale_y)
+                        
+                        # Basic size filter
+                        if (x2-x1) < 15 or (y2-y1) < 15: continue
+                        
+                        cx, cy = (x1+x2)>>1, (y1+y2)>>1
+                        
+                        parent_pack = None
+                        for pack in active_packs:
+                            if is_point_in_box((cx, cy), pack['box']):
+                                parent_pack = pack
                                 break
                         
-                        if not match_found and "?" not in real_name and "Unknown" not in real_name:
-                            final_name = f"WRONG: {real_name}"
-                            final_score = 0.0
-                            is_wrong_drug = True
-                    
-                    clean_name = final_name.lower()
-                    
-                    # Register Valid Pills
-                    if not is_wrong_drug and "?" not in final_name and "Unknown" not in final_name and final_score >= SCORE_PASS_PILL:
-                        self.consistency_counter[clean_name] = self.consistency_counter.get(clean_name, 0) + 1
-                        found_in_this_frame.add(clean_name)
-                        
-                        if self.consistency_counter[clean_name] >= CONSISTENCY_THRESHOLD:
-                            prescription_state.verify_drug(clean_name)
-                    
-                    is_verified = prescription_state.is_verified(clean_name)
-                    
-                    final_detections.append({
-                        'label': final_name, 
-                        'score': final_score, 
-                        'type': 'pill',
-                        'verified': is_verified, 
-                        'box': (x1, y1, x2, y2), 
-                        'is_wrong': is_wrong_drug
-                    })
+                        final_name = "Unknown"
+                        final_score = 0.0
+                        is_wrong_drug = False
+                        is_verified = False
 
-                # Reset consistency counter สำหรับ items ที่หายไป
+                        if parent_pack:
+                            # Inherit from Pack
+                            final_name = parent_pack['label'] 
+                            final_score = parent_pack['score'] 
+                            is_wrong_drug = parent_pack['is_wrong']
+                            is_verified = parent_pack['verified']
+                            
+                            clean_name = parent_pack['clean_name']
+                            if not is_wrong_drug:
+                                 self.consistency_counter[clean_name] = self.consistency_counter.get(clean_name, 0) + 1
+                                 found_in_this_frame.add(clean_name)
+
+                        else:
+                            # Analyze Loose Pill
+                            crop = frame_HD[y1:y2, x1:x2]
+                            if crop.size > 0:
+                                real_name, real_score = trinity_inference(crop, is_pill=True,
+                                                          session_pills=matrix_pills,       
+                                                          session_pills_lbl=pills_lbls,
+                                                          session_packs=matrix_packs,
+                                                          session_packs_lbl=packs_lbls)
+                                final_name = real_name
+                                final_score = real_score
+
+                                if self.is_rx_mode:
+                                    clean_real = real_name.lower().strip()
+                                    allowed_drugs = [d.lower() for d in prescription_state.get_all_drugs()]
+                                    match_found = False
+                                    for allowed in allowed_drugs:
+                                        if allowed in clean_real or clean_real in allowed: 
+                                            match_found = True
+                                            final_name = allowed 
+                                            break
+                                    
+                                    if not match_found and "?" not in real_name and "Unknown" not in real_name:
+                                        final_name = f"WRONG: {real_name}"
+                                        # Show it anyway but marked as WRONG
+                                        is_wrong_drug = True
+
+                                clean_name = final_name.lower()
+                                if not is_wrong_drug and "?" not in final_name and "Unknown" not in final_name and final_score > SCORE_PASS_PILL:
+                                    self.consistency_counter[clean_name] = self.consistency_counter.get(clean_name, 0) + 1
+                                    found_in_this_frame.add(clean_name)
+                                    if self.consistency_counter[clean_name] >= CONSISTENCY_THRESHOLD:
+                                        prescription_state.verify_drug(clean_name)
+                                
+                                is_verified = prescription_state.is_verified(clean_name)
+
+                        # Add to display even if score is low (show all frames found)
+                        final_detections.append({
+                            'label': final_name, 'score': final_score, 'type': 'pill',
+                            'verified': is_verified, 'box': (x1, y1, x2, y2), 'is_wrong': is_wrong_drug
+                        })
+
+                # Cleanup old consistency counts
                 all_tracked = list(self.consistency_counter.keys())
                 for k in all_tracked:
                     if k not in found_in_this_frame:
@@ -501,11 +615,10 @@ class AIProcessor:
 
 # ================= 5. UI DRAWING (RGB COLORS) =================
 FONT = cv2.FONT_HERSHEY_SIMPLEX
-FONT_SCALE = 0.7
-FONT_SCALE_SMALL = 0.5
+FONT_SCALE = 0.8
+FONT_SCALE_SMALL = 0.5 # เล็กลงหน่อยเพื่อให้โชว์เลขได้ชัดตอนเม็ดเยอะๆ
 THICKNESS = 2
 THICKNESS_BOX = 2
-CHECKBOX_SIZE = 25
 
 RGB_GREEN = (0, 255, 0)
 RGB_RED   = (255, 0, 0)
@@ -513,9 +626,9 @@ RGB_BLUE  = (0, 0, 255)
 RGB_YELLOW = (255, 255, 0)
 RGB_WHITE = (255, 255, 255)
 RGB_GRAY  = (50, 50, 50)
-RGB_BLACK = (0, 0, 0)
 
 def draw_patient_info(frame, patient_data):
+    # ฟังก์ชันนี้ทำหน้าที่ "Print" ข้อมูลยาและคนไข้ขึ้นจอ โดยไม่ต้อง detect กล่องยา
     if not patient_data: return []
     
     H, W = frame.shape[:2]
@@ -532,6 +645,7 @@ def draw_patient_info(frame, patient_data):
     line_h = 45
     box_h = (len(header_lines) + len(all_drugs)) * line_h + 20
     
+    # Background for List
     cv2.rectangle(frame, (start_x, 0), (W, box_h), RGB_GRAY, -1)
     cv2.rectangle(frame, (start_x, 0), (W, box_h), RGB_YELLOW, 2)
     
@@ -540,6 +654,8 @@ def draw_patient_info(frame, patient_data):
         cv2.putText(frame, line, (start_x+15, y), FONT, FONT_SCALE, RGB_WHITE, THICKNESS)
     
     clickable_areas = []
+    CHECKBOX_SIZE = 25
+    
     for i, drug in enumerate(all_drugs):
         y_base = 35 + (len(header_lines) + i) * line_h
         checkbox_x = start_x + 15
@@ -555,23 +671,15 @@ def draw_patient_info(frame, patient_data):
             cv2.rectangle(frame, (checkbox_x + 3, checkbox_y + 3), 
                          (checkbox_x + CHECKBOX_SIZE - 3, checkbox_y + CHECKBOX_SIZE - 3), 
                          RGB_GREEN, -1)
-            cv2.line(frame, (checkbox_x + 6, checkbox_y + 14), 
-                    (checkbox_x + 11, checkbox_y + 20), RGB_WHITE, 4)
-            cv2.line(frame, (checkbox_x + 11, checkbox_y + 20), 
-                    (checkbox_x + 20, checkbox_y + 8), RGB_WHITE, 4)
-        else:
-            cv2.rectangle(frame, (checkbox_x + 3, checkbox_y + 3), 
-                         (checkbox_x + CHECKBOX_SIZE - 3, checkbox_y + CHECKBOX_SIZE - 3), 
-                         (60, 60, 60), -1)
         
         text_x = checkbox_x + CHECKBOX_SIZE + 10
         text_y = y_base
         drug_text = drug
         text_color = (100, 100, 100) if is_checked else RGB_WHITE
-        cv2.putText(frame, drug_text, (text_x, text_y), FONT, 0.7, text_color, THICKNESS)
+        cv2.putText(frame, drug_text, (text_x, text_y), FONT, 0.75, text_color, THICKNESS)
         
         if is_checked:
-            text_size = cv2.getTextSize(drug_text, FONT, 0.7, THICKNESS)[0]
+            text_size = cv2.getTextSize(drug_text, FONT, 0.75, THICKNESS)[0]
             cv2.line(frame, (text_x, text_y - 10), (text_x + text_size[0], text_y - 10), RGB_RED, 3)
         
         click_box = (checkbox_x - 5, checkbox_y - 5, checkbox_x + 300, checkbox_y + CHECKBOX_SIZE + 10)
@@ -580,37 +688,39 @@ def draw_patient_info(frame, patient_data):
     return clickable_areas
 
 def draw_boxes_on_items(frame, results):
-    """วาดกรอบทุก object ที่เจอ"""
     for r in results:
         x1, y1, x2, y2 = r['box']
         label = r['label']
         score = r['score']
+        obj_type = r.get('type', 'pill')
         is_verified = r.get('verified', False)
         is_wrong = r.get('is_wrong', False)
         
-        # เลือกสีและข้อความ
         if is_wrong:
             color = RGB_RED 
-            label_display = f"!! {label} !!"
+            label_display = f"X {label[:10]}" # ตัดคำให้สั้นลงหน่อยจะได้ไม่รก
         elif is_verified:
             color = RGB_GREEN
-            label_display = f"✓ {label}"
-        elif "?" in label or score < SCORE_PASS_PILL:
-            color = RGB_RED
+            label_display = f"OK"
+        elif obj_type == 'pack':
+            if score >= SCORE_PASS_PACK:
+                color = RGB_GREEN
+            else:
+                color = RGB_YELLOW
             label_display = label
+        elif score < SCORE_PASS_PILL:
+            # Low Score Pill -> Show as RED box but still show
+            color = RGB_RED
+            label_display = "?"
         else:
             color = RGB_YELLOW
-            label_display = label
+            label_display = label[:10]
 
-        # วาดกรอบ
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, THICKNESS_BOX)
-        
-        # วาดพื้นหลังสำหรับ label
-        label_text = f"{label_display} {score:.0%}"
-        (text_w, text_h), _ = cv2.getTextSize(label_text, FONT, FONT_SCALE_SMALL, THICKNESS)
-        cv2.rectangle(frame, (x1, y1-text_h-10), (x1+text_w+10, y1), color, -1)
-        cv2.putText(frame, label_text, (x1+5, y1-5), 
-                   FONT, FONT_SCALE_SMALL, RGB_BLACK, THICKNESS)
+        # Show label only if box is big enough
+        if (x2-x1) > 20:
+            cv2.putText(frame, f"{label_display}", (x1, y1-5), 
+                       FONT, FONT_SCALE_SMALL, color, 1)
 
 # ================= 6. MAIN =================
 def mouse_callback(event, x, y, flags, param):
@@ -636,18 +746,17 @@ def main():
         ai.load_patient(d)
     
     print("⏳ Waiting for camera feed...")
-    while cam.read() is None: 
-        time.sleep(0.1)
+    while cam.read() is None: time.sleep(0.1)
     
-    window_name = "PillTrack - Pills Only Mode"
+    window_name = "PillTrack Senior Edition (Segment-Box Mode)"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, DISPLAY_W, DISPLAY_H) 
 
-    print(f"🎥 RUNNING... (PILLS ONLY - OPTIMIZED FOR RPi)")
+    print(f"🎥 RUNNING... (RGB888 STRICT)")
     
     fps = 0
     prev_time = time.perf_counter()
-    TARGET_FPS = 12  # ลด FPS เป้าหมายสำหรับ RPi
+    TARGET_FPS = 20 # เพิ่ม FPS cap นิดหน่อย
     FRAME_TIME = 1.0 / TARGET_FPS
     
     clickable_areas = []
@@ -662,14 +771,7 @@ def main():
             
             ai.update_frame(frame_rgb.copy()) 
             results, cur_patient = ai.get_results()
-            
-            # วาดกรอบทุก object
             draw_boxes_on_items(frame_rgb, results)
-            
-            # แสดง count
-            num_items = len(results)
-            cv2.putText(frame_rgb, f"Detected: {num_items} pills", (30, 100), 
-                       FONT, 1.0, RGB_YELLOW, THICKNESS)
             
             if cur_patient: 
                 clickable_areas = draw_patient_info(frame_rgb, cur_patient)
@@ -681,20 +783,18 @@ def main():
             
             temp = get_cpu_temperature()
             cv2.putText(frame_rgb, f"FPS: {fps:.1f} | {temp}", (30, 50), 
-                       FONT, 1.2, RGB_GREEN, THICKNESS)
+                       FONT, 1.2, RGB_GREEN, THICKNESS_BOX)
             
             cv2.imshow(window_name, frame_rgb)
             
             key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'): 
-                break
+            if key == ord('q'): break
             if key == ord('r'):
                 his_db = HISLoader.load_database(HIS_FILE_PATH)
                 if TARGET_HN in his_db: 
                     d = his_db[TARGET_HN]
                     d['hn'] = TARGET_HN
                     ai.load_patient(d)
-                    print("🔄 Prescription reloaded")
 
             elapsed = time.perf_counter() - start_loop
             if elapsed < FRAME_TIME: 
