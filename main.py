@@ -757,9 +757,9 @@ def main():
             results, cur_patient = ai.get_results()
             draw_boxes_on_items(frame_rgb, results)
             
-            if cur_patient: 
-                clickable_areas = draw_patient_info(frame_rgb, cur_patient)
-                cv2.setMouseCallback(window_name, mouse_callback, (clickable_areas, ai))
+            # if cur_patient: 
+            #     clickable_areas = draw_patient_info(frame_rgb, cur_patient)
+            #     cv2.setMouseCallback(window_name, mouse_callback, (clickable_areas, ai))
             
             curr_time = time.perf_counter()
             fps = 1 / (curr_time - prev_time) if (curr_time - prev_time) > 0 else 0
