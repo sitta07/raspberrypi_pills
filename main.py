@@ -41,7 +41,7 @@ ZOOM_FACTOR = 1.3   # 1.0 = ปกติ, 2.0 = ซูม 2 เท่า (แน
 
 # Thresholds
 CONF_PILL = 0.5    
-CONF_PACK = 0.85     
+CONF_PACK = 0.5     
 SCORE_PASS_PILL = 0.2
 SCORE_PASS_PACK = 0.2
 
