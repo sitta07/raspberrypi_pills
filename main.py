@@ -28,6 +28,7 @@ DB_FILES = {
     'pills': {'vec': 'database/db_box_pills/db_pills.pkl', 'col': 'database/db_box_pills/colors_pills.pkl'},
     'packs': {'vec': 'database/db_box_pills/db_packs.pkl', 'col': 'database/db_box_pills/colors_packs.pkl'}
 }
+
 IMG_DB_FOLDER = 'database_images'
 HIS_FILE_PATH = 'prescription.txt' 
 
