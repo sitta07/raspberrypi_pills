@@ -22,11 +22,11 @@ except ImportError:
 
 # ================= CONFIGURATION =================
 # Paths
-MODEL_PILL_PATH = 'models/pills_seg.pt'          
-MODEL_PACK_PATH = 'models/seg_best_process.pt'
+MODEL_PILL_PATH = 'models/pills_seg.pt'      #seg    
+MODEL_PACK_PATH = 'models/seg_best_process.pt' #seg
 DB_FILES = {
-    'pills': {'vec': 'database/model_register/db_pills.pkl', 'col': 'database/model_register/colors_pills.pkl'},
-    'packs': {'vec': 'database/model_register/db_packs.pkl', 'col': 'database/model_register/colors_packs.pkl'}
+    'pills': {'vec': 'database/db_register/db_pills.pkl', 'col': 'database/db_register/colors_pills.pkl'},
+    'packs': {'vec': 'database/db_register/db_packs.pkl', 'col': 'database/db_register/colors_packs.pkl'}
 }
 
 IMG_DB_FOLDER = 'database_images'
