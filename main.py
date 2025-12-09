@@ -38,7 +38,7 @@ AI_IMG_SIZE = 416
 
 # Thresholds
 CONF_PILL = 0.15    
-CONF_PACK = 0.7     
+CONF_PACK = 0.85     
 SCORE_PASS_PILL = 0.2
 SCORE_PASS_PACK = 0.2
 
