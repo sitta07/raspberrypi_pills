@@ -37,13 +37,13 @@ DISPLAY_W, DISPLAY_H = 1280, 720
 AI_IMG_SIZE = 416 
 
 # Thresholds
-CONF_PILL = 0.25    
-CONF_PACK = 0.5     
+CONF_PILL = 0.15    
+CONF_PACK = 0.7     
 SCORE_PASS_PILL = 0.2
-SCORE_PASS_PACK = 0.6
+SCORE_PASS_PACK = 0.2
 
 # --- SENIOR UPGRADES ---
-CONSISTENCY_THRESHOLD = 3   # ลดลงเหลือ 3 เพื่อให้ตัดเร็วขึ้น (Responsiveness)
+CONSISTENCY_THRESHOLD = 2   # ลดลงเหลือ 3 เพื่อให้ตัดเร็วขึ้น (Responsiveness)
 MAX_OBJ_AREA_RATIO = 0.40   
 
 device = torch.device("cpu")
