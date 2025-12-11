@@ -51,7 +51,7 @@ class Config:
     CONF_THRESHOLD: float = 0.35
     
     # WEIGHTS FUSION: Vector 50%, Color 30%, SIFT 20%
-    WEIGHTS: Dict[str, float] = field(default_factory=lambda: {'vec': 0.5, 'col': 0.3, 'sift': 0.2}) 
+    WEIGHTS: Dict[str, float] = field(default_factory=lambda: {'vec': 0.4, 'col': 0.3, 'sift': 0.3}) 
     
     # SIFT Tuning
     SIFT_RATIO_TEST: float = 0.75
@@ -240,7 +240,7 @@ class AIProcessor:
         # Inference (Segmentation Task)
         # Note: We use the Pack model to detect both or separate if preferred.
         # Assuming model handles segmentation logic.
-        results = self.yolo_pack(img_ai, verbose=False, conf=0.25, imgsz=CFG.AI_SIZE, task='segment')
+        results = self.yolo_pack(img_ai, verbose=False, conf=0.35, imgsz=CFG.AI_SIZE, task='segment')
         
         detections = []
         res = results[0]
