@@ -52,7 +52,7 @@ class Config:
     CONF_THRESHOLD: float = 0.25        
     
     # WEIGHTS: Vector 60%, Color 40% (สีช่วยแยกแยะกล่องได้ดี)
-    WEIGHTS: Dict[str, float] = field(default_factory=lambda: {'vec': 0.8, 'col': 0.2}) 
+    WEIGHTS: Dict[str, float] = field(default_factory=lambda: {'vec': 0.2, 'col': 0.8}) 
 
 CFG = Config()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
