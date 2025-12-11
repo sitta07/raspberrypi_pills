@@ -35,22 +35,19 @@ DISPLAY_W, DISPLAY_H = 1280, 720
 AI_IMG_SIZE = 416 
 ZOOM_FACTOR = 1.0   
 
-# --- 🔥 PRECISION TUNING ---
-# 1. Color Gate: ถ้าระยะห่างสีเกินนี้ ปัดตกทันที (ค่าน้อย = เข้มงวดมาก)
-COLOR_REJECT_THRESHOLD = 0.4  
-
-# 2. Voting Weights
-WEIGHT_PILL_BASE = 4.0  # ให้ค่าเม็ดยาสูงขึ้นอีก
+# --- 🔥 PRECISION & STRICT MODE TUNING ---
+COLOR_REJECT_THRESHOLD = 0.45  # Strict Color Check
+WEIGHT_PILL_BASE = 4.0  
 WEIGHT_PACK_BASE = 1.0  
-RANK_WEIGHTS = [1.0, 0.6, 0.2] # ลดความสำคัญของอันดับ 2,3 ลง เพื่อกัน Noise
+RANK_WEIGHTS = [1.0, 0.6, 0.2] 
 
 CONF_PILL = 0.5   
 CONF_PACK = 0.5     
-SCORE_WIN_THRESHOLD = 2.5 # ต้องมั่นใจจริงๆ ถึงจะขึ้นชื่อ
-CONSISTENCY_THRESHOLD = 4 # ต้องนิ่งติดต่อกัน 4 เฟรม
+SCORE_WIN_THRESHOLD = 2.0 
+CONSISTENCY_THRESHOLD = 3 
 
 device = torch.device("cpu")
-print(f"🚀 SYSTEM STARTING ON: {device} (PRECISION MODE)")
+print(f"🚀 SYSTEM STARTING ON: {device} (STRICT PRESCRIPTION MODE)")
 
 # ================= UTILS =================
 def get_cpu_temperature():
@@ -112,7 +109,7 @@ class WebcamStream:
         if self.picam2: self.picam2.stop(); self.picam2.close()
         if self.cam: self.cam.release()
 
-# ================= 2. RESOURCES & SCOPED DB =================
+# ================= 2. RESOURCES & STRICT SCOPED DB =================
 class HISLoader:
     @staticmethod
     def load_database(filename):
@@ -146,27 +143,43 @@ class PrescriptionState:
             self.create_session_db()
             
     def create_session_db(self):
+        """ 🔥 STRICT MODE: Build DB ONLY from prescription list """
         s_pills_vecs, s_pills_lbls = [], []
         s_packs_vecs, s_packs_lbls = [], []
+        
+        # If global DB not loaded, can't create session DB
         if matrix_pills is None or matrix_packs is None: return
 
+        # Loop through GLOBAL PILLS DB -> Keep ONLY if in Prescription
         for idx, label in enumerate(pills_lbls):
+            # Check if any drug in prescription matches this label
             if any(t.lower() in label.lower() for t in self.all_drugs):
-                s_pills_vecs.append(matrix_pills[idx]); s_pills_lbls.append(label)
+                s_pills_vecs.append(matrix_pills[idx])
+                s_pills_lbls.append(label)
 
+        # Loop through GLOBAL PACKS DB -> Keep ONLY if in Prescription
         for idx, label in enumerate(packs_lbls):
             if any(t.lower() in label.lower() for t in self.all_drugs):
-                s_packs_vecs.append(matrix_packs[idx]); s_packs_lbls.append(label)
+                s_packs_vecs.append(matrix_packs[idx])
+                s_packs_lbls.append(label)
 
+        # Create Tensors
         if s_pills_vecs:
             self.session_pills_mat = torch.stack(s_pills_vecs).to(device)
             self.session_pills_lbl = s_pills_lbls
-        else: self.session_pills_mat = None
+            print(f"✅ Scoped Pills DB: {len(s_pills_lbls)} vectors")
+        else:
+            self.session_pills_mat = None
+            self.session_pills_lbl = []
+            print("⚠️ No matching Pills found for this prescription.")
 
         if s_packs_vecs:
             self.session_packs_mat = torch.stack(s_packs_vecs).to(device)
             self.session_packs_lbl = s_packs_lbls
-        else: self.session_packs_mat = None
+            print(f"✅ Scoped Packs DB: {len(s_packs_lbls)} vectors")
+        else:
+            self.session_packs_mat = None
+            self.session_packs_lbl = []
 
     def verify_drug(self, drug_name):
         with self.lock:
@@ -205,6 +218,7 @@ def load_pkl_to_list(filepath):
             return [], []
     except: return [], []
 
+# Load Global DB (Used ONLY to build Session DB, never used directly in inference)
 pills_vecs, pills_lbls = load_pkl_to_list(DB_FILES['pills']['vec'])
 packs_vecs, packs_lbls = load_pkl_to_list(DB_FILES['packs']['vec'])
 matrix_pills = torch.tensor(np.array(pills_vecs), device=device, dtype=torch.float32) if pills_vecs else None
@@ -244,60 +258,60 @@ try:
     del base_model
     preprocess = transforms.Compose([
         transforms.Resize((224, 224)), 
-        transforms.CenterCrop(224), # 🔥 Force focus on center pill
+        transforms.CenterCrop(224),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
     torch.set_grad_enabled(False)
 except Exception as e: sys.exit(1)
 
-# ================= 3. TRINITY ENGINE (REFACTORED FOR PRECISION) =================
+# ================= 3. TRINITY ENGINE (STRICT MODE) =================
 COLOR_NORM = np.array([90.0, 255.0, 255.0])
 SIFT_RATIO = 0.75; SIFT_MAX_MATCHES = 15.0
 
-def trinity_inference(img_crop, is_pill=True, s_pills=None, s_pills_lbl=None, s_packs=None, s_packs_lbl=None):
-    """ Detailed check with Multi-Vector Averaging and Hard Color Filter """
-    t_matrix = (s_pills if s_pills is not None else matrix_pills) if is_pill else (s_packs if s_packs is not None else matrix_packs)
-    t_labels = (s_pills_lbl if s_pills_lbl is not None else pills_lbls) if is_pill else (s_packs_lbl if s_packs_lbl is not None else packs_lbls)
-    
-    if t_matrix is None: return []
+def trinity_inference(img_crop, is_pill=True, session_mat=None, session_lbl=None):
+    """ 
+    🔥 STRICT: Accepts ONLY session matrices. 
+    If session_mat is None, returns empty list immediately (No Global Fallback).
+    """
+    if session_mat is None or session_lbl is None or len(session_lbl) == 0: 
+        return [] # ⛔ Stop here if no drug in prescription matches this category
 
     try:
-        # --- 1. Vector Extraction ---
+        # 1. Vector Extraction
         pil_img = Image.fromarray(img_crop if is_pill else cv2.merge([cv2.cvtColor(img_crop, cv2.COLOR_RGB2GRAY)]*3))
         input_tensor = preprocess(pil_img).unsqueeze(0).to(device)
         live_vec = embedder(input_tensor).flatten()
         live_vec = live_vec / live_vec.norm()
 
-        # --- 2. Full Matrix Search ---
-        scores = torch.matmul(live_vec, t_matrix.T).squeeze(0)
+        # 2. Compare with SESSION DB ONLY
+        scores = torch.matmul(live_vec, session_mat.T).squeeze(0)
         
-        # --- 3. Get Top Candidates (More than needed to filter later) ---
-        k_val = min(20, len(t_labels))
+        # 3. Candidates
+        k_val = min(10, len(session_lbl))
         if k_val == 0: return []
         top_k_val, top_k_idx = torch.topk(scores, k=k_val)
         
-        # --- 4. Color & SIFT Analysis ---
+        # 4. Color & SIFT
         live_color = None
         gray = cv2.cvtColor(img_crop, cv2.COLOR_RGB2GRAY)
         _, des_live = sift.detectAndCompute(gray, None)
         
         if is_pill: 
             h, w = img_crop.shape[:2]
-            # Focus strict center 50%
             center = img_crop[int(h*0.25):int(h*0.75), int(w*0.25):int(w*0.75)]
             if center.size > 0:
                 hsv = cv2.cvtColor(center, cv2.COLOR_RGB2HSV)
                 live_color = np.mean(hsv, axis=(0,1))
 
-        # --- 5. Candidate Evaluation with Hard Filtering ---
-        raw_candidates = {} # {name: [score1, score2, ...]}
+        # 5. Filter Candidates
+        raw_candidates = {} 
         
         for idx, sc in zip(top_k_idx.detach().cpu().numpy(), top_k_val.detach().cpu().numpy()):
-            name = t_labels[idx]
+            name = session_lbl[idx]
             vec_score = float(sc)
 
-            # 🔥 COLOR GATE (Strict Check)
+            # Strict Color Check
             color_penalty = 1.0
             if is_pill and live_color is not None and name in color_db:
                 diff = np.abs(live_color - color_db[name])
@@ -305,41 +319,28 @@ def trinity_inference(img_crop, is_pill=True, s_pills=None, s_pills_lbl=None, s_
                 norm_diff = diff / COLOR_NORM
                 dist = np.linalg.norm(norm_diff)
                 
-                # If color is too different, reject immediately
-                if dist > COLOR_REJECT_THRESHOLD: 
-                    continue # SKIP THIS CANDIDATE
-                
+                if dist > COLOR_REJECT_THRESHOLD: continue 
                 color_score = np.clip(np.exp(-3.0 * dist), 0, 1)
             else:
-                color_score = 0.5 # Neutral if no color db
+                color_score = 0.5 
 
-            # SIFT Score
-            sift_score = 0.0
             clean_name = name.replace("_pill", "").replace("_pack", "")
-            if des_live is not None and clean_name in sift_db:
-                 # (Reduced SIFT logic for speed, check only first ref)
-                 pass # SIFT is slow, relying on Vector+Color mostly for speed/accuracy trade-off
-
-            # Combined Score
-            final_score = vec_score * 0.7 + color_score * 0.3 # Weigh Vector more
+            final_score = vec_score * 0.7 + color_score * 0.3 
             
             if clean_name not in raw_candidates: raw_candidates[clean_name] = []
             raw_candidates[clean_name].append(final_score)
 
-        # --- 6. Top-N Averaging (Better Accuracy) ---
+        # 6. Average & Return
         averaged_candidates = []
         for name, score_list in raw_candidates.items():
-            # Average the top 3 scores for this drug to ensure consistency
             avg_score = sum(sorted(score_list, reverse=True)[:3]) / min(len(score_list), 3)
             averaged_candidates.append((name, avg_score))
 
         return sorted(averaged_candidates, key=lambda x: x[1], reverse=True)
 
-    except Exception as e: 
-        print(f"Error Trinity: {e}")
-        return []
+    except Exception as e: return []
 
-# ================= 4. AI WORKER (PRECISION VOTING) =================
+# ================= 4. AI WORKER (STRICT LOGIC) =================
 class AIProcessor:
     __slots__ = ('latest_frame', 'results', 'top_candidates', 'stopped', 'lock', 'is_rx_mode', 
                  'current_patient_info', 'scale_x', 'scale_y', 'resize_interpolation', 'consistency_counter',
@@ -366,15 +367,11 @@ class AIProcessor:
             self.final_winner = "Ready"
 
     def start(self): threading.Thread(target=self.run, daemon=True).start(); return self
-    def update_frame(self, frame): 
-        with self.lock: 
-            self.latest_frame = frame
-    def get_results(self): 
-        with self.lock: 
-            return self.results, self.top_candidates, self.final_winner, self.winner_verified
+    def update_frame(self, frame): with self.lock: self.latest_frame = frame
+    def get_results(self): with self.lock: return self.results, self.top_candidates, self.final_winner, self.winner_verified
 
     def run(self):
-        print("[DEBUG] AI Loop Started - Precision Mode")
+        print("[DEBUG] AI Loop Started - Strict Prescription Mode")
         while not self.stopped:
             with self.lock:
                 frame_HD = self.latest_frame; self.latest_frame = None
@@ -382,11 +379,9 @@ class AIProcessor:
             
             if frame_HD is None: time.sleep(0.005); continue
 
-            u_p_mat = s_pill_mat if s_pill_mat is not None else matrix_pills
-            u_p_lbl = s_pill_lbl if s_pill_lbl else pills_lbls
-            u_pk_mat = s_pack_mat if s_pack_mat is not None else matrix_packs
-            u_pk_lbl = s_pack_lbl if s_pack_lbl else packs_lbls
-
+            # 🔥 CRITICAL: NO GLOBAL DB FALLBACK 
+            # We strictly use s_pill_mat / s_pack_mat. If they are None, Trinity returns [].
+            
             frame_yolo = cv2.resize(frame_HD, (AI_IMG_SIZE, AI_IMG_SIZE), interpolation=self.resize_interpolation)
             global_votes = {} 
             detected_boxes = []
@@ -399,13 +394,13 @@ class AIProcessor:
                 crop = frame_HD[y1:y2, x1:x2]
                 if crop.size == 0: continue
                 
-                candidates = trinity_inference(crop, is_pill=False, s_packs=u_pk_mat, s_packs_lbl=u_pk_lbl)
+                # Use STRICT Session DB
+                candidates = trinity_inference(crop, is_pill=False, session_mat=s_pack_mat, session_lbl=s_pack_lbl)
                 
-                # 🔥 Power Voting (Squared Score)
                 for i, (name, score) in enumerate(candidates[:3]):
                     weight = RANK_WEIGHTS[i] * WEIGHT_PACK_BASE
                     if name not in global_votes: global_votes[name] = 0.0
-                    global_votes[name] += (score ** 2) * weight # Square the score to punish low confidence
+                    global_votes[name] += (score ** 2) * weight
                 
                 detected_boxes.append({'box': (x1,y1,x2,y2), 'type': 'pack'})
 
@@ -417,7 +412,8 @@ class AIProcessor:
                 crop = frame_HD[y1:y2, x1:x2]
                 if crop.size == 0: continue
                 
-                candidates = trinity_inference(crop, is_pill=True, s_pills=u_p_mat, s_pills_lbl=u_p_lbl, s_packs=u_pk_mat, s_packs_lbl=u_pk_lbl)
+                # Use STRICT Session DB
+                candidates = trinity_inference(crop, is_pill=True, session_mat=s_pill_mat, session_lbl=s_pill_lbl)
                 
                 cx, cy = (x1+x2)>>1, (y1+y2)>>1
                 in_pack = False
@@ -425,7 +421,6 @@ class AIProcessor:
                     if p['type'] == 'pack' and is_point_in_box((cx, cy), p['box']): in_pack = True; break
                 
                 if in_pack:
-                    # 🔥 Power Voting (Squared Score)
                     for i, (name, score) in enumerate(candidates[:3]):
                         clean_name = name.replace("_pill", "").lower()
                         weight = RANK_WEIGHTS[i] * WEIGHT_PILL_BASE
@@ -443,11 +438,10 @@ class AIProcessor:
             
             if sorted_candidates:
                 winner_name, winner_score = sorted_candidates[0]
-                
-                # ถ้าคะแนนที่ 1 นำห่างที่ 2 มากๆ ให้ confirm เร็วขึ้น
                 second_score = sorted_candidates[1][1] if len(sorted_candidates) > 1 else 0
                 margin = winner_score - second_score
 
+                # Strict Confirmation
                 if winner_score > SCORE_WIN_THRESHOLD or (margin > 1.0 and winner_score > 1.0):
                     self.consistency_counter[winner_name] = self.consistency_counter.get(winner_name, 0) + 1
                     if self.consistency_counter[winner_name] >= CONSISTENCY_THRESHOLD:
@@ -489,10 +483,9 @@ def draw_ui_overlay(frame, candidates, winner, verified):
         cv2.addWeighted(sub, 0.4, white, 0.6, 0, sub)
         cv2.rectangle(frame, (x_start, y_start), (x_start+panel_w, y_start+panel_h), RGB_BLACK, 2)
 
-        cv2.putText(frame, "PRECISION RANK (Top 3)", (x_start+10, y_start+25), FONT, 0.6, RGB_BLACK, 2)
+        cv2.putText(frame, "STRICT RANK (Top 3)", (x_start+10, y_start+25), FONT, 0.6, RGB_BLACK, 2)
         for i, (name, score) in enumerate(candidates):
             y_pos = y_start + 60 + (i * 25)
-            # Scaling for display (since we squared scores, numbers might be high)
             bar_len = int(min(score, 15.0) / 15.0 * 150) 
             cv2.putText(frame, f"{i+1}. {name[:12]}", (x_start+10, y_pos), FONT, 0.55, RGB_BLACK, 1)
             cv2.rectangle(frame, (x_start+130, y_pos-10), (x_start+130+bar_len, y_pos), (0, 100, 255), -1)
@@ -526,11 +519,11 @@ def main():
         d = his_db[TARGET_HN]; d['hn'] = TARGET_HN; ai.load_patient(d)
     
     while cam.read() is None: time.sleep(0.1)
-    window_name = "PillTrack: Precision Edition"
+    window_name = "PillTrack: Strict Edition"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, DISPLAY_W, DISPLAY_H) 
 
-    print("🎥 SYSTEM READY. Precision Check Active.")
+    print("🎥 SYSTEM READY. Strict Mode: ON")
     
     try:
         while True:
