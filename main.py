@@ -360,8 +360,12 @@ class AIProcessor:
             self.final_winner = "Ready"
 
     def start(self): threading.Thread(target=self.run, daemon=True).start(); return self
-    def update_frame(self, frame): with self.lock: self.latest_frame = frame
-    def get_results(self): with self.lock: return self.results, self.top_candidates, self.final_winner, self.winner_verified
+    def update_frame(self, frame): 
+        with self.lock: 
+            self.latest_frame = frame
+    def get_results(self): 
+        with self.lock: 
+            return self.results, self.top_candidates, self.final_winner, self.winner_verified
 
     def run(self):
         print("[DEBUG] AI Loop Started - ROI & Color Check Active")
