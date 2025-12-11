@@ -22,7 +22,6 @@ except ImportError:
     print("⚠️ Warning: Picamera2 not found.")
 
 # ================= CONFIGURATION =================
-# Paths
 MODEL_PILL_PATH = 'models/pills_seg.pt'      
 MODEL_PACK_PATH = 'models/seg_best_process.pt' 
 DB_FILES = {
@@ -34,22 +33,25 @@ HIS_FILE_PATH = 'prescription.txt'
 
 DISPLAY_W, DISPLAY_H = 1280, 720
 AI_IMG_SIZE = 416 
-ZOOM_FACTOR = 1.0   
+ZOOM_FACTOR = 1.3  
 
-# --- LOGIC TUNING (The "Weights") ---
-# ถ้าเจอเม็ดยา ให้คะแนนเท่าไหร่? (เยอะกว่าแผง)
-WEIGHT_PILL_VOTE = 3.0  
-# ถ้าเจอแค่แผง ให้คะแนนเท่าไหร่?
-WEIGHT_PACK_VOTE = 1.0  
+# --- 🔥 VOTING LOGIC TUNING ---
+# คะแนนดิบ (Base Weight)
+WEIGHT_PILL_BASE = 3.0  # เม็ดยาเชื่อถือได้มากกว่า
+WEIGHT_PACK_BASE = 1.0  # แผงยาเชื่อถือน้อยกว่า
 
-# Confidence Thresholds
+# การลดทอนคะแนนตามลำดับ (Rank Decay)
+# ถ้ายาติดอันดับ 1 ได้คะแนนเต็ม, อันดับ 2 ได้ครึ่งนึง, อันดับ 3 ได้ 30%
+# แบบนี้ถ้า อันดับ 2+3 เป็นยาเดียวกัน คะแนนรวมอาจจะชนะอันดับ 1 ได้!
+RANK_WEIGHTS = [1.0, 0.5, 0.3] 
+
 CONF_PILL = 0.5   
 CONF_PACK = 0.5     
-SCORE_PASS_MIN = 0.2  # คะแนนขั้นต่ำที่จะยอมรับว่าเป็นยานั้นๆ
+SCORE_WIN_THRESHOLD = 2.0  # ต้องมีคะแนนโหวตรวมเกินเท่านี้ถึงจะฟันธง
 CONSISTENCY_THRESHOLD = 3   
 
 device = torch.device("cpu")
-print(f"🚀 SYSTEM STARTING ON: {device} (SINGLE DRUG VOTING MODE)")
+print(f"🚀 SYSTEM STARTING ON: {device} (DEMOCRATIC VOTING MODE)")
 
 # ================= UTILS =================
 def get_cpu_temperature():
@@ -149,7 +151,6 @@ class PrescriptionState:
         s_packs_vecs, s_packs_lbls = [], []
         if matrix_pills is None or matrix_packs is None: return
 
-        # Strict Scoping: Only allow drugs in prescription
         for idx, label in enumerate(pills_lbls):
             if any(t.lower() in label.lower() for t in self.all_drugs):
                 s_pills_vecs.append(matrix_pills[idx]); s_pills_lbls.append(label)
@@ -205,13 +206,10 @@ def load_pkl_to_list(filepath):
             return [], []
     except: return [], []
 
-# Global DB Load
 pills_vecs, pills_lbls = load_pkl_to_list(DB_FILES['pills']['vec'])
 packs_vecs, packs_lbls = load_pkl_to_list(DB_FILES['packs']['vec'])
-
 matrix_pills = torch.tensor(np.array(pills_vecs), device=device, dtype=torch.float32) if pills_vecs else None
 matrix_packs = torch.tensor(np.array(packs_vecs), device=device, dtype=torch.float32) if packs_vecs else None
-
 if matrix_pills is not None: matrix_pills = matrix_pills / matrix_pills.norm(dim=1, keepdim=True)
 if matrix_packs is not None: matrix_packs = matrix_packs / matrix_packs.norm(dim=1, keepdim=True)
 
@@ -252,27 +250,24 @@ try:
     torch.set_grad_enabled(False)
 except Exception as e: sys.exit(1)
 
-# ================= 3. TRINITY ENGINE (UPDATED TO RETURN CANDIDATES) =================
+# ================= 3. TRINITY ENGINE =================
 COLOR_NORM = np.array([90.0, 255.0, 255.0])
 SIFT_RATIO = 0.75; SIFT_MAX_MATCHES = 15.0
 
 def trinity_inference(img_crop, is_pill=True, s_pills=None, s_pills_lbl=None, s_packs=None, s_packs_lbl=None):
-    """
-    Returns: best_name, best_score, candidate_list [(name, score), (name, score)...]
-    """
+    """ Returns top 3 candidates to allow cumulative voting """
     t_matrix = (s_pills if s_pills is not None else matrix_pills) if is_pill else (s_packs if s_packs is not None else matrix_packs)
     t_labels = (s_pills_lbl if s_pills_lbl is not None else pills_lbls) if is_pill else (s_packs_lbl if s_packs_lbl is not None else packs_lbls)
     
-    if t_matrix is None: return "DB Error", 0.0, []
+    if t_matrix is None: return []
     try:
         pil_img = Image.fromarray(img_crop if is_pill else cv2.merge([cv2.cvtColor(img_crop, cv2.COLOR_RGB2GRAY)]*3))
         input_tensor = preprocess(pil_img).unsqueeze(0).to(device)
         live_vec = embedder(input_tensor).flatten(); live_vec = live_vec / live_vec.norm()
         scores = torch.matmul(live_vec, t_matrix.T).squeeze(0)
         
-        # Get Top Candidates
         k_val = min(10, len(t_labels))
-        if k_val == 0: return "Unknown", 0.0, []
+        if k_val == 0: return []
         top_k_val, top_k_idx = torch.topk(scores, k=k_val)
         
         candidates = []
@@ -282,9 +277,8 @@ def trinity_inference(img_crop, is_pill=True, s_pills=None, s_pills_lbl=None, s_
             if name not in seen:
                 candidates.append({'name': name, 'vec_score': float(sc)})
                 seen.add(name)
-                if len(candidates) >= 3: break # Take Top 3 Vector Matches
+                if len(candidates) >= 3: break 
 
-        # Refine with SIFT & Color
         live_color = None
         gray = cv2.cvtColor(img_crop, cv2.COLOR_RGB2GRAY)
         _, des_live = sift.detectAndCompute(gray, None)
@@ -297,10 +291,8 @@ def trinity_inference(img_crop, is_pill=True, s_pills=None, s_pills_lbl=None, s_
                 live_color = np.mean(hsv, axis=(0,1))
 
         final_candidates = []
-        
         for cand in candidates:
             name = cand['name']
-            vec_score = cand['vec_score']
             clean_name = name.replace("_pill", "").replace("_pack", "")
             
             sift_score = 0.0
@@ -322,23 +314,17 @@ def trinity_inference(img_crop, is_pill=True, s_pills=None, s_pills_lbl=None, s_
                 color_score = np.clip(np.exp(-3.0 * dist), 0, 1)
             
             w_vec, w_sift, w_col = (0.5, 0.4, 0.1) if is_pill else (0.7, 0.3, 0.0)
-            total = vec_score * w_vec + sift_score * w_sift + color_score * w_col
+            total = cand['vec_score'] * w_vec + sift_score * w_sift + color_score * w_col
             final_candidates.append((clean_name, total))
 
-        # Sort by final total score
-        final_candidates.sort(key=lambda x: x[1], reverse=True)
-        
-        if final_candidates:
-            return final_candidates[0][0], final_candidates[0][1], final_candidates
-        else:
-            return "Unknown", 0.0, []
-            
-    except: return "Error", 0.0, []
+        return sorted(final_candidates, key=lambda x: x[1], reverse=True)
+    except: return []
 
-# ================= 4. AI WORKER (GLOBAL VOTING) =================
+# ================= 4. AI WORKER (RANKED VOTING) =================
 class AIProcessor:
     __slots__ = ('latest_frame', 'results', 'top_candidates', 'stopped', 'lock', 'is_rx_mode', 
-                 'current_patient_info', 'scale_x', 'scale_y', 'resize_interpolation', 'consistency_counter')
+                 'current_patient_info', 'scale_x', 'scale_y', 'resize_interpolation', 'consistency_counter',
+                 'final_winner', 'winner_verified')
     
     def __init__(self):
         self.latest_frame = None; self.results = []; self.top_candidates = []
@@ -346,6 +332,8 @@ class AIProcessor:
         self.is_rx_mode = False; self.current_patient_info = None
         self.scale_x = DISPLAY_W / AI_IMG_SIZE; self.scale_y = DISPLAY_H / AI_IMG_SIZE
         self.resize_interpolation = cv2.INTER_LINEAR; self.consistency_counter = {}
+        self.final_winner = "Analyzing..."
+        self.winner_verified = False
 
     def load_patient(self, patient_data):
         with self.lock:
@@ -356,6 +344,7 @@ class AIProcessor:
                 prescription_state.load_drugs(patient_data['drugs'])
                 print(f"🏥 Loaded: {patient_data['name']}")
             self.consistency_counter.clear()
+            self.final_winner = "Ready"
 
     def start(self): threading.Thread(target=self.run, daemon=True).start(); return self
     def update_frame(self, frame): 
@@ -363,10 +352,10 @@ class AIProcessor:
             self.latest_frame = frame
     def get_results(self): 
         with self.lock: 
-            return self.results, self.top_candidates
+            return self.results, self.top_candidates, self.final_winner, self.winner_verified
 
     def run(self):
-        print("[DEBUG] AI Loop Started - Single Drug Global Voting")
+        print("[DEBUG] AI Loop Started - Ranked Voting Logic")
         while not self.stopped:
             with self.lock:
                 frame_HD = self.latest_frame; self.latest_frame = None
@@ -382,139 +371,144 @@ class AIProcessor:
 
             frame_yolo = cv2.resize(frame_HD, (AI_IMG_SIZE, AI_IMG_SIZE), interpolation=self.resize_interpolation)
             
-            # 🗳️ GLOBAL VOTE REGISTRY FOR THIS FRAME
-            global_votes = {} # { 'drug_name': accumulated_score }
+            # 🔥 GLOBAL VOTE REGISTRY (สะสมคะแนนจากทุก Candidate)
+            global_votes = {} 
 
-            # --- PHASE 1: DETECT PACKS ---
-            pack_detections = []
+            detected_boxes = []
+
+            # --- PROCESS PACKS ---
             pack_res = model_pack(frame_yolo, verbose=False, conf=CONF_PACK, imgsz=AI_IMG_SIZE, max_det=5, agnostic_nms=True)
-            
             for box in pack_res[0].boxes.xyxy.detach().cpu().numpy().astype(int):
                 x1, y1 = int(box[0] * self.scale_x), int(box[1] * self.scale_y)
                 x2, y2 = int(box[2] * self.scale_x), int(box[3] * self.scale_y)
                 crop = frame_HD[y1:y2, x1:x2]
                 if crop.size == 0: continue
                 
-                # Get Top 3 Candidates for this Pack
-                _, _, candidates = trinity_inference(crop, is_pill=False, s_packs=u_pk_mat, s_packs_lbl=u_pk_lbl)
+                candidates = trinity_inference(crop, is_pill=False, s_packs=u_pk_mat, s_packs_lbl=u_pk_lbl)
                 
-                # Vote (Weight = Low)
-                for name, score in candidates:
+                # 🔥 VOTE: ให้คะแนนตามลำดับไหล่ (Rank 1, 2, 3)
+                for i, (name, score) in enumerate(candidates[:3]):
+                    weight = RANK_WEIGHTS[i] * WEIGHT_PACK_BASE
                     if name not in global_votes: global_votes[name] = 0.0
-                    global_votes[name] += score * WEIGHT_PACK_VOTE
+                    global_votes[name] += score * weight
+                
+                detected_boxes.append({'box': (x1,y1,x2,y2), 'type': 'pack'})
 
-                pack_detections.append({'box': (x1,y1,x2,y2), 'type': 'pack'})
-
-            # --- PHASE 2: DETECT PILLS ---
-            pill_detections = []
+            # --- PROCESS PILLS ---
             pill_res = model_pill(frame_yolo, verbose=False, conf=CONF_PILL, imgsz=AI_IMG_SIZE, max_det=20, agnostic_nms=True)
-            
             for box in pill_res[0].boxes.xyxy.detach().cpu().numpy().astype(int):
                 x1, y1 = int(box[0] * self.scale_x), int(box[1] * self.scale_y)
                 x2, y2 = int(box[2] * self.scale_x), int(box[3] * self.scale_y)
                 crop = frame_HD[y1:y2, x1:x2]
                 if crop.size == 0: continue
                 
-                # Get Best Candidate for this Pill
-                p_name, p_score, _ = trinity_inference(crop, is_pill=True, s_pills=u_p_mat, s_pills_lbl=u_p_lbl, s_packs=u_pk_mat, s_packs_lbl=u_pk_lbl)
+                candidates = trinity_inference(crop, is_pill=True, s_pills=u_p_mat, s_pills_lbl=u_p_lbl, s_packs=u_pk_mat, s_packs_lbl=u_pk_lbl)
                 
-                # Check if Inside any Pack (To confirm it's valid)
+                # Check inside pack (Valid pill)
                 cx, cy = (x1+x2)>>1, (y1+y2)>>1
                 in_pack = False
-                for p in pack_detections:
-                    if is_point_in_box((cx, cy), p['box']): in_pack = True; break
+                for p in detected_boxes:
+                    if p['type'] == 'pack' and is_point_in_box((cx, cy), p['box']): in_pack = True; break
                 
-                # Vote (Weight = High)
-                if in_pack: 
-                    clean_name = p_name.replace("_pill", "").lower()
-                    if clean_name not in global_votes: global_votes[clean_name] = 0.0
-                    global_votes[clean_name] += p_score * WEIGHT_PILL_VOTE
+                if in_pack:
+                    # 🔥 VOTE: ให้คะแนนเม็ดยาสูงกว่า
+                    for i, (name, score) in enumerate(candidates[:3]):
+                        clean_name = name.replace("_pill", "").lower()
+                        weight = RANK_WEIGHTS[i] * WEIGHT_PILL_BASE
+                        if clean_name not in global_votes: global_votes[clean_name] = 0.0
+                        global_votes[clean_name] += score * weight
 
-                pill_detections.append({'box': (x1,y1,x2,y2), 'type': 'pill'})
+                detected_boxes.append({'box': (x1,y1,x2,y2), 'type': 'pill'})
 
-            # --- PHASE 3: DECISION ---
-            final_detections = pack_detections + pill_detections
+            # --- DECISION TIME ---
             sorted_candidates = sorted(global_votes.items(), key=lambda x: x[1], reverse=True)
+            current_top_list = sorted_candidates[:3]
             
-            current_top_list = sorted_candidates[:3] # For Dashboard
-            
-            winning_drug = "Unknown"
+            winner_name = "Unknown"
+            winner_score = 0.0
             is_verified = False
-            
+
             if sorted_candidates:
-                best_name, best_score = sorted_candidates[0]
-                # Normalize Score for display (crude normalization)
-                # If score > 1.0 (from accumulation), we treat it as high confidence
+                winner_name, winner_score = sorted_candidates[0]
                 
-                if best_score > SCORE_PASS_MIN:
-                    winning_drug = best_name
-                    self.consistency_counter[winning_drug] = self.consistency_counter.get(winning_drug, 0) + 1
-                    
-                    if self.consistency_counter[winning_drug] >= CONSISTENCY_THRESHOLD:
-                        prescription_state.verify_drug(winning_drug)
-            
-            is_verified = prescription_state.is_verified(winning_drug)
+                # ต้องคะแนนถึงเกณฑ์ที่ตั้งไว้
+                if winner_score > SCORE_WIN_THRESHOLD:
+                    self.consistency_counter[winner_name] = self.consistency_counter.get(winner_name, 0) + 1
+                    if self.consistency_counter[winner_name] >= CONSISTENCY_THRESHOLD:
+                        prescription_state.verify_drug(winner_name)
+                else:
+                    winner_name = "Analyzing..." # คะแนนยังไม่ขาด
 
-            # Update Labels in Detections to match the Global Winner
-            for d in final_detections:
-                d['label'] = winning_drug
-                d['verified'] = is_verified
-                d['is_wrong'] = (winning_drug == "Unknown")
+            is_verified = prescription_state.is_verified(winner_name)
 
-            # Reset consistency for others
+            # Reset logic
             for k in list(self.consistency_counter.keys()):
-                if k != winning_drug: self.consistency_counter[k] = 0
+                if k != winner_name: self.consistency_counter[k] = 0
 
             with self.lock: 
-                self.results = final_detections
-                self.top_candidates = current_top_list # Send to UI
+                self.results = detected_boxes
+                self.top_candidates = current_top_list
+                self.final_winner = winner_name
+                self.winner_verified = is_verified
     
     def stop(self): self.stopped = True
 
-# ================= 5. UI DRAWING =================
+# ================= 5. UI DRAWING (Z-ORDER FIX) =================
 FONT = cv2.FONT_HERSHEY_SIMPLEX
-RGB_GREEN = (0, 255, 0); RGB_RED = (255, 0, 0); RGB_YELLOW = (255, 255, 0); RGB_WHITE = (255, 255, 255); RGB_BLACK = (0, 0, 0)
+RGB_GREEN = (0, 255, 0); RGB_RED = (0, 0, 255); RGB_YELLOW = (0, 255, 255); 
+RGB_WHITE = (255, 255, 255); RGB_BLACK = (0, 0, 0); RGB_GRAY = (50, 50, 50)
 
-def draw_dashboard(frame, candidates):
-    """ Draws Top 3 Candidates at Top-Right """
-    if not candidates: return
-    
-    panel_w = 300
-    panel_h = 120
-    x_start = DISPLAY_W - panel_w - 10
-    y_start = 10
-    
-    # Semi-transparent background
-    sub_img = frame[y_start:y_start+panel_h, x_start:x_start+panel_w]
-    white_rect = np.ones(sub_img.shape, dtype=np.uint8) * 255
-    res = cv2.addWeighted(sub_img, 0.5, white_rect, 0.5, 1.0)
-    frame[y_start:y_start+panel_h, x_start:x_start+panel_w] = res
-    cv2.rectangle(frame, (x_start, y_start), (x_start+panel_w, y_start+panel_h), RGB_BLACK, 2)
-
-    cv2.putText(frame, "AI ANALYSIS (TOP 3)", (x_start+10, y_start+25), FONT, 0.6, RGB_BLACK, 2)
-    
-    for i, (name, score) in enumerate(candidates):
-        y_pos = y_start + 55 + (i * 25)
-        # Bar chart length
-        bar_len = int(min(score, 3.0) / 3.0 * 150) # Normalize assuming max score ~3.0
-        cv2.putText(frame, f"{i+1}. {name[:15]}", (x_start+10, y_pos), FONT, 0.5, RGB_BLACK, 1)
-        
-        # Draw Bar
-        cv2.rectangle(frame, (x_start+130, y_pos-10), (x_start+130+bar_len, y_pos), (0, 100, 255), -1)
-        cv2.putText(frame, f"{score:.1f}", (x_start+135+bar_len, y_pos), FONT, 0.5, RGB_BLACK, 1)
-
-def draw_boxes_on_items(frame, results):
+def draw_boxes(frame, results, winner):
+    """ Draw only boxes, no text clutter """
     for r in results:
         x1, y1, x2, y2 = r['box']
-        label = r['label']
-        is_verified = r.get('verified', False)
-        
-        color = RGB_GREEN if is_verified else RGB_YELLOW
-        if r['is_wrong']: color = RGB_RED
-
+        color = RGB_GREEN if r.get('type') == 'pack' else RGB_YELLOW
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        if r['type'] == 'pack': # Only label packs to avoid clutter
-            cv2.putText(frame, label, (x1, y1-10), FONT, 0.6, color, 2)
+
+def draw_ui_overlay(frame, candidates, winner, verified):
+    """ Draws Dashboard and Master Status ON TOP of everything """
+    h, w = frame.shape[:2]
+    
+    # 1. TOP RIGHT: Candidate Analysis
+    if candidates:
+        panel_w, panel_h = 300, 140
+        x_start, y_start = w - panel_w - 10, 10
+        
+        # Semi-transparent BG
+        sub = frame[y_start:y_start+panel_h, x_start:x_start+panel_w]
+        white = np.ones(sub.shape, dtype=np.uint8) * 255
+        cv2.addWeighted(sub, 0.4, white, 0.6, 0, sub) # Mutates sub -> mutates frame
+        cv2.rectangle(frame, (x_start, y_start), (x_start+panel_w, y_start+panel_h), RGB_BLACK, 2)
+
+        cv2.putText(frame, "VOTING RANK (Top 3)", (x_start+10, y_start+25), FONT, 0.6, RGB_BLACK, 2)
+        for i, (name, score) in enumerate(candidates):
+            y_pos = y_start + 60 + (i * 25)
+            # Bar length logic
+            bar_len = int(min(score, 10.0) / 10.0 * 150) 
+            cv2.putText(frame, f"{i+1}. {name[:12]}", (x_start+10, y_pos), FONT, 0.55, RGB_BLACK, 1)
+            cv2.rectangle(frame, (x_start+130, y_pos-10), (x_start+130+bar_len, y_pos), (0, 100, 255), -1)
+            cv2.putText(frame, f"{score:.1f}", (x_start+135+bar_len, y_pos), FONT, 0.5, RGB_BLACK, 1)
+
+    # 2. MASTER STATUS BAR (Bottom or Top-Center) -> The "Green Box"
+    bar_h = 60
+    cv2.rectangle(frame, (0, h-bar_h), (w, h), RGB_BLACK, -1) # Background Strip
+    
+    status_color = RGB_GREEN if verified else (RGB_YELLOW if winner != "Analyzing..." else RGB_GRAY)
+    status_text = f"CONCLUSION: {winner.upper()}" if winner != "Analyzing..." else "ANALYZING..."
+    
+    if verified: status_text = f"VERIFIED: {winner.upper()} (MATCHED)"
+    
+    # Draw Green Box if Verified
+    if verified:
+        cv2.rectangle(frame, (0, h-bar_h), (w, h), RGB_GREEN, -1)
+        text_color = RGB_BLACK
+    else:
+        text_color = RGB_WHITE
+
+    tsize = cv2.getTextSize(status_text, FONT, 1.2, 3)[0]
+    tx = (w - tsize[0]) // 2
+    ty = h - (bar_h - tsize[1]) // 2 - 5
+    cv2.putText(frame, status_text, (tx, ty), FONT, 1.2, text_color, 3)
 
 # ================= 6. MAIN =================
 def main():
@@ -527,11 +521,11 @@ def main():
         d = his_db[TARGET_HN]; d['hn'] = TARGET_HN; ai.load_patient(d)
     
     while cam.read() is None: time.sleep(0.1)
-    window_name = "PillTrack: Single Drug Analysis"
+    window_name = "PillTrack: Democratic Voting"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, DISPLAY_W, DISPLAY_H) 
 
-    print("🎥 SYSTEM READY. Show one drug type at a time.")
+    print("🎥 SYSTEM READY. Rank 2 & 3 now matter!")
     
     try:
         while True:
@@ -540,10 +534,13 @@ def main():
             frame = apply_digital_zoom(frame, ZOOM_FACTOR)
             
             ai.update_frame(frame.copy()) 
-            results, candidates = ai.get_results()
+            results, candidates, winner, verified = ai.get_results()
             
-            draw_boxes_on_items(frame, results)
-            draw_dashboard(frame, candidates) # Show Top 3
+            # Step 1: Draw Boxes (Underneath)
+            draw_boxes(frame, results, winner)
+            
+            # Step 2: Draw UI Overlays (Last step to ensure they are on top)
+            draw_ui_overlay(frame, candidates, winner, verified)
             
             cv2.imshow(window_name, frame)
             key = cv2.waitKey(1) & 0xFF
