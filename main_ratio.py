@@ -49,10 +49,10 @@ class Config:
     
     # 🎚️ TUNING THRESHOLDS
     # ลด CONF ลงเพื่อให้ AI กล้าตอบมากขึ้น (เดิมอาจจะสูงไปจน Unknown)
-    CONF_THRESHOLD: float = 0.38        
+    CONF_THRESHOLD: float = 0.25        
     
     # WEIGHTS: Vector 60%, Color 40% (สีช่วยแยกแยะกล่องได้ดี)
-    WEIGHTS: Dict[str, float] = field(default_factory=lambda: {'vec': 0.6, 'col': 0.4}) 
+    WEIGHTS: Dict[str, float] = field(default_factory=lambda: {'vec': 0.8, 'col': 0.2}) 
 
 CFG = Config()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
