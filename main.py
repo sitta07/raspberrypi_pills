@@ -33,7 +33,7 @@ HIS_FILE_PATH = 'prescription.txt'
 
 DISPLAY_W, DISPLAY_H = 1280, 720
 AI_IMG_SIZE = 416 
-ZOOM_FACTOR = 1.0   
+ZOOM_FACTOR = 1.4   
 
 # --- 🔥 PRECISION & STRICT MODE TUNING ---
 COLOR_REJECT_THRESHOLD = 0.45  # Strict Color Check
