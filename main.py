@@ -358,8 +358,12 @@ class AIProcessor:
             self.consistency_counter.clear()
 
     def start(self): threading.Thread(target=self.run, daemon=True).start(); return self
-    def update_frame(self, frame): with self.lock: self.latest_frame = frame
-    def get_results(self): with self.lock: return self.results, self.top_candidates
+    def update_frame(self, frame): 
+        with self.lock: 
+            self.latest_frame = frame
+    def get_results(self): 
+        with self.lock: 
+            return self.results, self.top_candidates
 
     def run(self):
         print("[DEBUG] AI Loop Started - Single Drug Global Voting")
