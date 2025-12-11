@@ -37,10 +37,10 @@ DISPLAY_W, DISPLAY_H = 1280, 720
 AI_IMG_SIZE = 416 
 
 # 🆕 NEW: ZOOM CONFIGURATION (ปรับเลขนี้เพื่อซูมมาก/น้อย)
-ZOOM_FACTOR = 1.15   # 1.0 = ปกติ, 2.0 = ซูม 2 เท่า (แนะนำลอง 1.5 - 2.0)
+ZOOM_FACTOR = 1.3   # 1.0 = ปกติ, 2.0 = ซูม 2 เท่า (แนะนำลอง 1.5 - 2.0)
 
 # Thresholds
-CONF_PILL = 0.5    
+CONF_PILL = 0.5   
 CONF_PACK = 0.25     
 SCORE_PASS_PILL = 0.2
 SCORE_PASS_PACK = 0.2
@@ -700,7 +700,6 @@ def main():
     prev_time = time.perf_counter()
     TARGET_FPS = 15 
     FRAME_TIME = 1.0 / TARGET_FPS
-    
     try:
         while True:
             start_loop = time.perf_counter()
