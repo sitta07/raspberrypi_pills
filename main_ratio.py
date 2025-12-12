@@ -48,13 +48,13 @@ class Config:
     UI_ZONE_Y_END: int = 220
     
     # 🎚️ TUNING THRESHOLDS
-    CONF_THRESHOLD: float = 0.5
+    CONF_THRESHOLD: float = 0.45
     
     # WEIGHTS FUSION: Vector 50%, Color 30%, SIFT 20%
     WEIGHTS: Dict[str, float] = field(default_factory=lambda: {'vec': 0.5, 'col': 0.3, 'sift': 0.2}) 
     
     # SIFT Tuning
-    SIFT_RATIO_TEST: float = 0.75
+    SIFT_RATIO_TEST: float = 0.85
 
 CFG = Config()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
