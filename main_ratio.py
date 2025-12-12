@@ -252,104 +252,53 @@ class AIProcessor:
         return unique
 
     def process_frame(self, frame):
-        # 1. Resize ภาพสำหรับส่งเข้า YOLO (AI Vision)
         img_ai = cv2.resize(frame, (CFG.AI_SIZE, CFG.AI_SIZE))
         
-        # 2. สั่ง YOLO ทำงาน (Detect + Segment)
-        results = self.yolo_pack(img_ai, verbose=False, conf=0.4, imgsz=CFG.AI_SIZE, task='segment')
+        # YOLO Segmentation Inference
+        results = self.yolo_pack(img_ai, verbose=False, conf=0.85, imgsz=CFG.AI_SIZE, task='segment')
         
         detections = []
         res = results[0]
-        
-        # ถ้าไม่เจออะไรเลย ให้เคลียร์ผลลัพธ์แล้วออก
         if res.masks is None:
             with self.lock: self.results = []
             return
 
-        # 3. วนลูปวัตถุทุกชิ้นที่เจอ
         for box, mask in zip(res.boxes, res.masks):
-            # --- A. แปลงพิกัด (Scale Coordinates) ---
+            # 1. Box Scaling
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-            
-            # คำนวณ Scale จาก AI_SIZE -> หน้าจอจริง
             scale_x = CFG.DISPLAY_SIZE[0] / CFG.AI_SIZE
             scale_y = CFG.DISPLAY_SIZE[1] / CFG.AI_SIZE
-            
             rx1, ry1 = int(x1 * scale_x), int(y1 * scale_y)
             rx2, ry2 = int(x2 * scale_x), int(y2 * scale_y)
             
-            # ป้องกันพิกัดหลุดขอบจอ
-            rx1, ry1 = max(0, rx1), max(0, ry1)
-            rx2, ry2 = min(CFG.DISPLAY_SIZE[0], rx2), min(CFG.DISPLAY_SIZE[1], ry2)
-            
-            # --- B. ตรวจสอบพื้นที่ยกเว้น (Dashboard Zone) ---
+            # ROI Filter
             cx, cy = (rx1+rx2)//2, (ry1+ry2)//2
             if cx > CFG.UI_ZONE_X_START and cy < CFG.UI_ZONE_Y_END: continue
 
-            # --- C. ดึงเส้นขอบ (Contour) เพื่อใช้วาดและทำ Mask ---
-            contour = mask.xyn[0].copy()
+            # 2. Contour Extraction
+            contour = mask.xyn[0]
             contour[:, 0] *= CFG.DISPLAY_SIZE[0]
             contour[:, 1] *= CFG.DISPLAY_SIZE[1]
             contour = contour.astype(np.int32)
 
-            # --- D. ✂️ ตัดภาพและลบพื้นหลัง (CRITICAL FIX FOR DINOv2) ---
-            # ตัดภาพสี่เหลี่ยมออกมาก่อน
-            crop_rgb = frame[ry1:ry2, rx1:rx2]
-            if crop_rgb.size == 0: continue
-            
-            # สร้างหน้ากาก (Mask) ให้ตรงกับขอบยาเป๊ะๆ
-            # สร้างภาพดำขนาดเท่าหน้าจอ
-            full_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-            # วาดรูปยาสีขาวลงไป
-            cv2.fillPoly(full_mask, [contour], 255)
-            # ตัด Mask ออกมาเฉพาะส่วนที่เราสนใจ
-            crop_mask = full_mask[ry1:ry2, rx1:rx2]
+            # 3. Crop
+            crop = frame[ry1:ry2, rx1:rx2]
+            if crop.size == 0: continue
 
-            # สร้างพื้นหลังสีเทา (128) ให้เหมือน Database
-            bg_gray = np.full_like(crop_rgb, 128) 
-            
-            # เอาภาพยาจริง แปะลงบนพื้นหลังสีเทา โดยใช้ Mask
-            # ตรงไหนเป็นยา (White Mask) ให้ใช้ภาพจริง, ตรงไหนเป็นพื้น (Black Mask) ให้ใช้สีเทา
-            final_input = bg_gray.copy()
-            mask_bool = crop_mask > 0
-            # ป้องกัน Error กรณีขนาดไม่เท่ากัน (Rare case)
-            try:
-                final_input[mask_bool] = crop_rgb[mask_bool]
-            except:
-                final_input = crop_rgb # Fallback ถ้า Mask พัง
-
-            # --- E. ส่งเข้า DINOv2 (Identification) ---
-            # ส่งภาพที่ลบพื้นแล้ว (final_input) เข้าไป
-            vec = self.engine.get_vector(final_input)
-            candidates = self.match(vec, final_input) # match returns top 5
+            # 4. Identification (DINOv2)
+            vec = self.engine.get_vector(crop)
+            candidates = self.match(vec, crop)
             
             label = "Unknown"
             score = 0.0
             
-            # --- F. ตัดสินใจและ Verify (Logic นิ่ง) ---
             if candidates:
                 top_name, top_score, _, _ = candidates[0]
-                
-                # เช็คคะแนน (Threshold)
                 if top_score > CFG.CONF_THRESHOLD:
-                    # ✅ LOGIC ใหม่: Counter Check
-                    # ต้องเห็นเป็นยาตัวเดิมซ้ำกัน X ครั้ง ถึงจะยอมรับ (กันภาพกระพริบ)
-                    if hasattr(self, 'last_seen_drug') and self.last_seen_drug == top_name:
-                        self.verify_counter = getattr(self, 'verify_counter', 0) + 1
-                    else:
-                        self.last_seen_drug = top_name
-                        self.verify_counter = 1
-                    
-                    # ถ้าเห็นต่อเนื่องเกิน 3 เฟรม (~0.3 วิ) ให้ฟันธงเลย
-                    if self.verify_counter >= 3:
-                        label = top_name
-                        score = top_score
-                        self.rx_manager.verify(label)
-                else:
-                    # ถ้าคะแนนตก ให้รีเซ็ต Counter
-                    self.verify_counter = 0
+                    label = top_name
+                    self.rx_manager.verify(label)
+                score = top_score
 
-            # เก็บผลลัพธ์
             detections.append({
                 'box': (rx1, ry1, rx2, ry2),
                 'contour': contour,
@@ -358,7 +307,6 @@ class AIProcessor:
                 'candidates': candidates
             })
             
-        # อัปเดตผลลัพธ์รวม (Thread Safe)
         with self.lock: self.results = detections
 
     def start(self):
