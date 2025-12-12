@@ -3,7 +3,7 @@
 ╔══════════════════════════════════════════════════════════════╗
 ║  PILLTRACK: SEGMENTATION MASTER (RGB STRICT)                 ║
 ║  - Model Type: YOLOv8 Segmentation (Masks/Contours)          ║
-║  - Feature: Prescription Lock + SIFT + Vector + Color        ║
+║  - Feature: EfficientNetV2 + SIFT + Vector + Color           ║
 ║  - Display: Real-time Mask Overlay (RGB888)                  ║
 ╚══════════════════════════════════════════════════════════════╝
 """
@@ -18,7 +18,7 @@ import numpy as np
 import cv2
 import torch
 import pickle
-from PIL import Image
+from PIL import Image # สำคัญมากสำหรับการแก้ Type Error
 from torchvision import models, transforms
 from ultralytics import YOLO
 
@@ -26,7 +26,6 @@ from ultralytics import YOLO
 @dataclass
 class Config:
     # --- PATHS (แก้ให้ตรงกับเครื่องคุณ) ---
-    # โมเดลต้องเป็น Type Segmentation
     MODEL_PACK: str = 'models/seg_best_process.pt' 
     MODEL_PILL: str = 'models/pills_seg.pt'
     
@@ -41,7 +40,7 @@ class Config:
     
     # Display & ROI
     DISPLAY_SIZE: Tuple[int, int] = (1280, 720)
-    AI_SIZE: int = 416 # Resize ก่อนเข้าโมเดล
+    AI_SIZE: int = 416 
     
     # 🚫 EXCLUSION ZONE (Dashboard Area)
     UI_ZONE_X_START: int = 900 
@@ -58,7 +57,7 @@ class Config:
 
 CFG = Config()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"🚀 SYSTEM STARTING ON: {device} (SEGMENTATION MODE)")
+print(f"🚀 SYSTEM STARTING ON: {device} (EfficientNetV2 MODE)")
 
 # ================= 🧠 PRESCRIPTION STATE MANAGER =================
 class PrescriptionManager:
@@ -99,40 +98,40 @@ class PrescriptionManager:
             if allowed in clean or clean in allowed:
                 self.verified_drugs.add(allowed)
 
-# ================= 🎨 FEATURE ENGINE (Vec + Color + SIFT) =================
+# ================= 🎨 FEATURE ENGINE (EfficientNetV2 + SIFT) =================
 class FeatureEngine:
-   # ใน class FeatureEngine:
-
     def __init__(self):
-        # 1. เปลี่ยนจาก ResNet50 เป็น EfficientNetV2 Small (เร็วกว่า แม่นกว่า)
+        # 1. EfficientNetV2 Small (เร็วกว่าและแม่นกว่า ResNet50)
         try:
-            # ใช้ Weights เวอร์ชั่นใหม่สุด
-            weights = models.EfficientNet_V2_S_Weights.DEFAULT 
+            print("🔄 Loading EfficientNetV2...")
+            weights = models.EfficientNet_V2_S_Weights.DEFAULT
             self.base = models.efficientnet_v2_s(weights=weights)
             
-            # EfficientNet โครงสร้างต่างจาก ResNet นิดหน่อย 
-            # วิธีดึง Vector คือตัดส่วน Classifier ทิ้ง (เหลือแต่ Feature Extractor)
-            self.base.classifier = torch.nn.Identity() 
+            # ตัดส่วน Classifier ออก เพื่อเอา Vector อย่างเดียว
+            self.base.classifier = torch.nn.Identity()
             
             self.model = self.base
             self.model.eval().to(device)
-
-            # Preprocess ของ EfficientNet V2 ฉลาดขึ้น (รองรับขนาดภาพยืดหยุ่นกว่า)
-            self.preprocess = transforms.Compose([
-            transforms.ToPILImage(),     # 1. แปลง Numpy เป็น PIL
-            weights.transforms()         # 2. เข้าสู่กระบวนการปกติของ EfficientNet
-        ])
+            
+            # ใช้ Transform มาตรฐานของ EfficientNet (คาดหวัง PIL Image)
+            self.preprocess = weights.transforms()
+            print("✅ EfficientNetV2 Loaded Successfully")
         except Exception as e: sys.exit(f"❌ Model Error: {e}")
 
-        # 2. SIFT Engine (เหมือนเดิม)
+        # 2. SIFT Engine
         self.sift = cv2.SIFT_create()
         self.bf = cv2.BFMatcher()
 
     @torch.no_grad()
     def get_vector(self, img_rgb):
+        # 🟢 FIX: แปลง NumPy Array (จาก OpenCV) เป็น PIL Image ก่อนส่งเข้า Transform
+        # สิ่งนี้แก้ Error: "pic should be Tensor or ndarray" ได้ 100%
         img_pil = Image.fromarray(img_rgb)
+        
         t = self.preprocess(img_pil).unsqueeze(0).to(device)
         vec = self.model(t).flatten().cpu().numpy()
+        
+        # Normalize Vector (L2 Norm)
         return vec / (np.linalg.norm(vec) + 1e-8)
 
     def get_sift_features(self, img_rgb):
@@ -222,8 +221,16 @@ class AIProcessor:
         query_sift_des = self.engine.get_sift_features(img_crop)
 
         for key, (real_name, db_v) in self.session_db_vec.items():
-            vec_score = np.dot(vec, db_v)
-            col_score = 0.5 # Placeholder (If you have real color hist, compare here)
+            # Dot Product (เพราะ Normalize แล้ว)
+            try:
+                # ตรวจสอบขนาด Vector ก่อน dot (เผื่อ DB เก่าใช้ ResNet 2048 แต่ EffNet 1280)
+                if vec.shape != db_v.shape:
+                    continue # ข้ามไปก่อนถ้าขนาดไม่เท่ากัน (ควรเคลียร์ DB ใหม่)
+                
+                vec_score = np.dot(vec, db_v)
+            except: vec_score = 0
+            
+            col_score = 0.5 
             sift_score = self.compute_sift_score(query_sift_des, real_name)
             
             final_score = (vec_score * CFG.WEIGHTS['vec']) + \
@@ -243,12 +250,7 @@ class AIProcessor:
         return unique
 
     def process_frame(self, frame):
-        # Resize for Inference
         img_ai = cv2.resize(frame, (CFG.AI_SIZE, CFG.AI_SIZE))
-        
-        # Inference (Segmentation Task)
-        # Note: We use the Pack model to detect both or separate if preferred.
-        # Assuming model handles segmentation logic.
         results = self.yolo_pack(img_ai, verbose=False, conf=0.4, imgsz=CFG.AI_SIZE, task='segment')
         
         detections = []
@@ -258,34 +260,32 @@ class AIProcessor:
             with self.lock: self.results = []
             return
 
-        # Iterate over Masks and Boxes
         for box, mask in zip(res.boxes, res.masks):
-            # 1. Bounding Box (For Cropping Logic)
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
             
-            # Scale Box to Display Size
             scale_x = CFG.DISPLAY_SIZE[0] / CFG.AI_SIZE
             scale_y = CFG.DISPLAY_SIZE[1] / CFG.AI_SIZE
             
             rx1, ry1 = int(x1 * scale_x), int(y1 * scale_y)
             rx2, ry2 = int(x2 * scale_x), int(y2 * scale_y)
             
-            # ROI Check
             cx, cy = (rx1+rx2)//2, (ry1+ry2)//2
             if cx > CFG.UI_ZONE_X_START and cy < CFG.UI_ZONE_Y_END: continue 
             
-            # 2. Extract Polygon (For Drawing)
-            # mask.xyn gives normalized coordinates (0-1). We scale them up.
-            contour = mask.xyn[0] # Get first contour
+            contour = mask.xyn[0]
             contour[:, 0] *= CFG.DISPLAY_SIZE[0]
             contour[:, 1] *= CFG.DISPLAY_SIZE[1]
             contour = contour.astype(np.int32)
             
-            # 3. Crop for Recognition (Using Box)
+            # Crop Image
+            # Ensure coordinates are within bounds
+            ry1, ry2 = max(0, ry1), min(frame.shape[0], ry2)
+            rx1, rx2 = max(0, rx1), min(frame.shape[1], rx2)
+            
             crop = frame[ry1:ry2, rx1:rx2]
             if crop.size == 0: continue
             
-            # 4. Recognize
+            # Recognize
             vec = self.engine.get_vector(crop)
             candidates = self.match(vec, crop)
             
@@ -299,7 +299,7 @@ class AIProcessor:
 
             detections.append({
                 'box': (rx1, ry1, rx2, ry2),
-                'contour': contour, # Store the shape!
+                'contour': contour,
                 'label': label,
                 'score': candidates[0][1] if candidates else 0.0,
                 'candidates': candidates
@@ -316,7 +316,7 @@ class AIProcessor:
             with self.lock: frame = self.latest_frame
             if frame is not None:
                 try: self.process_frame(frame)
-                except Exception as e: print(f"Err: {e}")
+                except Exception as e: print(f"Err Process: {e}")
             time.sleep(0.01)
 
 # ================= 📷 CAMERA (RGB888) =================
@@ -349,28 +349,22 @@ class Camera:
         if self.use_pi: self.picam.stop()
         else: self.cap.release()
 
-# ================= 🖥️ UI RENDERER (MASKS + OVERLAYS) =================
+# ================= 🖥️ UI RENDERER =================
 def draw_ui(frame, results, rx_manager):
     h, w = frame.shape[:2]
     
-    # 1. Draw Masks (Segmentation Overlay)
+    # 1. Draw Masks
     overlay = frame.copy()
     for det in results:
         contour = det['contour']
         label = det['label']
-        
-        # Color: Green if Known/Verified, Red if Unknown
         color = (0, 255, 0) if label != "Unknown" else (255, 0, 0)
-        
-        # Draw Filled Polygon on Overlay
         cv2.fillPoly(overlay, [contour], color)
-        # Draw Contour Line on Overlay
         cv2.polylines(overlay, [contour], True, color, 2)
     
-    # Apply Transparency (Alpha Blend)
     cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
 
-    # 2. Draw Labels & Boxes
+    # 2. Draw Labels
     for det in results:
         x1, y1, x2, y2 = det['box']
         label = det['label']
@@ -378,16 +372,13 @@ def draw_ui(frame, results, rx_manager):
         candidates = det['candidates']
         contour = det['contour']
         
-        # Get topmost point of contour for label placement
         top_point = tuple(contour[contour[:, 1].argmin()])
         tx, ty = top_point
         
-        # Label Background
         color = (0, 255, 0) if label != "Unknown" else (255, 0, 0)
         cv2.rectangle(frame, (tx, ty-25), (tx + len(label)*15, ty), color, -1)
         cv2.putText(frame, f"{label} {score:.0%}", (tx+5, ty-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
         
-        # Candidate Panel
         panel_x = x2 + 5 if x2 + 180 < w else x1 - 185
         panel_y = y1
         cv2.rectangle(frame, (panel_x, panel_y), (panel_x+180, panel_y+60), (0,0,0), -1)
@@ -420,11 +411,11 @@ if __name__ == "__main__":
     cam = Camera()
     ai = AIProcessor().start()
     
-    print("✨ Waiting for RGB888 feed (Segmentation Mode)...")
+    print("✨ Waiting for RGB888 feed (EfficientNetV2 Mode)...")
     while cam.get() is None: time.sleep(0.1)
     
-    cv2.namedWindow("PillTrack Segmentation", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("PillTrack Segmentation", *CFG.DISPLAY_SIZE)
+    cv2.namedWindow("PillTrack AI", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("PillTrack AI", *CFG.DISPLAY_SIZE)
     
     try:
         while True:
@@ -434,8 +425,7 @@ if __name__ == "__main__":
             ai.latest_frame = frame.copy()
             draw_ui(frame, ai.results, ai.rx_manager)
             
-            # Display STRICT RGB (Requires display to support it, usually works fine)
-            cv2.imshow("PillTrack Segmentation", frame)
+            cv2.imshow("PillTrack AI", frame)
             
             if cv2.waitKey(1) == ord('q'): break
             
