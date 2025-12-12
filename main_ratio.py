@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
-║  PILLTRACK: SEGMENTATION MASTER (RGB STRICT)                 ║
-║  - Model Type: YOLOv8 Segmentation (Masks/Contours)          ║
-║  - Feature: EfficientNetV2 + SIFT + Vector + Color           ║
-║  - Display: Real-time Mask Overlay (RGB888)                  ║
+║ PILLTRACK: THE DINOv2 EDITION (ViT-S/14)                     ║
+║ - Model Type: YOLOv8 Segmentation (Masks)                    ║
+║ - Feature: DINOv2 (Meta AI) - 384 Dimensions                 ║
+║ - Capability: High-Fidelity Texture Recognition              ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -18,46 +18,46 @@ import numpy as np
 import cv2
 import torch
 import pickle
-from PIL import Image # สำคัญมากสำหรับการแก้ Type Error
-from torchvision import models, transforms
+from torchvision import transforms
 from ultralytics import YOLO
 
 # ================= ⚙️ CONFIGURATION =================
 @dataclass
 class Config:
     # --- PATHS (แก้ให้ตรงกับเครื่องคุณ) ---
-    MODEL_PACK: str = 'models/seg_best_process.pt' 
+    MODEL_PACK: str = 'models/seg_best_process.pt'
     MODEL_PILL: str = 'models/pills_seg.pt'
     
-    # Databases
-    DB_PILLS_VEC: str = 'database/db_register/db_pills.pkl'
-    DB_PACKS_VEC: str = 'database/db_register/db_packs.pkl'
+    # 🔥 DINOv2 DATABASES (ต้องตรงกับไฟล์ที่ Build มา)
+    DB_PILLS_VEC: str = 'database/db_register/db_pills_dino.pkl'
+    DB_PACKS_VEC: str = 'database/db_register/db_packs_dino.pkl'
+    
+    # Color & SIFT Databases (ใช้ร่วมกันได้)
     DB_PILLS_COL: str = 'database/db_register/colors_pills.pkl'
     DB_PACKS_COL: str = 'database/db_register/colors_packs.pkl'
-    
-    IMG_DB_FOLDER: str = 'database_images' # For SIFT
+    IMG_DB_FOLDER: str = 'database_images' 
     PRESCRIPTION_FILE: str = 'prescription.txt'
-    
+
     # Display & ROI
     DISPLAY_SIZE: Tuple[int, int] = (1280, 720)
-    AI_SIZE: int = 416 
+    AI_SIZE: int = 416 # YOLO Input Size
     
     # 🚫 EXCLUSION ZONE (Dashboard Area)
-    UI_ZONE_X_START: int = 900 
+    UI_ZONE_X_START: int = 900
     UI_ZONE_Y_END: int = 220
     
     # 🎚️ TUNING THRESHOLDS
-    CONF_THRESHOLD: float = 0.5
+    CONF_THRESHOLD: float = 0.65 # DINO แม่นมาก ขยับ Threshold ขึ้นได้
     
-    # WEIGHTS FUSION: Vector 50%, Color 30%, SIFT 20%
-    WEIGHTS: Dict[str, float] = field(default_factory=lambda: {'vec': 0.5, 'col': 0.2, 'sift': 0.2}) 
+    # WEIGHTS FUSION: DINO เก่ง Texture มาก ให้ Weight เยอะหน่อย
+    # Vector 60%, Color 20%, SIFT 20%
+    WEIGHTS: Dict[str, float] = field(default_factory=lambda: {'vec': 0.6, 'col': 0.2, 'sift': 0.2})
     
-    # SIFT Tuning
     SIFT_RATIO_TEST: float = 0.75
 
 CFG = Config()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"🚀 SYSTEM STARTING ON: {device} (EfficientNetV2 MODE)")
+print(f"🚀 SYSTEM STARTING ON: {device} (DINOv2 MODE)")
 
 # ================= 🧠 PRESCRIPTION STATE MANAGER =================
 class PrescriptionManager:
@@ -71,7 +71,6 @@ class PrescriptionManager:
         if not os.path.exists(CFG.PRESCRIPTION_FILE):
             print("⚠️ Prescription file not found.")
             return
-
         try:
             with open(CFG.PRESCRIPTION_FILE, 'r', encoding='utf-8') as f:
                 for line in f:
@@ -83,7 +82,7 @@ class PrescriptionManager:
                         raw_drugs = parts[2].split(',')
                         self.allowed_drugs = [d.strip().lower() for d in raw_drugs if d.strip()]
                         print(f"📋 Rx for {self.patient_name}: {self.allowed_drugs}")
-                        break 
+                        break
         except Exception as e: print(f"Rx Error: {e}")
 
     def is_allowed(self, db_name):
@@ -98,40 +97,44 @@ class PrescriptionManager:
             if allowed in clean or clean in allowed:
                 self.verified_drugs.add(allowed)
 
-# ================= 🎨 FEATURE ENGINE (EfficientNetV2 + SIFT) =================
+# ================= 🎨 FEATURE ENGINE (DINOv2 + SIFT) =================
 class FeatureEngine:
     def __init__(self):
-        # 1. EfficientNetV2 Small (เร็วกว่าและแม่นกว่า ResNet50)
+        # 🔥 UPGRADE: DINOv2 (Vision Transformer)
+        print("🦕 Loading DINOv2 (ViT-S/14)... This might take a moment.")
         try:
-            print("🔄 Loading EfficientNetV2...")
-            weights = models.EfficientNet_V2_S_Weights.DEFAULT
-            self.base = models.efficientnet_v2_s(weights=weights)
-            
-            # ตัดส่วน Classifier ออก เพื่อเอา Vector อย่างเดียว
-            self.base.classifier = torch.nn.Identity()
-            
-            self.model = self.base
+            # โหลด Model จาก Torch Hub (ไม่ต้องมีไฟล์ weight ในเครื่อง มันโหลดเอง)
+            self.model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
             self.model.eval().to(device)
             
-            # ใช้ Transform มาตรฐานของ EfficientNet (คาดหวัง PIL Image)
-            self.preprocess = weights.transforms()
-            print("✅ EfficientNetV2 Loaded Successfully")
-        except Exception as e: sys.exit(f"❌ Model Error: {e}")
+            # Preprocessing ของ DINOv2 (Standard ImageNet)
+            self.preprocess = transforms.Compose([
+                transforms.ToPILImage(),
+                transforms.Resize((224, 224), antialias=True), # สำคัญ: ต้อง 224 หรือหาร 14 ลงตัว
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+            print("✅ DINOv2 Engine Ready (Vector Size: 384)")
+        except Exception as e:
+            print(f"❌ DINOv2 Load Error: {e}")
+            print("💡 Tip: Try running 'pip install timm'")
+            sys.exit(1)
 
-        # 2. SIFT Engine
+        # 2. SIFT Engine (Secondary Verification)
         self.sift = cv2.SIFT_create()
         self.bf = cv2.BFMatcher()
 
     @torch.no_grad()
     def get_vector(self, img_rgb):
-        # 🟢 FIX: แปลง NumPy Array (จาก OpenCV) เป็น PIL Image ก่อนส่งเข้า Transform
-        # สิ่งนี้แก้ Error: "pic should be Tensor or ndarray" ได้ 100%
-        img_pil = Image.fromarray(img_rgb)
+        # DINO รับ Input เป็น Batch Tensor
+        t = self.preprocess(img_rgb).unsqueeze(0).to(device)
         
-        t = self.preprocess(img_pil).unsqueeze(0).to(device)
-        vec = self.model(t).flatten().cpu().numpy()
+        # Inference
+        # บาง Version ของ Hub return dict, บางอัน return tensor
+        output = self.model(t)
         
-        # Normalize Vector (L2 Norm)
+        # Flatten & Normalize
+        vec = output.flatten().cpu().numpy()
         return vec / (np.linalg.norm(vec) + 1e-8)
 
     def get_sift_features(self, img_rgb):
@@ -139,23 +142,21 @@ class FeatureEngine:
         kp, des = self.sift.detectAndCompute(gray, None)
         return des
 
-# ================= 🤖 AI PROCESSOR (SEGMENTATION LOGIC) =================
+# ================= 🤖 AI PROCESSOR =================
 class AIProcessor:
     def __init__(self):
         self.engine = FeatureEngine()
         self.rx_manager = PrescriptionManager()
         
-        # Session Databases
-        self.session_db_vec = {} 
+        self.session_db_vec = {}
         self.session_db_col = {}
         self.session_db_sift = {}
         
         self.load_and_filter_db()
         
         try:
-            # Load as Segmentation Models
             self.yolo_pack = YOLO(CFG.MODEL_PACK) if os.path.exists(CFG.MODEL_PACK) else YOLO('yolov8n-seg.pt')
-            print("✅ YOLO Segmentation Models Loaded")
+            print("✅ YOLO Segmentation Loaded")
         except: sys.exit("❌ YOLO Error")
 
         self.latest_frame = None
@@ -164,7 +165,7 @@ class AIProcessor:
         self.stopped = False
 
     def load_and_filter_db(self):
-        print("🔍 Building Session Database...")
+        print("🔍 Loading DINOv2 Database...")
         def load_pkl(path):
             if os.path.exists(path):
                 with open(path, 'rb') as f: return pickle.load(f)
@@ -176,16 +177,20 @@ class AIProcessor:
         for name, vecs in all_vecs.items():
             if self.rx_manager.is_allowed(name):
                 for v in vecs:
-                    self.session_db_vec[f"{name}_{count}"] = (name, np.array(v)) 
+                    # DINOv2-Small ให้ Vector 384
+                    if len(v) != 384:
+                        # ถ้าเผลอโหลด Database เก่ามา มันจะฟ้องตรงนี้
+                        print(f"⚠️ Warning: Vector mismatch ({len(v)} vs 384) for {name}. Wrong DB file?")
+                        continue
+                    self.session_db_vec[f"{name}_{count}"] = (name, np.array(v))
                     count += 1
         
-        # 2. Load Colors
+        # 2. Load Colors & SIFT (เหมือนเดิม)
         all_cols = {**load_pkl(CFG.DB_PILLS_COL), **load_pkl(CFG.DB_PACKS_COL)}
         for name, col in all_cols.items():
             if self.rx_manager.is_allowed(name):
                 self.session_db_col[name] = col
 
-        # 3. Load SIFT
         if os.path.exists(CFG.IMG_DB_FOLDER):
             for drug_name in os.listdir(CFG.IMG_DB_FOLDER):
                 if not self.rx_manager.is_allowed(drug_name): continue
@@ -201,7 +206,6 @@ class AIProcessor:
                                 if des is not None: descriptors_list.append(des)
                     if descriptors_list:
                         self.session_db_sift[drug_name] = descriptors_list
-                        print(f"   + SIFT: {drug_name}")
 
     def compute_sift_score(self, query_des, target_name):
         if query_des is None or target_name not in self.session_db_sift: return 0.0
@@ -221,25 +225,23 @@ class AIProcessor:
         query_sift_des = self.engine.get_sift_features(img_crop)
 
         for key, (real_name, db_v) in self.session_db_vec.items():
-            # Dot Product (เพราะ Normalize แล้ว)
-            try:
-                # ตรวจสอบขนาด Vector ก่อน dot (เผื่อ DB เก่าใช้ ResNet 2048 แต่ EffNet 1280)
-                if vec.shape != db_v.shape:
-                    continue # ข้ามไปก่อนถ้าขนาดไม่เท่ากัน (ควรเคลียร์ DB ใหม่)
-                
-                vec_score = np.dot(vec, db_v)
-            except: vec_score = 0
+            # Cosine Similarity
+            vec_score = np.dot(vec, db_v)
             
+            # Color Check (Placeholder logic - implement histogram comparison if needed)
             col_score = 0.5 
+            
             sift_score = self.compute_sift_score(query_sift_des, real_name)
             
             final_score = (vec_score * CFG.WEIGHTS['vec']) + \
                           (col_score * CFG.WEIGHTS['col']) + \
                           (sift_score * CFG.WEIGHTS['sift'])
-                          
+            
             candidates.append((real_name, final_score, vec_score, sift_score))
-        
+
         candidates.sort(key=lambda x: x[1], reverse=True)
+        
+        # Filter duplicates (keep best score per drug name)
         unique = []
         seen = set()
         for n, fs, vs, ss in candidates:
@@ -251,57 +253,57 @@ class AIProcessor:
 
     def process_frame(self, frame):
         img_ai = cv2.resize(frame, (CFG.AI_SIZE, CFG.AI_SIZE))
+        
+        # YOLO Segmentation Inference
         results = self.yolo_pack(img_ai, verbose=False, conf=0.4, imgsz=CFG.AI_SIZE, task='segment')
         
         detections = []
         res = results[0]
-        
         if res.masks is None:
             with self.lock: self.results = []
             return
 
         for box, mask in zip(res.boxes, res.masks):
+            # 1. Box Scaling
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-            
             scale_x = CFG.DISPLAY_SIZE[0] / CFG.AI_SIZE
             scale_y = CFG.DISPLAY_SIZE[1] / CFG.AI_SIZE
-            
             rx1, ry1 = int(x1 * scale_x), int(y1 * scale_y)
             rx2, ry2 = int(x2 * scale_x), int(y2 * scale_y)
             
+            # ROI Filter
             cx, cy = (rx1+rx2)//2, (ry1+ry2)//2
-            if cx > CFG.UI_ZONE_X_START and cy < CFG.UI_ZONE_Y_END: continue 
-            
+            if cx > CFG.UI_ZONE_X_START and cy < CFG.UI_ZONE_Y_END: continue
+
+            # 2. Contour Extraction
             contour = mask.xyn[0]
             contour[:, 0] *= CFG.DISPLAY_SIZE[0]
             contour[:, 1] *= CFG.DISPLAY_SIZE[1]
             contour = contour.astype(np.int32)
-            
-            # Crop Image
-            # Ensure coordinates are within bounds
-            ry1, ry2 = max(0, ry1), min(frame.shape[0], ry2)
-            rx1, rx2 = max(0, rx1), min(frame.shape[1], rx2)
-            
+
+            # 3. Crop
             crop = frame[ry1:ry2, rx1:rx2]
             if crop.size == 0: continue
-            
-            # Recognize
+
+            # 4. Identification (DINOv2)
             vec = self.engine.get_vector(crop)
             candidates = self.match(vec, crop)
             
+            label = "Unknown"
+            score = 0.0
+            
             if candidates:
                 top_name, top_score, _, _ = candidates[0]
-                label = top_name if top_score > CFG.CONF_THRESHOLD else "Unknown"
-                if label != "Unknown": self.rx_manager.verify(label)
-            else:
-                label = "Unknown"
-                candidates = []
+                if top_score > CFG.CONF_THRESHOLD:
+                    label = top_name
+                    self.rx_manager.verify(label)
+                score = top_score
 
             detections.append({
                 'box': (rx1, ry1, rx2, ry2),
                 'contour': contour,
                 'label': label,
-                'score': candidates[0][1] if candidates else 0.0,
+                'score': score,
                 'candidates': candidates
             })
             
@@ -310,16 +312,15 @@ class AIProcessor:
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
         return self
-        
     def _run(self):
         while not self.stopped:
             with self.lock: frame = self.latest_frame
             if frame is not None:
                 try: self.process_frame(frame)
-                except Exception as e: print(f"Err Process: {e}")
+                except Exception as e: print(f"Err: {e}")
             time.sleep(0.01)
 
-# ================= 📷 CAMERA (RGB888) =================
+# ================= 📷 CAMERA =================
 class Camera:
     def __init__(self):
         self.cap = None
@@ -337,14 +338,12 @@ class Camera:
             self.cap.set(4, CFG.DISPLAY_SIZE[1])
             self.use_pi = False
             print("📷 USB Camera: Converting BGR to RGB888")
-            
     def get(self):
         if self.use_pi: return self.picam.capture_array()
         else:
             ret, frame = self.cap.read()
             if ret: return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             return None
-    
     def stop(self):
         if self.use_pi: self.picam.stop()
         else: self.cap.release()
@@ -352,8 +351,7 @@ class Camera:
 # ================= 🖥️ UI RENDERER =================
 def draw_ui(frame, results, rx_manager):
     h, w = frame.shape[:2]
-    
-    # 1. Draw Masks
+    # Overlay for Masks
     overlay = frame.copy()
     for det in results:
         contour = det['contour']
@@ -361,10 +359,9 @@ def draw_ui(frame, results, rx_manager):
         color = (0, 255, 0) if label != "Unknown" else (255, 0, 0)
         cv2.fillPoly(overlay, [contour], color)
         cv2.polylines(overlay, [contour], True, color, 2)
-    
     cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
 
-    # 2. Draw Labels
+    # Labels
     for det in results:
         x1, y1, x2, y2 = det['box']
         label = det['label']
@@ -374,31 +371,33 @@ def draw_ui(frame, results, rx_manager):
         
         top_point = tuple(contour[contour[:, 1].argmin()])
         tx, ty = top_point
-        
+
         color = (0, 255, 0) if label != "Unknown" else (255, 0, 0)
         cv2.rectangle(frame, (tx, ty-25), (tx + len(label)*15, ty), color, -1)
         cv2.putText(frame, f"{label} {score:.0%}", (tx+5, ty-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
         
+        # Candidate Panel (แสดงว่า AI สงสัยว่าเป็นยาอะไรบ้าง)
         panel_x = x2 + 5 if x2 + 180 < w else x1 - 185
         panel_y = y1
         cv2.rectangle(frame, (panel_x, panel_y), (panel_x+180, panel_y+60), (0,0,0), -1)
-        cv2.putText(frame, "AI CANDIDATES:", (panel_x+5, panel_y+15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200,200,200), 1)
+        cv2.putText(frame, "DINOv2 SEES:", (panel_x+5, panel_y+15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200,200,200), 1)
         
-        for i, (c_name, c_score, c_vec, c_sift) in enumerate(candidates[:3]):
-            d_name = (c_name[:9] + '.') if len(c_name) > 9 else c_name
-            c_col = (0, 255, 0) if c_score > CFG.CONF_THRESHOLD else (255, 100, 0)
-            line = f"{i+1}.{d_name} {c_score:.2f} (S:{c_sift:.1f})"
-            cv2.putText(frame, line, (panel_x+5, panel_y+30+(i*15)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, c_col, 1)
+        if candidates:
+            for i, (c_name, c_score, c_vec, c_sift) in enumerate(candidates[:3]):
+                d_name = (c_name[:9] + '.') if len(c_name) > 9 else c_name
+                c_col = (0, 255, 0) if c_score > CFG.CONF_THRESHOLD else (255, 100, 0)
+                line = f"{i+1}.{d_name} {c_score:.2f}"
+                cv2.putText(frame, line, (panel_x+5, panel_y+30+(i*15)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, c_col, 1)
 
-    # 3. Dashboard
+    # Dashboard
     db_x, db_y = CFG.UI_ZONE_X_START, 10
     db_w, db_h = w - db_x - 10, CFG.UI_ZONE_Y_END
     sub = frame[db_y:db_y+db_h, db_x:db_x+db_w]
     white = np.ones(sub.shape, dtype=np.uint8) * 30
     cv2.addWeighted(sub, 0.3, white, 0.7, 0, sub)
     cv2.rectangle(frame, (db_x, db_y), (db_x+db_w, db_y+db_h), (0, 255, 0), 2)
-    cv2.putText(frame, f"RX: {rx_manager.patient_name}", (db_x+10, db_y+30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
     
+    cv2.putText(frame, f"RX: {rx_manager.patient_name}", (db_x+10, db_y+30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
     y_off = 60
     for drug in rx_manager.allowed_drugs:
         status = " [OK]" if drug in rx_manager.verified_drugs else " [...]"
@@ -410,12 +409,12 @@ def draw_ui(frame, results, rx_manager):
 if __name__ == "__main__":
     cam = Camera()
     ai = AIProcessor().start()
+    print("✨ Waiting for RGB888 feed (DINOv2 Mode)...")
     
-    print("✨ Waiting for RGB888 feed (EfficientNetV2 Mode)...")
     while cam.get() is None: time.sleep(0.1)
     
-    cv2.namedWindow("PillTrack AI", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("PillTrack AI", *CFG.DISPLAY_SIZE)
+    cv2.namedWindow("PillTrack DINOv2", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("PillTrack DINOv2", *CFG.DISPLAY_SIZE)
     
     try:
         while True:
@@ -425,10 +424,8 @@ if __name__ == "__main__":
             ai.latest_frame = frame.copy()
             draw_ui(frame, ai.results, ai.rx_manager)
             
-            cv2.imshow("PillTrack AI", frame)
-            
+            cv2.imshow("PillTrack DINOv2", frame)
             if cv2.waitKey(1) == ord('q'): break
-            
     except KeyboardInterrupt:
         print("Stopping...")
     finally:
