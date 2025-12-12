@@ -51,7 +51,7 @@ class Config:
     CONF_THRESHOLD: float = 0.35
     
     # WEIGHTS FUSION: Vector 50%, Color 30%, SIFT 20%
-    WEIGHTS: Dict[str, float] = field(default_factory=lambda: {'vec': 0.5, 'col': 0.3, 'sift': 0.2}) 
+    WEIGHTS: Dict[str, float] = field(default_factory=lambda: {'vec': 0.5, 'col': 0.2, 'sift': 0.3}) 
     
     # SIFT Tuning
     SIFT_RATIO_TEST: float = 0.85
