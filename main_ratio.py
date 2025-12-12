@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
-║  PILLTRACK: SEGMENTATION MASTER (RGB STRICT)                 ║
-║  - Model Type: YOLOv8 Segmentation (Masks/Contours)          ║
-║  - Feature: Prescription Lock + SIFT + Vector + Color        ║
-║  - Display: Real-time Mask Overlay (RGB888)                  ║
+║  PILLTRACK: DUAL PIPELINE ARCHITECTURE (HIGH ACCURACY)       ║
+║  - Pipeline 1: Pack Detection (Model A -> DB Packs)          ║
+║  - Pipeline 2: Pill Detection (Model B -> DB Pills)          ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -25,40 +24,38 @@ from ultralytics import YOLO
 # ================= ⚙️ CONFIGURATION =================
 @dataclass
 class Config:
-    # --- PATHS (แก้ให้ตรงกับเครื่องคุณ) ---
-    # โมเดลต้องเป็น Type Segmentation
-    MODEL_PACK: str = 'models/seg_best_process.pt' 
-    MODEL_PILL: str = 'models/pills_seg.pt'
+    # --- PATHS ---
+    # แยกโมเดลกันทำงานชัดเจน
+    MODEL_PACK_PATH: str = 'models/seg_best_process.pt' 
+    MODEL_PILL_PATH: str = 'models/pills_seg.pt'
     
-    # Databases
+    # แยก Database ออกจากกัน
     DB_PILLS_VEC: str = 'database/db_register/db_pills.pkl'
     DB_PACKS_VEC: str = 'database/db_register/db_packs.pkl'
     DB_PILLS_COL: str = 'database/db_register/colors_pills.pkl'
     DB_PACKS_COL: str = 'database/db_register/colors_packs.pkl'
     
-    IMG_DB_FOLDER: str = 'database_images' # For SIFT
+    IMG_DB_FOLDER: str = 'database_images' # SIFT Images
     PRESCRIPTION_FILE: str = 'prescription.txt'
     
     # Display & ROI
     DISPLAY_SIZE: Tuple[int, int] = (1280, 720)
-    AI_SIZE: int = 416 # Resize ก่อนเข้าโมเดล
+    AI_SIZE: int = 640 # เพิ่มความละเอียดเพื่อให้ Model 2 ตัวทำงานแม่นขึ้น (เดิม 416)
     
     # 🚫 EXCLUSION ZONE (Dashboard Area)
     UI_ZONE_X_START: int = 900 
     UI_ZONE_Y_END: int = 220
     
-    # 🎚️ TUNING THRESHOLDS
-    CONF_THRESHOLD: float = 0.35
-    
-    # WEIGHTS FUSION: Vector 50%, Color 30%, SIFT 20%
-    WEIGHTS: Dict[str, float] = field(default_factory=lambda: {'vec': 0.5, 'col': 0.3, 'sift': 0.2}) 
+    # 🎚️ TUNING (แยก Threshold ได้อิสระ)
+    CONF_PACK: float = 0.40
+    CONF_PILL: float = 0.50
     
     # SIFT Tuning
     SIFT_RATIO_TEST: float = 0.75
 
 CFG = Config()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"🚀 SYSTEM STARTING ON: {device} (SEGMENTATION MODE)")
+print(f"🚀 SYSTEM STARTING ON: {device} (DUAL PIPELINE MODE)")
 
 # ================= 🧠 PRESCRIPTION STATE MANAGER =================
 class PrescriptionManager:
@@ -99,10 +96,10 @@ class PrescriptionManager:
             if allowed in clean or clean in allowed:
                 self.verified_drugs.add(allowed)
 
-# ================= 🎨 FEATURE ENGINE (Vec + Color + SIFT) =================
+# ================= 🎨 FEATURE ENGINE =================
 class FeatureEngine:
     def __init__(self):
-        # 1. ResNet50 for Vectors
+        # 1. ResNet50
         try:
             weights = models.ResNet50_Weights.DEFAULT
             base = models.resnet50(weights=weights)
@@ -131,172 +128,214 @@ class FeatureEngine:
         kp, des = self.sift.detectAndCompute(gray, None)
         return des
 
-# ================= 🤖 AI PROCESSOR (SEGMENTATION LOGIC) =================
+# ================= 🤖 AI PROCESSOR (DUAL CORE) =================
 class AIProcessor:
     def __init__(self):
         self.engine = FeatureEngine()
         self.rx_manager = PrescriptionManager()
         
-        # Session Databases
-        self.session_db_vec = {} 
-        self.session_db_col = {}
-        self.session_db_sift = {}
+        # --- SEPARATED DATABASES ---
+        # เลน Pack
+        self.db_packs_vec = {} 
+        self.db_packs_sift = {}
+        self.db_packs_col = {}
         
-        self.load_and_filter_db()
+        # เลน Pill
+        self.db_pills_vec = {}
+        self.db_pills_col = {} # Pill ไม่เน้น SIFT
+        
+        self.load_separate_dbs()
         
         try:
-            # Load as Segmentation Models
-            self.yolo_pack = YOLO(CFG.MODEL_PACK) if os.path.exists(CFG.MODEL_PACK) else YOLO('yolov8n-seg.pt')
-            print("✅ YOLO Segmentation Models Loaded")
-        except: sys.exit("❌ YOLO Error")
+            print("⏳ Loading Models...")
+            # Load 2 Separate Models
+            self.model_pack = YOLO(CFG.MODEL_PACK_PATH)
+            self.model_pill = YOLO(CFG.MODEL_PILL_PATH)
+            print("✅ DUAL Models Loaded (Pack & Pill)")
+        except Exception as e: sys.exit(f"❌ Model Error: {e}")
 
         self.latest_frame = None
         self.results = []
         self.lock = threading.Lock()
         self.stopped = False
 
-    def load_and_filter_db(self):
-        print("🔍 Building Session Database...")
+    def load_separate_dbs(self):
+        print("🔍 Building Dual Database...")
         def load_pkl(path):
             if os.path.exists(path):
                 with open(path, 'rb') as f: return pickle.load(f)
             return {}
 
-        # 1. Load Vectors
-        all_vecs = {**load_pkl(CFG.DB_PILLS_VEC), **load_pkl(CFG.DB_PACKS_VEC)}
-        count = 0
-        for name, vecs in all_vecs.items():
+        # 1. Load PACKS
+        packs_raw = load_pkl(CFG.DB_PACKS_VEC)
+        count_pack = 0
+        for name, vecs in packs_raw.items():
             if self.rx_manager.is_allowed(name):
                 for v in vecs:
-                    self.session_db_vec[f"{name}_{count}"] = (name, np.array(v)) 
-                    count += 1
+                    self.db_packs_vec[f"{name}_{count_pack}"] = (name, np.array(v))
+                    count_pack += 1
         
-        # 2. Load Colors
-        all_cols = {**load_pkl(CFG.DB_PILLS_COL), **load_pkl(CFG.DB_PACKS_COL)}
-        for name, col in all_cols.items():
-            if self.rx_manager.is_allowed(name):
-                self.session_db_col[name] = col
-
-        # 3. Load SIFT
+        # Load SIFT for PACKS ONLY
         if os.path.exists(CFG.IMG_DB_FOLDER):
             for drug_name in os.listdir(CFG.IMG_DB_FOLDER):
+                # โหลดเฉพาะตัวที่เป็น Pack (สมมติชื่อไฟล์หรือ Folder บ่งบอก หรือ Rx check)
                 if not self.rx_manager.is_allowed(drug_name): continue
+                
                 drug_path = os.path.join(CFG.IMG_DB_FOLDER, drug_name)
                 if os.path.isdir(drug_path):
                     descriptors_list = []
-                    for img_file in sorted(os.listdir(drug_path))[:3]:
-                        if img_file.lower().endswith(('jpg', 'png', 'jpeg')):
+                    for img_file in sorted(os.listdir(drug_path))[:2]: # จำกัดจำนวนรูป Reference
+                        if img_file.lower().endswith(('jpg', 'png')):
                             img = cv2.imread(os.path.join(drug_path, img_file))
                             if img is not None:
                                 img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                                 des = self.engine.get_sift_features(img)
                                 if des is not None: descriptors_list.append(des)
                     if descriptors_list:
-                        self.session_db_sift[drug_name] = descriptors_list
-                        print(f"   + SIFT: {drug_name}")
+                        self.db_packs_sift[drug_name] = descriptors_list
+        
+        # 2. Load PILLS
+        pills_raw = load_pkl(CFG.DB_PILLS_VEC)
+        count_pill = 0
+        for name, vecs in pills_raw.items():
+            if self.rx_manager.is_allowed(name):
+                for v in vecs:
+                    self.db_pills_vec[f"{name}_{count_pill}"] = (name, np.array(v))
+                    count_pill += 1
 
-    def compute_sift_score(self, query_des, target_name):
-        if query_des is None or target_name not in self.session_db_sift: return 0.0
+        print(f"   + Packs Loaded: {count_pack} vectors")
+        print(f"   + Pills Loaded: {count_pill} vectors")
+
+    def compute_sift_score(self, query_des, target_name, db_sift):
+        if query_des is None or target_name not in db_sift: return 0.0
         max_matches = 0
-        for ref_des in self.session_db_sift[target_name]:
+        for ref_des in db_sift[target_name]:
             try:
                 matches = self.engine.bf.knnMatch(query_des, ref_des, k=2)
                 good = [m for m, n in matches if m.distance < CFG.SIFT_RATIO_TEST * n.distance]
                 if len(good) > max_matches: max_matches = len(good)
             except: pass
-        return min(max_matches / 15.0, 1.0)
+        
+        # Normalize score (สมมติว่าเจอ 10 จุดคือเต็ม 100%)
+        return min(max_matches / 10.0, 1.0)
 
-    def match(self, vec, img_crop):
+    # --- PIPELINE 1: PACK MATCHING ---
+    def match_pack(self, vec, img_crop):
         candidates = []
-        if not self.session_db_vec: return []
+        if not self.db_packs_vec: return []
 
-        query_sift_des = self.engine.get_sift_features(img_crop)
+        query_sift = self.engine.get_sift_features(img_crop)
 
-        for key, (real_name, db_v) in self.session_db_vec.items():
+        for key, (real_name, db_v) in self.db_packs_vec.items():
+            # Vector Similarity
             vec_score = np.dot(vec, db_v)
-            col_score = 0.5 # Placeholder (If you have real color hist, compare here)
-            sift_score = self.compute_sift_score(query_sift_des, real_name)
             
-            final_score = (vec_score * CFG.WEIGHTS['vec']) + \
-                          (col_score * CFG.WEIGHTS['col']) + \
-                          (sift_score * CFG.WEIGHTS['sift'])
-                          
-            candidates.append((real_name, final_score, vec_score, sift_score))
+            # SIFT Similarity (เฉพาะ Pack ที่เน้น)
+            sift_score = self.compute_sift_score(query_sift, real_name, self.db_packs_sift)
+            
+            # Pack Weight: ให้ค่า SIFT สูงหน่อย
+            final_score = (vec_score * 0.4) + (sift_score * 0.6) 
+            
+            candidates.append((real_name, final_score))
         
         candidates.sort(key=lambda x: x[1], reverse=True)
-        unique = []
-        seen = set()
-        for n, fs, vs, ss in candidates:
-            if n not in seen:
-                unique.append((n, fs, vs, ss))
-                seen.add(n)
-            if len(unique) >= 5: break
-        return unique
+        return candidates[:1] # เอาตัวที่ดีที่สุด
+
+    # --- PIPELINE 2: PILL MATCHING ---
+    def match_pill(self, vec, img_crop):
+        candidates = []
+        if not self.db_pills_vec: return []
+
+        # Pill ไม่ทำ SIFT เพื่อประหยัดแรงและลด Noise
+        for key, (real_name, db_v) in self.db_pills_vec.items():
+            vec_score = np.dot(vec, db_v)
+            
+            # Color Check (ใส่ Logic ง่ายๆ ไว้ก่อน หรือรอฟังก์ชันเทียบสี)
+            # Pill Weight: Vector 100% (เดี๋ยวเพิ่ม Color ใน step ถัดไป)
+            final_score = vec_score 
+            
+            candidates.append((real_name, final_score))
+        
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return candidates[:1]
 
     def process_frame(self, frame):
-        # Resize for Inference
         img_ai = cv2.resize(frame, (CFG.AI_SIZE, CFG.AI_SIZE))
-        
-        # Inference (Segmentation Task)
-        # Note: We use the Pack model to detect both or separate if preferred.
-        # Assuming model handles segmentation logic.
-        results = self.yolo_pack(img_ai, verbose=False, conf=0.35, imgsz=CFG.AI_SIZE, task='segment')
-        
-        detections = []
-        res = results[0]
-        
-        if res.masks is None:
-            with self.lock: self.results = []
-            return
+        combined_detections = []
 
-        # Iterate over Masks and Boxes
+        # ---------------------------------------------------------
+        # PIPELINE 1: Detect PACKS
+        # ---------------------------------------------------------
+        results_pack = self.model_pack(img_ai, verbose=False, conf=CFG.CONF_PACK, imgsz=CFG.AI_SIZE, task='segment')
+        if results_pack[0].masks is not None:
+            combined_detections.extend(self._extract_detections(frame, results_pack[0], mode='pack'))
+
+        # ---------------------------------------------------------
+        # PIPELINE 2: Detect PILLS
+        # ---------------------------------------------------------
+        results_pill = self.model_pill(img_ai, verbose=False, conf=CFG.CONF_PILL, imgsz=CFG.AI_SIZE, task='segment')
+        if results_pill[0].masks is not None:
+            combined_detections.extend(self._extract_detections(frame, results_pill[0], mode='pill'))
+            
+        with self.lock: self.results = combined_detections
+
+    def _extract_detections(self, frame, res, mode):
+        detections = []
+        # Loop ผ่าน Results
         for box, mask in zip(res.boxes, res.masks):
-            # 1. Bounding Box (For Cropping Logic)
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
             
-            # Scale Box to Display Size
+            # Scale กลับมาขนาดจอจริง
             scale_x = CFG.DISPLAY_SIZE[0] / CFG.AI_SIZE
             scale_y = CFG.DISPLAY_SIZE[1] / CFG.AI_SIZE
+            rx1, ry1 = int(x1*scale_x), int(y1*scale_y)
+            rx2, ry2 = int(x2*scale_x), int(y2*scale_y)
             
-            rx1, ry1 = int(x1 * scale_x), int(y1 * scale_y)
-            rx2, ry2 = int(x2 * scale_x), int(y2 * scale_y)
-            
-            # ROI Check
+            # Dashboard Check
             cx, cy = (rx1+rx2)//2, (ry1+ry2)//2
             if cx > CFG.UI_ZONE_X_START and cy < CFG.UI_ZONE_Y_END: continue 
             
-            # 2. Extract Polygon (For Drawing)
-            # mask.xyn gives normalized coordinates (0-1). We scale them up.
-            contour = mask.xyn[0] # Get first contour
+            # Contour
+            contour = mask.xyn[0]
             contour[:, 0] *= CFG.DISPLAY_SIZE[0]
             contour[:, 1] *= CFG.DISPLAY_SIZE[1]
             contour = contour.astype(np.int32)
             
-            # 3. Crop for Recognition (Using Box)
+            # Crop & Recognize
             crop = frame[ry1:ry2, rx1:rx2]
             if crop.size == 0: continue
             
-            # 4. Recognize
             vec = self.engine.get_vector(crop)
-            candidates = self.match(vec, crop)
             
-            if candidates:
-                top_name, top_score, _, _ = candidates[0]
-                label = top_name if top_score > CFG.CONF_THRESHOLD else "Unknown"
-                if label != "Unknown": self.rx_manager.verify(label)
+            # *** KEY: แยก Logic การ Match ***
+            if mode == 'pack':
+                candidates = self.match_pack(vec, crop)
+                display_color = (0, 255, 255) # สีเหลืองสำหรับ Pack
             else:
-                label = "Unknown"
-                candidates = []
+                candidates = self.match_pill(vec, crop)
+                display_color = (255, 0, 255) # สีม่วงสำหรับ Pill
+            
+            # Threshold Check
+            label = "Unknown"
+            score = 0.0
+            if candidates:
+                top_name, top_score = candidates[0]
+                # ใช้ Threshold แยกกันได้
+                thresh = CFG.CONF_PACK if mode == 'pack' else CFG.CONF_PILL
+                if top_score > thresh:
+                    label = top_name
+                    score = top_score
+                    self.rx_manager.verify(label)
 
             detections.append({
+                'type': mode, # เก็บ Type ไว้ใช้แสดงผล
                 'box': (rx1, ry1, rx2, ry2),
-                'contour': contour, # Store the shape!
+                'contour': contour,
                 'label': label,
-                'score': candidates[0][1] if candidates else 0.0,
-                'candidates': candidates
+                'score': score,
+                'color': display_color
             })
-            
-        with self.lock: self.results = detections
+        return detections
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
@@ -310,7 +349,7 @@ class AIProcessor:
                 except Exception as e: print(f"Err: {e}")
             time.sleep(0.01)
 
-# ================= 📷 CAMERA (RGB888) =================
+# ================= 📷 CAMERA =================
 class Camera:
     def __init__(self):
         self.cap = None
@@ -340,82 +379,63 @@ class Camera:
         if self.use_pi: self.picam.stop()
         else: self.cap.release()
 
-# ================= 🖥️ UI RENDERER (MASKS + OVERLAYS) =================
+# ================= 🖥️ UI RENDERER =================
 def draw_ui(frame, results, rx_manager):
     h, w = frame.shape[:2]
-    
-    # 1. Draw Masks (Segmentation Overlay)
     overlay = frame.copy()
+    
+    # 1. Draw Detections
     for det in results:
         contour = det['contour']
         label = det['label']
+        score = det['score']
+        dtype = det['type']
         
-        # Color: Green if Known/Verified, Red if Unknown
-        color = (0, 255, 0) if label != "Unknown" else (255, 0, 0)
+        # Color Logic: Known vs Unknown
+        base_color = det['color'] if label != "Unknown" else (255, 0, 0)
         
-        # Draw Filled Polygon on Overlay
-        cv2.fillPoly(overlay, [contour], color)
-        # Draw Contour Line on Overlay
-        cv2.polylines(overlay, [contour], True, color, 2)
-    
-    # Apply Transparency (Alpha Blend)
-    cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
+        # Draw Mask
+        cv2.fillPoly(overlay, [contour], base_color)
+        cv2.polylines(overlay, [contour], True, (255,255,255), 2)
+        
+        # Draw Label (บนสุดของ Contour)
+        top_point = tuple(contour[contour[:, 1].argmin()])
+        tx, ty = top_point
+        
+        text = f"[{dtype.upper()}] {label} ({score:.2f})"
+        cv2.putText(frame, text, (tx, ty-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, base_color, 2)
 
-    # 2. Draw Labels & Boxes
-    # for det in results:
-    #     x1, y1, x2, y2 = det['box']
-    #     label = det['label']
-    #     score = det['score']
-    #     candidates = det['candidates']
-    #     contour = det['contour']
-        
-    #     # Get topmost point of contour for label placement
-    #     top_point = tuple(contour[contour[:, 1].argmin()])
-    #     tx, ty = top_point
-        
-    #     # Label Background
-    #     color = (0, 255, 0) if label != "Unknown" else (255, 0, 0)
-    #     cv2.rectangle(frame, (tx, ty-25), (tx + len(label)*15, ty), color, -1)
-    #     cv2.putText(frame, f"{label} {score:.0%}", (tx+5, ty-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
-        
-    #     # Candidate Panel
-    #     panel_x = x2 + 5 if x2 + 180 < w else x1 - 185
-    #     panel_y = y1
-    #     cv2.rectangle(frame, (panel_x, panel_y), (panel_x+180, panel_y+60), (0,0,0), -1)
-    #     cv2.putText(frame, "AI CANDIDATES:", (panel_x+5, panel_y+15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200,200,200), 1)
-        
-    #     for i, (c_name, c_score, c_vec, c_sift) in enumerate(candidates[:3]):
-    #         d_name = (c_name[:9] + '.') if len(c_name) > 9 else c_name
-    #         c_col = (0, 255, 0) if c_score > CFG.CONF_THRESHOLD else (255, 100, 0)
-    #         line = f"{i+1}.{d_name} {c_score:.2f} (S:{c_sift:.1f})"
-    #         cv2.putText(frame, line, (panel_x+5, panel_y+30+(i*15)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, c_col, 1)
+    cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
 
-    # 3. Dashboard
+    # 2. Dashboard
     db_x, db_y = CFG.UI_ZONE_X_START, 10
     db_w, db_h = w - db_x - 10, CFG.UI_ZONE_Y_END
-    sub = frame[db_y:db_y+db_h, db_x:db_x+db_w]
-    white = np.ones(sub.shape, dtype=np.uint8) * 30
-    cv2.addWeighted(sub, 0.3, white, 0.7, 0, sub)
-    cv2.rectangle(frame, (db_x, db_y), (db_x+db_w, db_y+db_h), (0, 255, 0), 2)
-    cv2.putText(frame, f"RX: {rx_manager.patient_name}", (db_x+10, db_y+30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
     
-    y_off = 60
+    # Dashboard Background
+    cv2.rectangle(frame, (db_x, db_y), (db_x+db_w, db_y+db_h), (0, 0, 0), -1)
+    cv2.rectangle(frame, (db_x, db_y), (db_x+db_w, db_y+db_h), (0, 255, 0), 2)
+    
+    cv2.putText(frame, f"RX: {rx_manager.patient_name}", (db_x+10, db_y+30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+    
+    y_off = 70
     for drug in rx_manager.allowed_drugs:
-        status = " [OK]" if drug in rx_manager.verified_drugs else " [...]"
-        col = (0, 255, 0) if drug in rx_manager.verified_drugs else (200, 200, 200)
-        cv2.putText(frame, f"- {drug}{status}", (db_x+10, db_y+y_off), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
-        y_off += 25
+        is_verified = drug in rx_manager.verified_drugs
+        status_icon = " [OK]" if is_verified else " [...]"
+        text_col = (0, 255, 0) if is_verified else (150, 150, 150)
+        
+        cv2.putText(frame, f"- {drug}{status_icon}", (db_x+10, db_y+y_off), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_col, 1)
+        y_off += 30
 
 # ================= 🚀 MAIN =================
 if __name__ == "__main__":
     cam = Camera()
     ai = AIProcessor().start()
     
-    print("✨ Waiting for RGB888 feed (Segmentation Mode)...")
+    print("✨ System Ready. Waiting for video...")
     while cam.get() is None: time.sleep(0.1)
     
-    cv2.namedWindow("PillTrack Segmentation", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("PillTrack Segmentation", *CFG.DISPLAY_SIZE)
+    cv2.namedWindow("PillTrack: Dual Pipeline", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("PillTrack: Dual Pipeline", *CFG.DISPLAY_SIZE)
     
     try:
         while True:
@@ -425,8 +445,7 @@ if __name__ == "__main__":
             ai.latest_frame = frame.copy()
             draw_ui(frame, ai.results, ai.rx_manager)
             
-            # Display STRICT RGB (Requires display to support it, usually works fine)
-            cv2.imshow("PillTrack Segmentation", frame)
+            cv2.imshow("PillTrack: Dual Pipeline", frame)
             
             if cv2.waitKey(1) == ord('q'): break
             
