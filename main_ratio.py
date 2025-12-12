@@ -101,22 +101,28 @@ class PrescriptionManager:
 
 # ================= 🎨 FEATURE ENGINE (Vec + Color + SIFT) =================
 class FeatureEngine:
-    def __init__(self):
-        # 1. ResNet50 for Vectors
-        try:
-            weights = models.EfficientNet_V2_S_Weights.DEFAULT
-            base = models.efficientnet_v2_s(weights=weights)
-            self.model = torch.nn.Sequential(*list(base.children())[:-1])
-            self.model.eval().to(device)
-            self.preprocess = transforms.Compose([
-                transforms.ToPILImage(),
-                transforms.Resize((224, 224)),
-                transforms.ToTensor(),
-                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-            ])
-        except Exception as e: sys.exit(f"❌ ResNet Error: {e}")
+   # ใน class FeatureEngine:
 
-        # 2. SIFT Engine
+    def __init__(self):
+        # 1. เปลี่ยนจาก ResNet50 เป็น EfficientNetV2 Small (เร็วกว่า แม่นกว่า)
+        try:
+            # ใช้ Weights เวอร์ชั่นใหม่สุด
+            weights = models.EfficientNet_V2_S_Weights.DEFAULT 
+            self.base = models.efficientnet_v2_s(weights=weights)
+            
+            # EfficientNet โครงสร้างต่างจาก ResNet นิดหน่อย 
+            # วิธีดึง Vector คือตัดส่วน Classifier ทิ้ง (เหลือแต่ Feature Extractor)
+            self.base.classifier = torch.nn.Identity() 
+            
+            self.model = self.base
+            self.model.eval().to(device)
+
+            # Preprocess ของ EfficientNet V2 ฉลาดขึ้น (รองรับขนาดภาพยืดหยุ่นกว่า)
+            self.preprocess = weights.transforms() 
+            
+        except Exception as e: sys.exit(f"❌ Model Error: {e}")
+
+        # 2. SIFT Engine (เหมือนเดิม)
         self.sift = cv2.SIFT_create()
         self.bf = cv2.BFMatcher()
 
