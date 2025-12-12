@@ -1,32 +1,46 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
-║  PILLTRACK: STABILIZED VERSION (Stability & Filtering)       ║
-║  - Feature: Object Tracking + Label Voting (ลดการกระพริบ)    ║
-║  - Feature: Confidence Buffering (รอชัวร์ค่อยโชว์)           ║
+║  PILLTRACK: ENHANCED VERSION v2.0                            ║
+║  - Optimized Performance & Memory Management                 ║
+║  - Robust Error Handling & Recovery                          ║
+║  - Improved Tracking Algorithm                               ║
+║  - Clean Code Architecture                                   ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
 import os
 import sys
 import time
+import logging
 import threading
 import collections
+from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional, Set
+from contextlib import contextmanager
+
 import numpy as np
 import cv2
 import torch
 import pickle
-from PIL import Image
 from torchvision import models, transforms
 from ultralytics import YOLO
+
+# ================= 📝 LOGGING SETUP =================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # ================= ⚙️ CONFIGURATION =================
 @dataclass
 class Config:
+    """Centralized configuration with validation"""
+    
     # --- PATHS ---
-    MODEL_PACK: str = 'models/seg_best_process.pt' 
+    MODEL_PACK: str = 'models/seg_best_process.pt'
     MODEL_PILL: str = 'models/pills_seg.pt'
     
     # Databases
@@ -38,482 +52,931 @@ class Config:
     IMG_DB_FOLDER: str = 'database_images'
     PRESCRIPTION_FILE: str = 'prescription.txt'
     
-    # Display & ROI
+    # Display & Processing
     DISPLAY_SIZE: Tuple[int, int] = (1280, 720)
     AI_SIZE: int = 416
     
-    # Dashboard Zone
-    UI_ZONE_X_START: int = 900 
+    # UI Zone
+    UI_ZONE_X_START: int = 900
     UI_ZONE_Y_END: int = 220
     
-    # 🎚️ TUNING THRESHOLDS
-    CONF_THRESHOLD: float = 0.40  # เพิ่มความเข้มขึ้นเล็กน้อย
+    # Detection Thresholds
+    CONF_THRESHOLD: float = 0.40
+    YOLO_CONF: float = 0.35
     
-    # WEIGHTS
-    WEIGHTS: Dict[str, float] = field(default_factory=lambda: {'vec': 0.5, 'col': 0.3, 'sift': 0.2}) 
+    # Feature Weights
+    WEIGHTS: Dict[str, float] = field(default_factory=lambda: {
+        'vec': 0.5, 
+        'col': 0.3, 
+        'sift': 0.2
+    })
     
-    # SIFT Tuning
+    # SIFT Configuration
     SIFT_RATIO_TEST: float = 0.75
-
-    # 🛡️ STABILITY SETTINGS (NEW!)
-    STABILITY_HISTORY_LEN: int = 5   # จำประวัติ 10 เฟรมล่าสุด
-    STABILITY_CONFIRM_REQ: int = 3    # ต้องเจอชื่อซ้ำกัน 6 ใน 10 เฟรม ถึงจะฟันธง
-    TRACKING_IOU_THRESH: float = 0.3  # ถ้าย้ายที่เกินนี้ถือว่าเป็นวัตถุใหม่
-    MAX_MISSING_FRAMES: int = 1       # ถ้าหายไป 5 เฟรม ให้ลืมวัตถุนั้น
+    SIFT_MAX_MATCHES_NORMALIZE: int = 15
+    
+    # Stability & Tracking
+    STABILITY_HISTORY_LEN: int = 5
+    STABILITY_CONFIRM_REQ: int = 3
+    TRACKING_IOU_THRESH: float = 0.3
+    MAX_MISSING_FRAMES: int = 1
+    
+    # Performance
+    FRAME_SKIP: int = 1  # Process every N frames
+    MAX_DETECTIONS: int = 20  # Limit detections per frame
+    
+    def __post_init__(self):
+        """Validate configuration"""
+        assert 0 < self.CONF_THRESHOLD <= 1.0, "CONF_THRESHOLD must be in (0, 1]"
+        assert sum(self.WEIGHTS.values()) > 0, "Weights must sum to positive value"
+        assert self.STABILITY_CONFIRM_REQ <= self.STABILITY_HISTORY_LEN, \
+            "Confirm requirement cannot exceed history length"
 
 CFG = Config()
+
+# Device Setup
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"🚀 SYSTEM STARTING ON: {device} (STABILIZED MODE)")
+logger.info(f"🚀 System starting on: {device.type.upper()}")
 
 # ================= 🧠 PRESCRIPTION STATE MANAGER =================
 class PrescriptionManager:
-    def __init__(self):
-        self.patient_name = "Unknown"
-        self.allowed_drugs = []
-        self.verified_drugs = set()
+    """Manages prescription validation and drug verification"""
+    
+    def __init__(self, prescription_file: str = CFG.PRESCRIPTION_FILE):
+        self.prescription_file = Path(prescription_file)
+        self.patient_name: str = "Unknown"
+        self.allowed_drugs: List[str] = []
+        self.verified_drugs: Set[str] = set()
+        self._lock = threading.Lock()
+        
         self.load_prescription()
-
-    def load_prescription(self):
-        if not os.path.exists(CFG.PRESCRIPTION_FILE): return
+    
+    def load_prescription(self) -> bool:
+        """Load prescription with error handling"""
+        if not self.prescription_file.exists():
+            logger.warning(f"Prescription file not found: {self.prescription_file}")
+            return False
+        
         try:
-            with open(CFG.PRESCRIPTION_FILE, 'r', encoding='utf-8') as f:
+            with open(self.prescription_file, 'r', encoding='utf-8') as f:
                 for line in f:
                     line = line.strip()
-                    if not line or line.startswith('#'): continue
+                    if not line or line.startswith('#'):
+                        continue
+                    
                     parts = line.split('|')
                     if len(parts) >= 3:
                         self.patient_name = parts[1].strip()
                         raw_drugs = parts[2].split(',')
-                        self.allowed_drugs = [d.strip().lower() for d in raw_drugs if d.strip()]
-                        break 
-        except Exception as e: print(f"Rx Error: {e}")
-
-    def is_allowed(self, db_name):
+                        self.allowed_drugs = [
+                            drug.strip().lower() 
+                            for drug in raw_drugs 
+                            if drug.strip()
+                        ]
+                        logger.info(f"✅ Loaded prescription for: {self.patient_name}")
+                        logger.info(f"   Allowed drugs: {', '.join(self.allowed_drugs)}")
+                        return True
+            
+            logger.warning("No valid prescription data found")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error loading prescription: {e}")
+            return False
+    
+    def is_allowed(self, db_name: str) -> bool:
+        """Check if drug name matches allowed prescriptions"""
         db_clean = db_name.lower().replace('_pack', '').replace('_pill', '')
+        
         for allowed in self.allowed_drugs:
-            if allowed in db_clean or db_clean in allowed: return True
+            if allowed in db_clean or db_clean in allowed:
+                return True
         return False
-
-    def verify(self, name):
+    
+    def verify(self, name: str) -> bool:
+        """Mark drug as verified (thread-safe)"""
         clean = name.lower().replace('_pack', '').replace('_pill', '')
-        for allowed in self.allowed_drugs:
-            if allowed in clean or clean in allowed:
-                self.verified_drugs.add(allowed)
+        
+        with self._lock:
+            for allowed in self.allowed_drugs:
+                if allowed in clean or clean in allowed:
+                    self.verified_drugs.add(allowed)
+                    return True
+        return False
+    
+    def get_verification_status(self) -> Dict[str, bool]:
+        """Get verification status for all drugs"""
+        with self._lock:
+            return {drug: drug in self.verified_drugs for drug in self.allowed_drugs}
 
 # ================= 🎨 FEATURE ENGINE =================
 class FeatureEngine:
+    """Handles feature extraction using ResNet and SIFT"""
+    
     def __init__(self):
+        self._initialize_resnet()
+        self._initialize_sift()
+    
+    def _initialize_resnet(self):
+        """Initialize ResNet50 for feature vectors"""
         try:
+            logger.info("Loading ResNet50 model...")
             weights = models.ResNet50_Weights.DEFAULT
-            base = models.resnet50(weights=weights)
-            self.model = torch.nn.Sequential(*list(base.children())[:-1])
-            self.model.eval().to(device)
+            base_model = models.resnet50(weights=weights)
+            
+            # Remove classification layer
+            self.model = torch.nn.Sequential(*list(base_model.children())[:-1])
+            self.model.eval()
+            self.model.to(device)
+            
+            # Preprocessing pipeline
             self.preprocess = transforms.Compose([
                 transforms.ToPILImage(),
                 transforms.Resize((224, 224)),
                 transforms.ToTensor(),
-                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225]
+                )
             ])
-        except Exception as e: sys.exit(f"❌ ResNet Error: {e}")
-        self.sift = cv2.SIFT_create()
-        self.bf = cv2.BFMatcher()
-
+            
+            logger.info("✅ ResNet50 loaded successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to load ResNet50: {e}")
+            raise
+    
+    def _initialize_sift(self):
+        """Initialize SIFT detector"""
+        try:
+            self.sift = cv2.SIFT_create()
+            self.bf_matcher = cv2.BFMatcher()
+            logger.info("✅ SIFT detector initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize SIFT: {e}")
+            raise
+    
     @torch.no_grad()
-    def get_vector(self, img_rgb):
-        t = self.preprocess(img_rgb).unsqueeze(0).to(device)
-        vec = self.model(t).flatten().cpu().numpy()
-        return vec / (np.linalg.norm(vec) + 1e-8)
-
-    def get_sift_features(self, img_rgb):
-        gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-        kp, des = self.sift.detectAndCompute(gray, None)
-        return des
-
-# ================= 🛡️ STABILIZER SYSTEM (NEW CLASS) =================
-class ObjectStabilizer:
-    """
-    คลาสนี้ทำหน้าที่จำวัตถุข้ามเฟรม (Tracking) และโหวตชื่อ (Voting)
-    เพื่อแก้ปัญหาชื่อกระพริบไปมา
-    """
-    def __init__(self):
-        # tracks เก็บข้อมูล: { track_id: {'history': deque, 'missing': int, 'box': tuple, 'contour': np.array} }
-        self.tracks = {} 
-        self.next_id = 0
-
-    def calculate_iou(self, boxA, boxB):
-        # คำนวณ Intersection over Union เพื่อดูว่ากล่องซ้อนกันแค่ไหน
-        xA = max(boxA[0], boxB[0])
-        yA = max(boxA[1], boxB[1])
-        xB = min(boxA[2], boxB[2])
-        yB = min(boxA[3], boxB[3])
-        interArea = max(0, xB - xA + 1) * max(0, yB - yA + 1)
-        boxAArea = (boxA[2] - boxA[0] + 1) * (boxA[3] - boxA[1] + 1)
-        boxBArea = (boxB[2] - boxB[0] + 1) * (boxB[3] - boxB[1] + 1)
-        return interArea / float(boxAArea + boxBArea - interArea + 1e-5)
-
-    def update(self, raw_detections):
-        # raw_detections = list of dict {'box', 'contour', 'label', ...}
+    def get_vector(self, img_rgb: np.ndarray) -> Optional[np.ndarray]:
+        """Extract feature vector from image"""
+        if img_rgb is None or img_rgb.size == 0:
+            return None
         
+        try:
+            img_tensor = self.preprocess(img_rgb).unsqueeze(0).to(device)
+            features = self.model(img_tensor)
+            vec = features.flatten().cpu().numpy()
+            
+            # L2 normalization
+            norm = np.linalg.norm(vec)
+            return vec / (norm + 1e-8)
+            
+        except Exception as e:
+            logger.error(f"Error extracting vector: {e}")
+            return None
+    
+    def get_sift_features(self, img_rgb: np.ndarray) -> Optional[np.ndarray]:
+        """Extract SIFT descriptors from image"""
+        if img_rgb is None or img_rgb.size == 0:
+            return None
+        
+        try:
+            gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+            _, descriptors = self.sift.detectAndCompute(gray, None)
+            return descriptors
+            
+        except Exception as e:
+            logger.error(f"Error extracting SIFT features: {e}")
+            return None
+    
+    def match_sift(self, query_des: np.ndarray, ref_des: np.ndarray, 
+                   ratio_test: float = CFG.SIFT_RATIO_TEST) -> int:
+        """Match SIFT descriptors using ratio test"""
+        if query_des is None or ref_des is None:
+            return 0
+        
+        try:
+            matches = self.bf_matcher.knnMatch(query_des, ref_des, k=2)
+            good_matches = [
+                m for m, n in matches 
+                if m.distance < ratio_test * n.distance
+            ]
+            return len(good_matches)
+            
+        except Exception as e:
+            logger.debug(f"SIFT matching error: {e}")
+            return 0
+
+# ================= 🛡️ OBJECT STABILIZER =================
+class ObjectStabilizer:
+    """Tracks objects across frames and stabilizes labels using voting"""
+    
+    def __init__(self):
+        self.tracks: Dict[int, Dict] = {}
+        self.next_id: int = 0
+        self._lock = threading.Lock()
+    
+    @staticmethod
+    def calculate_iou(boxA: Tuple, boxB: Tuple) -> float:
+        """Calculate Intersection over Union between two boxes"""
+        x1 = max(boxA[0], boxB[0])
+        y1 = max(boxA[1], boxB[1])
+        x2 = min(boxA[2], boxB[2])
+        y2 = min(boxA[3], boxB[3])
+        
+        inter_area = max(0, x2 - x1) * max(0, y2 - y1)
+        
+        boxA_area = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+        boxB_area = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+        
+        union_area = boxA_area + boxB_area - inter_area
+        
+        return inter_area / (union_area + 1e-6)
+    
+    def update(self, raw_detections: List[Dict]) -> List[Dict]:
+        """Update tracks with new detections and return stable results"""
+        with self._lock:
+            return self._update_internal(raw_detections)
+    
+    def _update_internal(self, raw_detections: List[Dict]) -> List[Dict]:
+        """Internal update logic (not thread-safe by itself)"""
         updated_tracks = {}
         used_indices = set()
         
-        # 1. MATCHING: จับคู่ของใหม่กับของเก่าที่ใกล้กันที่สุด
+        # Phase 1: Match existing tracks with new detections
         for track_id, track_data in self.tracks.items():
-            best_iou = 0
+            best_iou = 0.0
             best_idx = -1
-            
             last_box = track_data['box']
             
             for i, det in enumerate(raw_detections):
-                if i in used_indices: continue
+                if i in used_indices:
+                    continue
+                
                 iou = self.calculate_iou(last_box, det['box'])
                 if iou > best_iou:
                     best_iou = iou
                     best_idx = i
             
-            # ถ้าเจอคู่ที่ IOU สูงพอ แสดงว่าเป็นของเดิม
-            if best_iou > CFG.TRACKING_IOU_THRESH and best_idx != -1:
+            # Found a match
+            if best_iou > CFG.TRACKING_IOU_THRESH and best_idx >= 0:
                 det = raw_detections[best_idx]
                 
-                # Update History
+                # Update history
                 track_data['history'].append(det['label'])
                 if len(track_data['history']) > CFG.STABILITY_HISTORY_LEN:
                     track_data['history'].popleft()
                 
-                # Update Info
+                # Update metadata
                 track_data['box'] = det['box']
                 track_data['contour'] = det['contour']
                 track_data['missing'] = 0
-                track_data['candidates'] = det['candidates']
+                track_data['candidates'] = det.get('candidates', [])
                 
                 updated_tracks[track_id] = track_data
                 used_indices.add(best_idx)
+            
+            # Track lost but give it a chance
             else:
-                # ถ้าหาไม่เจอ ให้โอกาสหายไปได้ไม่เกิน MAX_MISSING_FRAMES
                 track_data['missing'] += 1
                 if track_data['missing'] < CFG.MAX_MISSING_FRAMES:
                     updated_tracks[track_id] = track_data
-
-        # 2. NEW OBJECTS: ของที่เหลือที่จับคู่ไม่ได้ คือของใหม่
+        
+        # Phase 2: Create new tracks for unmatched detections
         for i, det in enumerate(raw_detections):
             if i not in used_indices:
                 new_id = self.next_id
                 self.next_id += 1
-                history = collections.deque([det['label']])
+                
                 updated_tracks[new_id] = {
-                    'history': history,
+                    'history': collections.deque([det['label']], 
+                                                maxlen=CFG.STABILITY_HISTORY_LEN),
                     'missing': 0,
                     'box': det['box'],
                     'contour': det['contour'],
-                    'candidates': det['candidates']
+                    'candidates': det.get('candidates', [])
                 }
         
         self.tracks = updated_tracks
         
-        # 3. VOTING: แปลงข้อมูล Track เป็น Output ที่นิ่งแล้ว
+        # Phase 3: Generate stable output using voting
+        return self._generate_stable_output()
+    
+    def _generate_stable_output(self) -> List[Dict]:
+        """Generate stable detection results from tracks"""
         stable_results = []
-        for tid, data in self.tracks.items():
-            if data['missing'] > 0: continue # ไม่แสดงถ้ากำลังหายไป
+        
+        for track_id, track_data in self.tracks.items():
+            # Skip tracks that are currently missing
+            if track_data['missing'] > 0:
+                continue
             
-            # นับคะแนนโหวตใน History
-            counter = collections.Counter(data['history'])
-            most_common = counter.most_common(1)
+            # Vote on label
+            counter = collections.Counter(track_data['history'])
             
-            final_label = "Verifying..." # ค่า Default ถ้ายังไม่มั่นใจ
-            color_status = "pending"
+            if not counter:
+                continue
             
-            if most_common:
-                top_label, count = most_common[0]
-                # กฎเหล็ก: ต้องชนะโหวตเกินเกณฑ์ที่ตั้งไว้
-                if count >= CFG.STABILITY_CONFIRM_REQ:
-                    final_label = top_label
-                    color_status = "confirmed" if top_label != "Unknown" else "unknown"
-                else:
-                    final_label = f"Wait... ({count}/{CFG.STABILITY_CONFIRM_REQ})"
+            top_label, count = counter.most_common(1)[0]
+            
+            # Determine status based on voting
+            if count >= CFG.STABILITY_CONFIRM_REQ:
+                final_label = top_label
+                status = "confirmed" if top_label != "Unknown" else "unknown"
+            else:
+                final_label = f"Analyzing... ({count}/{CFG.STABILITY_CONFIRM_REQ})"
+                status = "pending"
             
             stable_results.append({
-                'box': data['box'],
-                'contour': data['contour'],
+                'box': track_data['box'],
+                'contour': track_data['contour'],
                 'label': final_label,
-                'status': color_status,
-                'candidates': data.get('candidates', [])
+                'status': status,
+                'candidates': track_data.get('candidates', []),
+                'track_id': track_id
             })
-            
+        
         return stable_results
+    
+    def reset(self):
+        """Reset all tracks"""
+        with self._lock:
+            self.tracks.clear()
+            self.next_id = 0
 
 # ================= 🤖 AI PROCESSOR =================
 class AIProcessor:
+    """Main AI processing pipeline"""
+    
     def __init__(self):
+        logger.info("Initializing AI Processor...")
+        
         self.engine = FeatureEngine()
         self.rx_manager = PrescriptionManager()
-        self.stabilizer = ObjectStabilizer()  # ✅ เรียกใช้ Stabilizer
+        self.stabilizer = ObjectStabilizer()
         
-        self.session_db_vec = {} 
-        self.session_db_sift = {}
-        self.load_and_filter_db()
+        # Database storage
+        self.session_db_vec: Dict[str, Tuple[str, np.ndarray]] = {}
+        self.session_db_sift: Dict[str, List[np.ndarray]] = {}
         
-        try:
-            # ตอนนี้ใช้ 1 โมเดลไปก่อนตาม Demo เดิม
-            self.yolo_pack = YOLO(CFG.MODEL_PACK) if os.path.exists(CFG.MODEL_PACK) else YOLO('yolov8n-seg.pt')
-            print("✅ YOLO Segmentation Model Loaded")
-        except: sys.exit("❌ YOLO Error")
-
-        self.latest_frame = None
-        self.results = []
+        # Load databases
+        self._load_databases()
+        
+        # Initialize YOLO
+        self._initialize_yolo()
+        
+        # Threading
+        self.latest_frame: Optional[np.ndarray] = None
+        self.results: List[Dict] = []
         self.lock = threading.Lock()
         self.stopped = False
-
-    def load_and_filter_db(self):
-        print("🔍 Building Session Database...")
-        def load_pkl(path):
-            if os.path.exists(path):
-                with open(path, 'rb') as f: return pickle.load(f)
-            return {}
-
-        # 1. Load Vectors (รวมกันไปก่อนตาม Demo เดิม)
-        all_vecs = {**load_pkl(CFG.DB_PILLS_VEC), **load_pkl(CFG.DB_PACKS_VEC)}
-        count = 0
-        for name, vecs in all_vecs.items():
-            if self.rx_manager.is_allowed(name):
-                for v in vecs:
-                    self.session_db_vec[f"{name}_{count}"] = (name, np.array(v)) 
-                    count += 1
-
-        # 2. Load SIFT
-        if os.path.exists(CFG.IMG_DB_FOLDER):
-            for drug_name in os.listdir(CFG.IMG_DB_FOLDER):
-                if not self.rx_manager.is_allowed(drug_name): continue
-                drug_path = os.path.join(CFG.IMG_DB_FOLDER, drug_name)
-                if os.path.isdir(drug_path):
-                    descriptors_list = []
-                    for img_file in sorted(os.listdir(drug_path))[:3]:
-                        if img_file.lower().endswith(('jpg', 'png', 'jpeg')):
-                            img = cv2.imread(os.path.join(drug_path, img_file))
-                            if img is not None:
-                                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                                des = self.engine.get_sift_features(img)
-                                if des is not None: descriptors_list.append(des)
-                    if descriptors_list:
-                        self.session_db_sift[drug_name] = descriptors_list
-
-    def compute_sift_score(self, query_des, target_name):
-        if query_des is None or target_name not in self.session_db_sift: return 0.0
-        max_matches = 0
-        for ref_des in self.session_db_sift[target_name]:
-            try:
-                matches = self.engine.bf.knnMatch(query_des, ref_des, k=2)
-                good = [m for m, n in matches if m.distance < CFG.SIFT_RATIO_TEST * n.distance]
-                if len(good) > max_matches: max_matches = len(good)
-            except: pass
-        return min(max_matches / 15.0, 1.0)
-
-    def match(self, vec, img_crop):
-        candidates = []
-        if not self.session_db_vec: return []
-
-        query_sift_des = self.engine.get_sift_features(img_crop)
-
-        for key, (real_name, db_v) in self.session_db_vec.items():
-            vec_score = np.dot(vec, db_v)
-            sift_score = self.compute_sift_score(query_sift_des, real_name)
+        self.frame_count = 0
+        
+        logger.info("✅ AI Processor initialized")
+    
+    def _initialize_yolo(self):
+        """Initialize YOLO model with error handling"""
+        try:
+            model_path = Path(CFG.MODEL_PACK)
             
-            final_score = (vec_score * CFG.WEIGHTS['vec']) + \
-                          (sift_score * CFG.WEIGHTS['sift']) + \
-                          (0.5 * CFG.WEIGHTS['col']) # Dummy color score for now
-                          
-            candidates.append((real_name, final_score, vec_score, sift_score))
+            if model_path.exists():
+                self.yolo_model = YOLO(str(model_path))
+                logger.info(f"✅ Loaded custom YOLO model: {model_path}")
+            else:
+                logger.warning(f"Custom model not found: {model_path}")
+                self.yolo_model = YOLO('yolov8n-seg.pt')
+                logger.info("✅ Loaded default YOLO model")
+                
+        except Exception as e:
+            logger.error(f"Failed to load YOLO model: {e}")
+            raise
+    
+    def _load_databases(self):
+        """Load feature databases with validation"""
+        logger.info("Loading feature databases...")
         
+        # Load vector databases
+        vec_count = self._load_vector_databases()
+        logger.info(f"   Loaded {vec_count} vector entries")
+        
+        # Load SIFT databases
+        sift_count = self._load_sift_databases()
+        logger.info(f"   Loaded {sift_count} SIFT entries")
+    
+    def _load_vector_databases(self) -> int:
+        """Load vector feature databases"""
+        count = 0
+        
+        for db_path in [CFG.DB_PILLS_VEC, CFG.DB_PACKS_VEC]:
+            db_file = Path(db_path)
+            if not db_file.exists():
+                logger.warning(f"Vector DB not found: {db_path}")
+                continue
+            
+            try:
+                with open(db_file, 'rb') as f:
+                    db_data = pickle.load(f)
+                
+                for drug_name, vectors in db_data.items():
+                    if not self.rx_manager.is_allowed(drug_name):
+                        continue
+                    
+                    for vec in vectors:
+                        key = f"{drug_name}_{count}"
+                        self.session_db_vec[key] = (drug_name, np.array(vec))
+                        count += 1
+                        
+            except Exception as e:
+                logger.error(f"Error loading {db_path}: {e}")
+        
+        return count
+    
+    def _load_sift_databases(self) -> int:
+        """Load SIFT feature databases from images"""
+        count = 0
+        img_db = Path(CFG.IMG_DB_FOLDER)
+        
+        if not img_db.exists():
+            logger.warning(f"Image database folder not found: {img_db}")
+            return 0
+        
+        for drug_folder in img_db.iterdir():
+            if not drug_folder.is_dir():
+                continue
+            
+            drug_name = drug_folder.name
+            if not self.rx_manager.is_allowed(drug_name):
+                continue
+            
+            descriptors_list = []
+            
+            # Load first 3 images
+            for img_file in sorted(drug_folder.iterdir())[:3]:
+                if img_file.suffix.lower() not in ['.jpg', '.png', '.jpeg']:
+                    continue
+                
+                try:
+                    img = cv2.imread(str(img_file))
+                    if img is None:
+                        continue
+                    
+                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    descriptors = self.engine.get_sift_features(img_rgb)
+                    
+                    if descriptors is not None:
+                        descriptors_list.append(descriptors)
+                        
+                except Exception as e:
+                    logger.debug(f"Error loading {img_file}: {e}")
+            
+            if descriptors_list:
+                self.session_db_sift[drug_name] = descriptors_list
+                count += 1
+        
+        return count
+    
+    def compute_sift_score(self, query_des: Optional[np.ndarray], 
+                          target_name: str) -> float:
+        """Compute normalized SIFT matching score"""
+        if query_des is None or target_name not in self.session_db_sift:
+            return 0.0
+        
+        max_matches = 0
+        
+        for ref_des in self.session_db_sift[target_name]:
+            matches = self.engine.match_sift(query_des, ref_des)
+            max_matches = max(max_matches, matches)
+        
+        # Normalize to [0, 1]
+        normalized = max_matches / CFG.SIFT_MAX_MATCHES_NORMALIZE
+        return min(normalized, 1.0)
+    
+    def match_drug(self, vec: np.ndarray, img_crop: np.ndarray) -> List[Tuple]:
+        """Match detected object against drug database"""
+        if not self.session_db_vec:
+            return []
+        
+        # Extract SIFT features
+        query_sift = self.engine.get_sift_features(img_crop)
+        
+        candidates = []
+        
+        for key, (drug_name, db_vec) in self.session_db_vec.items():
+            # Vector similarity
+            vec_score = float(np.dot(vec, db_vec))
+            
+            # SIFT similarity
+            sift_score = self.compute_sift_score(query_sift, drug_name)
+            
+            # Color similarity (placeholder - implement if color DB exists)
+            color_score = 0.5
+            
+            # Weighted combination
+            final_score = (
+                vec_score * CFG.WEIGHTS['vec'] +
+                sift_score * CFG.WEIGHTS['sift'] +
+                color_score * CFG.WEIGHTS['col']
+            )
+            
+            candidates.append((drug_name, final_score, vec_score, sift_score))
+        
+        # Sort by score and deduplicate
         candidates.sort(key=lambda x: x[1], reverse=True)
-        unique = []
-        seen = set()
-        for n, fs, vs, ss in candidates:
-            if n not in seen:
-                unique.append((n, fs, vs, ss))
-                seen.add(n)
-            if len(unique) >= 5: break
-        return unique
-
-    def process_frame(self, frame):
-        img_ai = cv2.resize(frame, (CFG.AI_SIZE, CFG.AI_SIZE))
-        results = self.yolo_pack(img_ai, verbose=False, conf=0.35, imgsz=CFG.AI_SIZE, task='segment')
         
-        raw_detections = [] # เก็บผลดิบเฟรมนี้
+        unique_candidates = []
+        seen_names = set()
+        
+        for name, score, vec_s, sift_s in candidates:
+            if name not in seen_names:
+                unique_candidates.append((name, score, vec_s, sift_s))
+                seen_names.add(name)
+            
+            if len(unique_candidates) >= 5:
+                break
+        
+        return unique_candidates
+    
+    def process_frame(self, frame: np.ndarray):
+        """Process a single frame"""
+        # Resize for YOLO
+        img_ai = cv2.resize(frame, (CFG.AI_SIZE, CFG.AI_SIZE))
+        
+        # Run YOLO detection
+        results = self.yolo_model(
+            img_ai,
+            verbose=False,
+            conf=CFG.YOLO_CONF,
+            imgsz=CFG.AI_SIZE,
+            task='segment'
+        )
+        
+        raw_detections = []
         res = results[0]
         
-        if res.masks is not None:
-            for box, mask in zip(res.boxes, res.masks):
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                
-                scale_x = CFG.DISPLAY_SIZE[0] / CFG.AI_SIZE
-                scale_y = CFG.DISPLAY_SIZE[1] / CFG.AI_SIZE
-                rx1, ry1 = int(x1 * scale_x), int(y1 * scale_y)
-                rx2, ry2 = int(x2 * scale_x), int(y2 * scale_y)
-                
-                cx, cy = (rx1+rx2)//2, (ry1+ry2)//2
-                if cx > CFG.UI_ZONE_X_START and cy < CFG.UI_ZONE_Y_END: continue 
-                
-                contour = mask.xyn[0]
-                contour[:, 0] *= CFG.DISPLAY_SIZE[0]
-                contour[:, 1] *= CFG.DISPLAY_SIZE[1]
-                contour = contour.astype(np.int32)
-                
-                crop = frame[ry1:ry2, rx1:rx2]
-                if crop.size == 0: continue
-                
-                vec = self.engine.get_vector(crop)
-                candidates = self.match(vec, crop)
-                
-                if candidates:
-                    top_name, top_score, _, _ = candidates[0]
-                    # กรองคะแนนดิบที่นี่ก่อนเข้า Stabilizer
-                    label = top_name if top_score > CFG.CONF_THRESHOLD else "Unknown"
-                else:
-                    label = "Unknown"
-
-                raw_detections.append({
-                    'box': (rx1, ry1, rx2, ry2),
-                    'contour': contour,
-                    'label': label,
-                    'candidates': candidates
-                })
-
-        # ✅ ส่งผลดิบเข้า Stabilizer เพื่อให้ช่วยกรองและจำ
+        if res.masks is None:
+            # No detections
+            with self.lock:
+                self.results = self.stabilizer.update([])
+            return
+        
+        # Scale factors
+        scale_x = CFG.DISPLAY_SIZE[0] / CFG.AI_SIZE
+        scale_y = CFG.DISPLAY_SIZE[1] / CFG.AI_SIZE
+        
+        for box, mask in zip(res.boxes, res.masks):
+            # Get bounding box
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+            
+            # Scale to display size
+            rx1 = int(x1 * scale_x)
+            ry1 = int(y1 * scale_y)
+            rx2 = int(x2 * scale_x)
+            ry2 = int(y2 * scale_y)
+            
+            # Filter out UI zone
+            cx, cy = (rx1 + rx2) // 2, (ry1 + ry2) // 2
+            if cx > CFG.UI_ZONE_X_START and cy < CFG.UI_ZONE_Y_END:
+                continue
+            
+            # Get contour
+            contour = mask.xyn[0]
+            contour[:, 0] *= CFG.DISPLAY_SIZE[0]
+            contour[:, 1] *= CFG.DISPLAY_SIZE[1]
+            contour = contour.astype(np.int32)
+            
+            # Crop and validate
+            crop = frame[ry1:ry2, rx1:rx2]
+            if crop.size == 0:
+                continue
+            
+            # Extract features
+            vec = self.engine.get_vector(crop)
+            if vec is None:
+                continue
+            
+            # Match against database
+            candidates = self.match_drug(vec, crop)
+            
+            # Determine label
+            if candidates:
+                top_name, top_score, _, _ = candidates[0]
+                label = top_name if top_score > CFG.CONF_THRESHOLD else "Unknown"
+            else:
+                label = "Unknown"
+            
+            raw_detections.append({
+                'box': (rx1, ry1, rx2, ry2),
+                'contour': contour,
+                'label': label,
+                'candidates': candidates
+            })
+            
+            # Limit detections
+            if len(raw_detections) >= CFG.MAX_DETECTIONS:
+                break
+        
+        # Update stabilizer
         final_detections = self.stabilizer.update(raw_detections)
         
-        # ✅ Verify เฉพาะยาที่ผ่านการ Stabilize มาแล้วว่าเป็นของจริง
+        # Verify drugs
         for det in final_detections:
-            lbl = det['label']
-            if lbl not in ["Unknown", "Verifying..."] and "Wait" not in lbl:
-                self.rx_manager.verify(lbl)
-
-        with self.lock: self.results = final_detections
-
+            label = det['label']
+            if label not in ["Unknown", "Verifying..."] and "Analyzing" not in label:
+                self.rx_manager.verify(label)
+        
+        # Store results
+        with self.lock:
+            self.results = final_detections
+    
     def start(self):
+        """Start processing thread"""
         threading.Thread(target=self._run, daemon=True).start()
         return self
-        
+    
     def _run(self):
+        """Main processing loop"""
         while not self.stopped:
-            with self.lock: frame = self.latest_frame
+            with self.lock:
+                frame = self.latest_frame
+            
             if frame is not None:
-                try: self.process_frame(frame)
-                except Exception as e: print(f"Err: {e}")
+                # Frame skipping for performance
+                self.frame_count += 1
+                if self.frame_count % CFG.FRAME_SKIP == 0:
+                    try:
+                        self.process_frame(frame)
+                    except Exception as e:
+                        logger.error(f"Frame processing error: {e}")
+            
             time.sleep(0.01)
 
 # ================= 📷 CAMERA =================
 class Camera:
+    """Camera interface supporting both PiCamera and USB cameras"""
+    
     def __init__(self):
         self.cap = None
+        self.picam = None
+        self.use_pi = False
+        
+        self._initialize_camera()
+    
+    def _initialize_camera(self):
+        """Initialize camera with fallback"""
+        # Try PiCamera first
         try:
             from picamera2 import Picamera2
-            self.picam = Picamera2()
-            cfg = self.picam.create_preview_configuration(main={"size": CFG.DISPLAY_SIZE, "format": "RGB888"})
-            self.picam.configure(cfg)
-            self.picam.start()
-            self.use_pi = True
-            print("📷 PiCamera2: RGB888 Source Locked")
-        except:
-            self.cap = cv2.VideoCapture(0)
-            self.cap.set(3, CFG.DISPLAY_SIZE[0])
-            self.cap.set(4, CFG.DISPLAY_SIZE[1])
-            self.use_pi = False
-            print("📷 USB Camera: Converting BGR to RGB888")
             
-    def get(self):
-        if self.use_pi: return self.picam.capture_array()
-        else:
-            ret, frame = self.cap.read()
-            if ret: return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            self.picam = Picamera2()
+            config = self.picam.create_preview_configuration(
+                main={"size": CFG.DISPLAY_SIZE, "format": "RGB888"}
+            )
+            self.picam.configure(config)
+            self.picam.start()
+            
+            self.use_pi = True
+            logger.info("📷 Using PiCamera2 (RGB888)")
+            return
+            
+        except ImportError:
+            logger.info("PiCamera2 not available, trying USB camera")
+        except Exception as e:
+            logger.warning(f"PiCamera2 init failed: {e}")
+        
+        # Fallback to USB camera
+        try:
+            self.cap = cv2.VideoCapture(0)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CFG.DISPLAY_SIZE[0])
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CFG.DISPLAY_SIZE[1])
+            
+            # Test capture
+            ret, _ = self.cap.read()
+            if not ret:
+                raise RuntimeError("Failed to capture from USB camera")
+            
+            self.use_pi = False
+            logger.info("📷 Using USB Camera (BGR→RGB)")
+            
+        except Exception as e:
+            logger.error(f"Camera initialization failed: {e}")
+            raise
+    
+    def get(self) -> Optional[np.ndarray]:
+        """Get frame from camera"""
+        try:
+            if self.use_pi:
+                return self.picam.capture_array()
+            else:
+                ret, frame = self.cap.read()
+                if ret:
+                    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                return None
+                
+        except Exception as e:
+            logger.error(f"Frame capture error: {e}")
             return None
     
     def stop(self):
-        if self.use_pi: self.picam.stop()
-        else: self.cap.release()
+        """Release camera resources"""
+        try:
+            if self.use_pi and self.picam:
+                self.picam.stop()
+            elif self.cap:
+                self.cap.release()
+            logger.info("Camera stopped")
+        except Exception as e:
+            logger.error(f"Error stopping camera: {e}")
 
-# ================= 🖥️ UI RENDERER (UPDATED) =================
-def draw_ui(frame, results, rx_manager):
+# ================= 🖥️ UI RENDERER =================
+def draw_ui(frame: np.ndarray, results: List[Dict], rx_manager: PrescriptionManager):
+    """Draw detection results and dashboard on frame"""
     h, w = frame.shape[:2]
     overlay = frame.copy()
     
+    # Draw detections
     for det in results:
         contour = det['contour']
         label = det['label']
-        status = det['status'] # confirmed, unknown, pending
-        box = det['box']
+        status = det['status']
         
-        # Color Coding
-        if status == "confirmed":
-            color = (0, 255, 0) # Green
-            border = 2
-        elif status == "unknown":
-            color = (255, 0, 0) # Red
-            border = 2
-        else: # pending / verifying
-            color = (255, 255, 0) # Yellow
-            border = 1
-            
+        # Color coding
+        color_map = {
+            'confirmed': (0, 255, 0),    # Green
+            'unknown': (255, 0, 0),       # Red
+            'pending': (255, 255, 0)      # Yellow
+        }
+        color = color_map.get(status, (255, 255, 0))
+        border_width = 2 if status in ['confirmed', 'unknown'] else 1
+        
+        # Draw filled contour
         cv2.fillPoly(overlay, [contour], color)
-        cv2.polylines(overlay, [contour], True, color, border)
+        cv2.polylines(overlay, [contour], True, color, border_width)
         
-        # Label Drawing
-        top_point = tuple(contour[contour[:, 1].argmin()])
-        tx, ty = top_point
+        # Draw label
+        top_y = int(np.min(contour[:, 1]))
+        top_x = int(contour[np.argmin(contour[:, 1]), 0])
         
-        # Background box for text
-        cv2.rectangle(frame, (tx, ty-25), (tx + len(label)*14, ty), color, -1)
+        # Text background
+        (text_w, text_h), _ = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+        )
+        cv2.rectangle(
+            frame,
+            (top_x, top_y - text_h - 10),
+            (top_x + text_w + 10, top_y),
+            color,
+            -1
+        )
         
-        # Text color (Black text on Yellow/Green, White on Red)
-        txt_col = (0,0,0) if status != "unknown" else (255,255,255)
-        cv2.putText(frame, label, (tx+5, ty-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, txt_col, 2)
-
+        # Text
+        text_color = (0, 0, 0) if status != 'unknown' else (255, 255, 255)
+        cv2.putText(
+            frame,
+            label,
+            (top_x + 5, top_y - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            text_color,
+            2
+        )
+    
+    # Blend overlay
     cv2.addWeighted(overlay, 0.35, frame, 0.65, 0, frame)
-
-    # Dashboard
+    
+    # Draw dashboard
     db_x, db_y = CFG.UI_ZONE_X_START, 10
-    db_w, db_h = w - db_x - 10, CFG.UI_ZONE_Y_END
+    db_w = w - db_x - 10
+    db_h = CFG.UI_ZONE_Y_END
     
-    # Semi-transparent BG for dashboard
-    sub = frame[db_y:db_y+db_h, db_x:db_x+db_w]
-    white = np.ones(sub.shape, dtype=np.uint8) * 40
-    cv2.addWeighted(sub, 0.4, white, 0.6, 0, sub)
-    frame[db_y:db_y+db_h, db_x:db_x+db_w] = sub
+    # Dashboard background
+    db_roi = frame[db_y:db_y + db_h, db_x:db_x + db_w]
+    white_bg = np.ones(db_roi.shape, dtype=np.uint8) * 40
+    cv2.addWeighted(db_roi, 0.4, white_bg, 0.6, 0, db_roi)
+    frame[db_y:db_y + db_h, db_x:db_x + db_w] = db_roi
     
-    cv2.rectangle(frame, (db_x, db_y), (db_x+db_w, db_y+db_h), (0, 255, 0), 2)
-    cv2.putText(frame, f"RX: {rx_manager.patient_name}", (db_x+10, db_y+30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+    # Dashboard border
+    cv2.rectangle(frame, (db_x, db_y), (db_x + db_w, db_y + db_h), (0, 255, 0), 2)
     
-    y_off = 60
-    for drug in rx_manager.allowed_drugs:
-        is_ver = drug in rx_manager.verified_drugs
-        icon = " [OK]" if is_ver else " [...]"
-        col = (0, 255, 0) if is_ver else (180, 180, 180)
-        cv2.putText(frame, f"- {drug}{icon}", (db_x+10, db_y+y_off), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
-        y_off += 25
+    # Patient name
+    cv2.putText(
+        frame,
+        f"Patient: {rx_manager.patient_name}",
+        (db_x + 10, db_y + 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (255, 255, 255),
+        2
+    )
+    
+    # Drug list
+    y_offset = 60
+    verification_status = rx_manager.get_verification_status()
+    
+    for drug, is_verified in verification_status.items():
+        icon = " ✓" if is_verified else " ○"
+        color = (0, 255, 0) if is_verified else (180, 180, 180)
+        
+        cv2.putText(
+            frame,
+            f"• {drug}{icon}",
+            (db_x + 10, db_y + y_offset),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            1
+        )
+        y_offset += 25
 
 # ================= 🚀 MAIN =================
-if __name__ == "__main__":
-    cam = Camera()
-    ai = AIProcessor().start()
+def main():
+    """Main application entry point"""
+    logger.info("=" * 60)
+    logger.info("PillTrack Enhanced v2.0 - Starting...")
+    logger.info("=" * 60)
     
-    print("✨ Waiting for RGB888 feed (Stabilized Mode)...")
-    while cam.get() is None: time.sleep(0.1)
+    # Initialize components
+    try:
+        camera = Camera()
+        ai_processor = AIProcessor().start()
+        
+    except Exception as e:
+        logger.error(f"Initialization failed: {e}")
+        return 1
     
-    cv2.namedWindow("PillTrack Stabilized", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("PillTrack Stabilized", *CFG.DISPLAY_SIZE)
+    # Wait for first frame
+    logger.info("Waiting for camera feed...")
+    while camera.get() is None:
+        time.sleep(0.1)
+    
+    logger.info("✨ System ready! Press 'q' to quit")
+    
+    # Create display window
+    window_name = "PillTrack Enhanced v2.0"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, *CFG.DISPLAY_SIZE)
+    
+    fps_counter = collections.deque(maxlen=30)
+    last_time = time.time()
     
     try:
         while True:
-            frame = cam.get()
-            if frame is None: continue
+            # Get frame
+            frame = camera.get()
+            if frame is None:
+                logger.warning("Failed to get frame")
+                continue
             
-            ai.latest_frame = frame.copy()
-            draw_ui(frame, ai.results, ai.rx_manager)
+            # Update AI processor
+            ai_processor.latest_frame = frame.copy()
             
-            cv2.imshow("PillTrack Stabilized", frame)
-            if cv2.waitKey(1) == ord('q'): break
+            # Draw UI
+            with ai_processor.lock:
+                results = ai_processor.results.copy()
             
+            draw_ui(frame, results, ai_processor.rx_manager)
+            
+            # Calculate FPS
+            current_time = time.time()
+            fps = 1.0 / (current_time - last_time + 1e-6)
+            fps_counter.append(fps)
+            avg_fps = sum(fps_counter) / len(fps_counter)
+            last_time = current_time
+            
+            # Draw FPS
+            cv2.putText(
+                frame,
+                f"FPS: {avg_fps:.1f}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2
+            )
+            
+            # Display
+            cv2.imshow(window_name, frame)
+            
+            # Check for quit
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                logger.info("Quit requested")
+                break
+    
     except KeyboardInterrupt:
-        print("Stopping...")
+        logger.info("Interrupted by user")
+    
+    except Exception as e:
+        logger.error(f"Runtime error: {e}", exc_info=True)
+        return 1
+    
     finally:
-        cam.stop()
-        ai.stopped = True
+        # Cleanup
+        logger.info("Cleaning up...")
+        camera.stop()
+        ai_processor.stopped = True
         cv2.destroyAllWindows()
+        logger.info("Shutdown complete")
+    
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
