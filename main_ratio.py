@@ -255,7 +255,7 @@ class AIProcessor:
         img_ai = cv2.resize(frame, (CFG.AI_SIZE, CFG.AI_SIZE))
         
         # YOLO Segmentation Inference
-        results = self.yolo_pack(img_ai, verbose=False, conf=0.4, imgsz=CFG.AI_SIZE, task='segment')
+        results = self.yolo_pack(img_ai, verbose=False, conf=0.8, imgsz=CFG.AI_SIZE, task='segment')
         
         detections = []
         res = results[0]
