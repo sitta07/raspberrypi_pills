@@ -240,7 +240,7 @@ class AIProcessor:
         # Inference (Segmentation Task)
         # Note: We use the Pack model to detect both or separate if preferred.
         # Assuming model handles segmentation logic.
-        results = self.yolo_pack(img_ai, verbose=False, conf=0.35, imgsz=CFG.AI_SIZE, task='segment')
+        results = self.yolo_pack(img_ai, verbose=False, conf=0.5, imgsz=CFG.AI_SIZE, task='segment')
         
         detections = []
         res = results[0]
