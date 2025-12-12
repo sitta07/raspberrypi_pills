@@ -719,6 +719,32 @@ class AIProcessor:
         
         return unique_candidates
     
+    def format_candidates_for_display(self, candidates: List[Tuple]) -> List[Dict]:
+        """Convert candidates tuple to dict format for compatibility"""
+        formatted = []
+        for item in candidates:
+            if len(item) == 5:
+                # New format with color score
+                name, final_score, vec_score, sift_score, color_score = item
+                formatted.append({
+                    'name': name,
+                    'final': final_score,
+                    'vec': vec_score,
+                    'sift': sift_score,
+                    'color': color_score
+                })
+            elif len(item) == 4:
+                # Old format without color score (fallback)
+                name, final_score, vec_score, sift_score = item
+                formatted.append({
+                    'name': name,
+                    'final': final_score,
+                    'vec': vec_score,
+                    'sift': sift_score,
+                    'color': 0.0
+                })
+        return formatted
+    
     def process_frame(self, frame: np.ndarray):
         """Process a single frame"""
         # Resize for YOLO
@@ -791,7 +817,7 @@ class AIProcessor:
                 'box': (rx1, ry1, rx2, ry2),
                 'contour': contour,
                 'label': label,
-                'candidates': candidates
+                'candidates': self.format_candidates_for_display(candidates)
             })
             
             # Limit detections
