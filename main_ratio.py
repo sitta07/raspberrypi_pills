@@ -362,33 +362,33 @@ def draw_ui(frame, results, rx_manager):
     cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
 
     # 2. Draw Labels & Boxes
-    # for det in results:
-    #     x1, y1, x2, y2 = det['box']
-    #     label = det['label']
-    #     score = det['score']
-    #     candidates = det['candidates']
-    #     contour = det['contour']
+    for det in results:
+        x1, y1, x2, y2 = det['box']
+        label = det['label']
+        score = det['score']
+        candidates = det['candidates']
+        contour = det['contour']
         
-    #     # Get topmost point of contour for label placement
-    #     top_point = tuple(contour[contour[:, 1].argmin()])
-    #     tx, ty = top_point
+        # Get topmost point of contour for label placement
+        top_point = tuple(contour[contour[:, 1].argmin()])
+        tx, ty = top_point
         
-    #     # Label Background
-    #     color = (0, 255, 0) if label != "Unknown" else (255, 0, 0)
-    #     cv2.rectangle(frame, (tx, ty-25), (tx + len(label)*15, ty), color, -1)
-    #     cv2.putText(frame, f"{label} {score:.0%}", (tx+5, ty-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
+        # Label Background
+        color = (0, 255, 0) if label != "Unknown" else (255, 0, 0)
+        cv2.rectangle(frame, (tx, ty-25), (tx + len(label)*15, ty), color, -1)
+        cv2.putText(frame, f"{label} {score:.0%}", (tx+5, ty-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
         
-    #     # Candidate Panel
-    #     panel_x = x2 + 5 if x2 + 180 < w else x1 - 185
-    #     panel_y = y1
-    #     cv2.rectangle(frame, (panel_x, panel_y), (panel_x+180, panel_y+60), (0,0,0), -1)
-    #     cv2.putText(frame, "AI CANDIDATES:", (panel_x+5, panel_y+15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200,200,200), 1)
+        # Candidate Panel
+        panel_x = x2 + 5 if x2 + 180 < w else x1 - 185
+        panel_y = y1
+        cv2.rectangle(frame, (panel_x, panel_y), (panel_x+180, panel_y+60), (0,0,0), -1)
+        cv2.putText(frame, "AI CANDIDATES:", (panel_x+5, panel_y+15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200,200,200), 1)
         
-    #     for i, (c_name, c_score, c_vec, c_sift) in enumerate(candidates[:3]):
-    #         d_name = (c_name[:9] + '.') if len(c_name) > 9 else c_name
-    #         c_col = (0, 255, 0) if c_score > CFG.CONF_THRESHOLD else (255, 100, 0)
-    #         line = f"{i+1}.{d_name} {c_score:.2f} (S:{c_sift:.1f})"
-    #         cv2.putText(frame, line, (panel_x+5, panel_y+30+(i*15)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, c_col, 1)
+        for i, (c_name, c_score, c_vec, c_sift) in enumerate(candidates[:3]):
+            d_name = (c_name[:9] + '.') if len(c_name) > 9 else c_name
+            c_col = (0, 255, 0) if c_score > CFG.CONF_THRESHOLD else (255, 100, 0)
+            line = f"{i+1}.{d_name} {c_score:.2f} (S:{c_sift:.1f})"
+            cv2.putText(frame, line, (panel_x+5, panel_y+30+(i*15)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, c_col, 1)
 
     # 3. Dashboard
     db_x, db_y = CFG.UI_ZONE_X_START, 10
