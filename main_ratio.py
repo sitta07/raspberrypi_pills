@@ -47,11 +47,11 @@ class Config:
     UI_ZONE_Y_END: int = 220
     
     # 🎚️ TUNING THRESHOLDS
-    CONF_THRESHOLD: float = 0.65 # DINO แม่นมาก ขยับ Threshold ขึ้นได้
+    CONF_THRESHOLD: float = 0.5 # DINO แม่นมาก ขยับ Threshold ขึ้นได้
     
     # WEIGHTS FUSION: DINO เก่ง Texture มาก ให้ Weight เยอะหน่อย
     # Vector 60%, Color 20%, SIFT 20%
-    WEIGHTS: Dict[str, float] = field(default_factory=lambda: {'vec': 0.6, 'col': 0.2, 'sift': 0.2})
+    WEIGHTS: Dict[str, float] = field(default_factory=lambda: {'vec': 0.5, 'col': 0.2, 'sift': 0.3})
     
     SIFT_RATIO_TEST: float = 0.75
 
@@ -255,7 +255,7 @@ class AIProcessor:
         img_ai = cv2.resize(frame, (CFG.AI_SIZE, CFG.AI_SIZE))
         
         # YOLO Segmentation Inference
-        results = self.yolo_pack(img_ai, verbose=False, conf=0.8, imgsz=CFG.AI_SIZE, task='segment')
+        results = self.yolo_pack(img_ai, verbose=False, conf=0.85, imgsz=CFG.AI_SIZE, task='segment')
         
         detections = []
         res = results[0]
