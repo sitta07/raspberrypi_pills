@@ -304,10 +304,11 @@ class FeatureEngine:
             distance_sum = 0.0
             
             for match_pair in matches:
-                if len(match_pair) != 2:
+                # ป้องกัน error ถ้า knnMatch ไม่คืน tuple
+                if not isinstance(match_pair, (list, tuple)) or len(match_pair) < 2:
                     continue
                 
-                m, n = match_pair
+                m, n = match_pair[0], match_pair[1]
                 if m.distance < ratio_test * n.distance:
                     good_matches.append(m)
                     distance_sum += m.distance
@@ -643,14 +644,22 @@ class AIProcessor:
         
         max_similarity = 0.0
         
-        for ref_hist in self.session_db_color[target_name]:
-            # ใช้ Correlation method (ให้ผลดีกับ color comparison)
-            similarity = cv2.compareHist(query_hist, ref_hist, cv2.HISTCMP_CORREL)
-            
-            # Correlation อยู่ระหว่าง -1 ถึง 1, normalize เป็น 0-1
-            normalized_similarity = (similarity + 1.0) / 2.0
-            
-            max_similarity = max(max_similarity, normalized_similarity)
+        try:
+            for ref_hist in self.session_db_color[target_name]:
+                # ใช้ Correlation method (ให้ผลดีกับ color comparison)
+                similarity = cv2.compareHist(
+                    query_hist.astype(np.float32), 
+                    ref_hist.astype(np.float32), 
+                    cv2.HISTCMP_CORREL
+                )
+                
+                # Correlation อยู่ระหว่าง -1 ถึง 1, normalize เป็น 0-1
+                normalized_similarity = (similarity + 1.0) / 2.0
+                
+                max_similarity = max(max_similarity, normalized_similarity)
+        except Exception as e:
+            logger.debug(f"Color comparison error: {e}")
+            return 0.0
         
         return max_similarity
     
