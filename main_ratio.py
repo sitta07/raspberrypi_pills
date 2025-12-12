@@ -118,8 +118,10 @@ class FeatureEngine:
             self.model.eval().to(device)
 
             # Preprocess ของ EfficientNet V2 ฉลาดขึ้น (รองรับขนาดภาพยืดหยุ่นกว่า)
-            self.preprocess = weights.transforms() 
-            
+            self.preprocess = transforms.Compose([
+            transforms.ToPILImage(),     # 1. แปลง Numpy เป็น PIL
+            weights.transforms()         # 2. เข้าสู่กระบวนการปกติของ EfficientNet
+        ])
         except Exception as e: sys.exit(f"❌ Model Error: {e}")
 
         # 2. SIFT Engine (เหมือนเดิม)
@@ -128,7 +130,8 @@ class FeatureEngine:
 
     @torch.no_grad()
     def get_vector(self, img_rgb):
-        t = self.preprocess(img_rgb).unsqueeze(0).to(device)
+        img_pil = Image.fromarray(img_rgb)
+        t = self.preprocess(img_pil).unsqueeze(0).to(device)
         vec = self.model(t).flatten().cpu().numpy()
         return vec / (np.linalg.norm(vec) + 1e-8)
 
