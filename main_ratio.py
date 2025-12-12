@@ -350,44 +350,44 @@ class Camera:
 
 # ================= 🖥️ UI RENDERER =================
 def draw_ui(frame, results, rx_manager):
-    h, w = frame.shape[:2]
-    # Overlay for Masks
-    overlay = frame.copy()
-    for det in results:
-        contour = det['contour']
-        label = det['label']
-        color = (0, 255, 0) if label != "Unknown" else (255, 0, 0)
-        cv2.fillPoly(overlay, [contour], color)
-        cv2.polylines(overlay, [contour], True, color, 2)
-    cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
+    # h, w = frame.shape[:2]
+    # # Overlay for Masks
+    # overlay = frame.copy()
+    # for det in results:
+    #     contour = det['contour']
+    #     label = det['label']
+    #     color = (0, 255, 0) if label != "Unknown" else (255, 0, 0)
+    #     cv2.fillPoly(overlay, [contour], color)
+    #     cv2.polylines(overlay, [contour], True, color, 2)
+    # cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
 
-    # Labels
-    for det in results:
-        x1, y1, x2, y2 = det['box']
-        label = det['label']
-        score = det['score']
-        candidates = det['candidates']
-        contour = det['contour']
+    # # Labels
+    # for det in results:
+    #     x1, y1, x2, y2 = det['box']
+    #     label = det['label']
+    #     score = det['score']
+    #     candidates = det['candidates']
+    #     contour = det['contour']
         
-        top_point = tuple(contour[contour[:, 1].argmin()])
-        tx, ty = top_point
+    #     top_point = tuple(contour[contour[:, 1].argmin()])
+    #     tx, ty = top_point
 
-        color = (0, 255, 0) if label != "Unknown" else (255, 0, 0)
-        cv2.rectangle(frame, (tx, ty-25), (tx + len(label)*15, ty), color, -1)
-        cv2.putText(frame, f"{label} {score:.0%}", (tx+5, ty-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
+    #     color = (0, 255, 0) if label != "Unknown" else (255, 0, 0)
+    #     cv2.rectangle(frame, (tx, ty-25), (tx + len(label)*15, ty), color, -1)
+    #     cv2.putText(frame, f"{label} {score:.0%}", (tx+5, ty-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
         
-        # Candidate Panel (แสดงว่า AI สงสัยว่าเป็นยาอะไรบ้าง)
-        panel_x = x2 + 5 if x2 + 180 < w else x1 - 185
-        panel_y = y1
-        cv2.rectangle(frame, (panel_x, panel_y), (panel_x+180, panel_y+60), (0,0,0), -1)
-        cv2.putText(frame, "DINOv2 SEES:", (panel_x+5, panel_y+15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200,200,200), 1)
+    #     # Candidate Panel (แสดงว่า AI สงสัยว่าเป็นยาอะไรบ้าง)
+    #     panel_x = x2 + 5 if x2 + 180 < w else x1 - 185
+    #     panel_y = y1
+    #     cv2.rectangle(frame, (panel_x, panel_y), (panel_x+180, panel_y+60), (0,0,0), -1)
+    #     cv2.putText(frame, "DINOv2 SEES:", (panel_x+5, panel_y+15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200,200,200), 1)
         
-        if candidates:
-            for i, (c_name, c_score, c_vec, c_sift) in enumerate(candidates[:3]):
-                d_name = (c_name[:9] + '.') if len(c_name) > 9 else c_name
-                c_col = (0, 255, 0) if c_score > CFG.CONF_THRESHOLD else (255, 100, 0)
-                line = f"{i+1}.{d_name} {c_score:.2f}"
-                cv2.putText(frame, line, (panel_x+5, panel_y+30+(i*15)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, c_col, 1)
+    #     if candidates:
+    #         for i, (c_name, c_score, c_vec, c_sift) in enumerate(candidates[:3]):
+    #             d_name = (c_name[:9] + '.') if len(c_name) > 9 else c_name
+    #             c_col = (0, 255, 0) if c_score > CFG.CONF_THRESHOLD else (255, 100, 0)
+    #             line = f"{i+1}.{d_name} {c_score:.2f}"
+    #             cv2.putText(frame, line, (panel_x+5, panel_y+30+(i*15)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, c_col, 1)
 
     # Dashboard
     db_x, db_y = CFG.UI_ZONE_X_START, 10
