@@ -48,7 +48,7 @@ class Config:
     UI_ZONE_Y_END: int = 220
     
     # 🎚️ TUNING THRESHOLDS
-    CONF_THRESHOLD: float = 0.35
+    CONF_THRESHOLD: float = 0.7
     
     # WEIGHTS FUSION: Vector 50%, Color 30%, SIFT 20%
     WEIGHTS: Dict[str, float] = field(default_factory=lambda: {'vec': 0.5, 'col': 0.3, 'sift': 0.2}) 
@@ -240,7 +240,7 @@ class AIProcessor:
         # Inference (Segmentation Task)
         # Note: We use the Pack model to detect both or separate if preferred.
         # Assuming model handles segmentation logic.
-        results = self.yolo_pack(img_ai, verbose=False, conf=0.5, imgsz=CFG.AI_SIZE, task='segment')
+        results = self.yolo_pack(img_ai, verbose=False, conf=0.4, imgsz=CFG.AI_SIZE, task='segment')
         
         detections = []
         res = results[0]
