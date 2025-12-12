@@ -61,19 +61,20 @@ class Config:
     UI_ZONE_Y_END: int = 220
     
     # Detection Thresholds
-    CONF_THRESHOLD: float = 0.40
+    CONF_THRESHOLD: float = 0.55  # เพิ่มเกณฑ์ให้สูงขึ้น
     YOLO_CONF: float = 0.35
     
-    # Feature Weights
+    # Feature Weights (ปรับให้ SIFT และ Color มีน้ำหนักมากขึ้น)
     WEIGHTS: Dict[str, float] = field(default_factory=lambda: {
-        'vec': 0.5, 
-        'col': 0.3, 
-        'sift': 0.2
+        'vec': 0.35,   # ลดลง - ResNet ค่อนข้าง generic
+        'col': 0.35,   # เพิ่มขึ้น - สีสำคัญมาก
+        'sift': 0.30   # เพิ่มขึ้น - รายละเอียดสำคัญ
     })
     
-    # SIFT Configuration
-    SIFT_RATIO_TEST: float = 0.75
-    SIFT_MAX_MATCHES_NORMALIZE: int = 15
+    # SIFT Configuration (ปรับให้เข้มงวดขึ้น)
+    SIFT_RATIO_TEST: float = 0.70  # เข้มงวดขึ้น (ต่ำลง = เข้มงวดมากขึ้น)
+    SIFT_MAX_MATCHES_NORMALIZE: int = 20  # เพิ่มเพื่อให้มีช่วง score กว้างขึ้น
+    SIFT_MIN_MATCHES: int = 5  # ต้องมี matches อย่างน้อย
     
     # Stability & Tracking
     STABILITY_HISTORY_LEN: int = 5
@@ -207,11 +208,16 @@ class FeatureEngine:
             raise
     
     def _initialize_sift(self):
-        """Initialize SIFT detector"""
+        """Initialize SIFT detector with optimized parameters"""
         try:
-            self.sift = cv2.SIFT_create()
-            self.bf_matcher = cv2.BFMatcher()
-            logger.info("✅ SIFT detector initialized")
+            # เพิ่ม nfeatures เพื่อให้จับ keypoints ได้มากขึ้น
+            self.sift = cv2.SIFT_create(
+                nfeatures=500,  # เพิ่มจำนวน features
+                contrastThreshold=0.03,  # ลดลงเพื่อให้ sensitive มากขึ้น
+                edgeThreshold=10  # จับ edge ได้ดีขึ้น
+            )
+            self.bf_matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+            logger.info("✅ SIFT detector initialized (enhanced)")
         except Exception as e:
             logger.error(f"Failed to initialize SIFT: {e}")
             raise
@@ -241,7 +247,14 @@ class FeatureEngine:
             return None
         
         try:
-            gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+            # Resize เพื่อให้ได้ features ที่สม่ำเสมอ
+            img_resized = cv2.resize(img_rgb, (224, 224))
+            gray = cv2.cvtColor(img_resized, cv2.COLOR_RGB2GRAY)
+            
+            # Apply CLAHE เพื่อเพิ่ม contrast
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            gray = clahe.apply(gray)
+            
             _, descriptors = self.sift.detectAndCompute(gray, None)
             return descriptors
             
@@ -249,23 +262,71 @@ class FeatureEngine:
             logger.error(f"Error extracting SIFT features: {e}")
             return None
     
+    def get_color_histogram(self, img_rgb: np.ndarray, bins: int = 32) -> Optional[np.ndarray]:
+        """Extract color histogram features (HSV space)"""
+        if img_rgb is None or img_rgb.size == 0:
+            return None
+        
+        try:
+            # Convert to HSV (better for color comparison)
+            img_resized = cv2.resize(img_rgb, (128, 128))
+            hsv = cv2.cvtColor(img_resized, cv2.COLOR_RGB2HSV)
+            
+            # Calculate histogram for each channel
+            h_hist = cv2.calcHist([hsv], [0], None, [bins], [0, 180])
+            s_hist = cv2.calcHist([hsv], [1], None, [bins], [0, 256])
+            v_hist = cv2.calcHist([hsv], [2], None, [bins], [0, 256])
+            
+            # Normalize
+            h_hist = cv2.normalize(h_hist, h_hist).flatten()
+            s_hist = cv2.normalize(s_hist, s_hist).flatten()
+            v_hist = cv2.normalize(v_hist, v_hist).flatten()
+            
+            # Concatenate
+            hist = np.concatenate([h_hist, s_hist, v_hist])
+            
+            return hist
+            
+        except Exception as e:
+            logger.error(f"Error extracting color histogram: {e}")
+            return None
+    
     def match_sift(self, query_des: np.ndarray, ref_des: np.ndarray, 
-                   ratio_test: float = CFG.SIFT_RATIO_TEST) -> int:
-        """Match SIFT descriptors using ratio test"""
+                   ratio_test: float = CFG.SIFT_RATIO_TEST) -> Tuple[int, float]:
+        """Match SIFT descriptors using ratio test - returns (count, quality)"""
         if query_des is None or ref_des is None:
-            return 0
+            return 0, 0.0
         
         try:
             matches = self.bf_matcher.knnMatch(query_des, ref_des, k=2)
-            good_matches = [
-                m for m, n in matches 
-                if m.distance < ratio_test * n.distance
-            ]
-            return len(good_matches)
+            
+            good_matches = []
+            distance_sum = 0.0
+            
+            for match_pair in matches:
+                if len(match_pair) != 2:
+                    continue
+                
+                m, n = match_pair
+                if m.distance < ratio_test * n.distance:
+                    good_matches.append(m)
+                    distance_sum += m.distance
+            
+            match_count = len(good_matches)
+            
+            # คำนวณคุณภาพของ matches (ยิ่ง distance ต่ำยิ่งดี)
+            if match_count > 0:
+                avg_distance = distance_sum / match_count
+                # Normalize distance (SIFT distance อยู่ประมาณ 0-512)
+                match_quality = 1.0 - min(avg_distance / 300.0, 1.0)
+            else:
+                match_quality = 0.0
+            
+            return match_count, match_quality
             
         except Exception as e:
             logger.debug(f"SIFT matching error: {e}")
-            return 0
+            return 0, 0.0
 
 # ================= 🛡️ OBJECT STABILIZER =================
 class ObjectStabilizer:
@@ -418,6 +479,7 @@ class AIProcessor:
         # Database storage
         self.session_db_vec: Dict[str, Tuple[str, np.ndarray]] = {}
         self.session_db_sift: Dict[str, List[np.ndarray]] = {}
+        self.session_db_color: Dict[str, List[np.ndarray]] = {}  # เพิ่ม color DB
         
         # Load databases
         self._load_databases()
@@ -459,9 +521,10 @@ class AIProcessor:
         vec_count = self._load_vector_databases()
         logger.info(f"   Loaded {vec_count} vector entries")
         
-        # Load SIFT databases
-        sift_count = self._load_sift_databases()
+        # Load SIFT and Color databases from images
+        sift_count, color_count = self._load_image_databases()
         logger.info(f"   Loaded {sift_count} SIFT entries")
+        logger.info(f"   Loaded {color_count} Color entries")
     
     def _load_vector_databases(self) -> int:
         """Load vector feature databases"""
@@ -491,14 +554,15 @@ class AIProcessor:
         
         return count
     
-    def _load_sift_databases(self) -> int:
-        """Load SIFT feature databases from images"""
-        count = 0
+    def _load_image_databases(self) -> Tuple[int, int]:
+        """Load SIFT and Color feature databases from images"""
+        sift_count = 0
+        color_count = 0
         img_db = Path(CFG.IMG_DB_FOLDER)
         
         if not img_db.exists():
             logger.warning(f"Image database folder not found: {img_db}")
-            return 0
+            return 0, 0
         
         for drug_folder in img_db.iterdir():
             if not drug_folder.is_dir():
@@ -508,10 +572,11 @@ class AIProcessor:
             if not self.rx_manager.is_allowed(drug_name):
                 continue
             
-            descriptors_list = []
+            sift_descriptors_list = []
+            color_histograms_list = []
             
-            # Load first 3 images
-            for img_file in sorted(drug_folder.iterdir())[:3]:
+            # Load first 5 images for better coverage
+            for img_file in sorted(drug_folder.iterdir())[:5]:
                 if img_file.suffix.lower() not in ['.jpg', '.png', '.jpeg']:
                     continue
                 
@@ -521,55 +586,94 @@ class AIProcessor:
                         continue
                     
                     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    descriptors = self.engine.get_sift_features(img_rgb)
                     
-                    if descriptors is not None:
-                        descriptors_list.append(descriptors)
+                    # Extract SIFT
+                    sift_des = self.engine.get_sift_features(img_rgb)
+                    if sift_des is not None:
+                        sift_descriptors_list.append(sift_des)
+                    
+                    # Extract Color Histogram
+                    color_hist = self.engine.get_color_histogram(img_rgb)
+                    if color_hist is not None:
+                        color_histograms_list.append(color_hist)
                         
                 except Exception as e:
                     logger.debug(f"Error loading {img_file}: {e}")
             
-            if descriptors_list:
-                self.session_db_sift[drug_name] = descriptors_list
-                count += 1
+            if sift_descriptors_list:
+                self.session_db_sift[drug_name] = sift_descriptors_list
+                sift_count += 1
+            
+            if color_histograms_list:
+                self.session_db_color[drug_name] = color_histograms_list
+                color_count += 1
         
-        return count
+        return sift_count, color_count
     
     def compute_sift_score(self, query_des: Optional[np.ndarray], 
                           target_name: str) -> float:
-        """Compute normalized SIFT matching score"""
+        """Compute normalized SIFT matching score with quality consideration"""
         if query_des is None or target_name not in self.session_db_sift:
             return 0.0
         
-        max_matches = 0
+        max_score = 0.0
         
         for ref_des in self.session_db_sift[target_name]:
-            matches = self.engine.match_sift(query_des, ref_des)
-            max_matches = max(max_matches, matches)
+            match_count, match_quality = self.engine.match_sift(query_des, ref_des)
+            
+            # ต้องมี matches ขั้นต่ำ
+            if match_count < CFG.SIFT_MIN_MATCHES:
+                continue
+            
+            # Normalize match count
+            count_score = min(match_count / CFG.SIFT_MAX_MATCHES_NORMALIZE, 1.0)
+            
+            # Combined score (50% count, 50% quality)
+            combined_score = 0.5 * count_score + 0.5 * match_quality
+            
+            max_score = max(max_score, combined_score)
         
-        # Normalize to [0, 1]
-        normalized = max_matches / CFG.SIFT_MAX_MATCHES_NORMALIZE
-        return min(normalized, 1.0)
+        return max_score
+    
+    def compute_color_score(self, query_hist: Optional[np.ndarray], 
+                           target_name: str) -> float:
+        """Compute color histogram similarity score"""
+        if query_hist is None or target_name not in self.session_db_color:
+            return 0.0
+        
+        max_similarity = 0.0
+        
+        for ref_hist in self.session_db_color[target_name]:
+            # ใช้ Correlation method (ให้ผลดีกับ color comparison)
+            similarity = cv2.compareHist(query_hist, ref_hist, cv2.HISTCMP_CORREL)
+            
+            # Correlation อยู่ระหว่าง -1 ถึง 1, normalize เป็น 0-1
+            normalized_similarity = (similarity + 1.0) / 2.0
+            
+            max_similarity = max(max_similarity, normalized_similarity)
+        
+        return max_similarity
     
     def match_drug(self, vec: np.ndarray, img_crop: np.ndarray) -> List[Tuple]:
-        """Match detected object against drug database"""
+        """Match detected object against drug database with enhanced scoring"""
         if not self.session_db_vec:
             return []
         
-        # Extract SIFT features
+        # Extract all features once
         query_sift = self.engine.get_sift_features(img_crop)
+        query_color = self.engine.get_color_histogram(img_crop)
         
         candidates = []
         
         for key, (drug_name, db_vec) in self.session_db_vec.items():
-            # Vector similarity
+            # 1. Vector similarity (ResNet features)
             vec_score = float(np.dot(vec, db_vec))
             
-            # SIFT similarity
+            # 2. SIFT similarity (local features)
             sift_score = self.compute_sift_score(query_sift, drug_name)
             
-            # Color similarity (placeholder - implement if color DB exists)
-            color_score = 0.5
+            # 3. Color similarity (histogram)
+            color_score = self.compute_color_score(query_color, drug_name)
             
             # Weighted combination
             final_score = (
@@ -578,21 +682,40 @@ class AIProcessor:
                 color_score * CFG.WEIGHTS['col']
             )
             
-            candidates.append((drug_name, final_score, vec_score, sift_score))
+            # เก็บ sub-scores สำหรับ debug
+            candidates.append((
+                drug_name, 
+                final_score, 
+                vec_score, 
+                sift_score, 
+                color_score
+            ))
         
-        # Sort by score and deduplicate
+        # Sort by final score
         candidates.sort(key=lambda x: x[1], reverse=True)
         
+        # Deduplicate and keep top 5
         unique_candidates = []
         seen_names = set()
         
-        for name, score, vec_s, sift_s in candidates:
+        for name, final_s, vec_s, sift_s, col_s in candidates:
             if name not in seen_names:
-                unique_candidates.append((name, score, vec_s, sift_s))
+                unique_candidates.append((name, final_s, vec_s, sift_s, col_s))
                 seen_names.add(name)
             
             if len(unique_candidates) >= 5:
                 break
+        
+        # Log top candidate for debugging
+        if unique_candidates:
+            top = unique_candidates[0]
+            logger.debug(
+                f"Top match: {top[0]} | "
+                f"Final: {top[1]:.3f} | "
+                f"Vec: {top[2]:.3f} | "
+                f"SIFT: {top[3]:.3f} | "
+                f"Color: {top[4]:.3f}"
+            )
         
         return unique_candidates
     
