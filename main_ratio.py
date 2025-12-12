@@ -59,7 +59,7 @@ class Config:
     STABILITY_HISTORY_LEN: int = 10   # จำประวัติ 10 เฟรมล่าสุด
     STABILITY_CONFIRM_REQ: int = 5    # ต้องเจอชื่อซ้ำกัน 6 ใน 10 เฟรม ถึงจะฟันธง
     TRACKING_IOU_THRESH: float = 0.3  # ถ้าย้ายที่เกินนี้ถือว่าเป็นวัตถุใหม่
-    MAX_MISSING_FRAMES: int = 5       # ถ้าหายไป 5 เฟรม ให้ลืมวัตถุนั้น
+    MAX_MISSING_FRAMES: int = 1       # ถ้าหายไป 5 เฟรม ให้ลืมวัตถุนั้น
 
 CFG = Config()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
