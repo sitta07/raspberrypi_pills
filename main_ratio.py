@@ -53,7 +53,7 @@ class Config:
     # Vector 60%, Color 20%, SIFT 20%
     WEIGHTS: Dict[str, float] = field(default_factory=lambda: {'vec': 0.3, 'col': 0.2, 'sift': 0.5})
     
-    SIFT_RATIO_TEST: float = 0.75
+    SIFT_RATIO_TEST: float = 0.85
 
 CFG = Config()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
