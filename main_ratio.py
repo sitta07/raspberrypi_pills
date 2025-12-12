@@ -40,7 +40,7 @@ class Config:
 
     # Display & ROI
     DISPLAY_SIZE: Tuple[int, int] = (1280, 720)
-    AI_SIZE: int = 640 # YOLO Input Size
+    AI_SIZE: int = 416 # YOLO Input Size
     
     # 🚫 EXCLUSION ZONE (Dashboard Area)
     UI_ZONE_X_START: int = 900
@@ -53,7 +53,7 @@ class Config:
     # Vector 60%, Color 20%, SIFT 20%
     WEIGHTS: Dict[str, float] = field(default_factory=lambda: {'vec': 0.3, 'col': 0.2, 'sift': 0.5})
     
-    SIFT_RATIO_TEST: float = 0.75
+    SIFT_RATIO_TEST: float = 0.7
 
 CFG = Config()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
