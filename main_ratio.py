@@ -48,7 +48,7 @@ class Config:
     UI_ZONE_Y_END: int = 220
     
     # 🎚️ TUNING THRESHOLDS
-    CONF_THRESHOLD: float = 0.35
+    CONF_THRESHOLD: float = 0.45
     
     # WEIGHTS FUSION: Vector 50%, Color 30%, SIFT 20%
     WEIGHTS: Dict[str, float] = field(default_factory=lambda: {'vec': 0.5, 'col': 0.2, 'sift': 0.2}) 
