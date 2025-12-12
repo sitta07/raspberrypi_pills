@@ -47,13 +47,13 @@ class Config:
     UI_ZONE_Y_END: int = 220
     
     # 🎚️ TUNING THRESHOLDS
-    CONF_THRESHOLD: float =0.7 # DINO แม่นมาก ขยับ Threshold ขึ้นได้
+    CONF_THRESHOLD: float =0.8 # DINO แม่นมาก ขยับ Threshold ขึ้นได้
     
     # WEIGHTS FUSION: DINO เก่ง Texture มาก ให้ Weight เยอะหน่อย
     # Vector 60%, Color 20%, SIFT 20%
     WEIGHTS: Dict[str, float] = field(default_factory=lambda: {'vec': 0.3, 'col': 0.2, 'sift': 0.5})
     
-    SIFT_RATIO_TEST: float = 0.85
+    SIFT_RATIO_TEST: float = 0.75
 
 CFG = Config()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
