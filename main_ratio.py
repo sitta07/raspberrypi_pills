@@ -352,14 +352,14 @@ class Camera:
 def draw_ui(frame, results, rx_manager):
     h, w = frame.shape[:2]
     # Overlay for Masks
-    overlay = frame.copy()
-    for det in results:
-        contour = det['contour']
-        label = det['label']
-        color = (0, 255, 0) if label != "Unknown" else (255, 0, 0)
-        cv2.fillPoly(overlay, [contour], color)
-        cv2.polylines(overlay, [contour], True, color, 2)
-    cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
+    # overlay = frame.copy()
+    # for det in results:
+    #     contour = det['contour']
+    #     label = det['label']
+    #     color = (0, 255, 0) if label != "Unknown" else (255, 0, 0)
+    #     cv2.fillPoly(overlay, [contour], color)
+    #     cv2.polylines(overlay, [contour], True, color, 2)
+    # cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
 
     # Labels
     # for det in results:
